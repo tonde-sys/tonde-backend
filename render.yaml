@@ -1,0 +1,94 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# TONDE — Blueprint Render pour le pilote (une organisation)
+#
+# Création : Dashboard Render → New → Blueprint → repo tonde-sys/tonde-backend
+#            branche main, chemin render.yaml.
+#
+# Coût indicatif (workspace Hobby, Frankfurt) :
+#   web 0.5c-512mb  :  7 $/mois
+#   Postgres 0.5c-1g: 19 $/mois + stockage 0,30 $/Go
+#   Key Value 256mb : 10 $/mois
+#   → environ 36 $/mois hors stockage/bande passante.
+#
+# Les plans payants sont volontaires : le plan gratuit n'a ni shell, ni
+# preDeployCommand, ni persistance Redis, et la base gratuite expire en 30 jours.
+# ═══════════════════════════════════════════════════════════════════════════
+
+services:
+  # ── API FastAPI ───────────────────────────────────────────────────────────
+  - type: web
+    name: tonde-api-pilot
+    runtime: docker
+    region: frankfurt
+    plan: 0.5c-512mb
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    preDeployCommand: alembic upgrade head
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: CREATE_TABLES_ON_STARTUP
+        value: "false"
+      - key: APP_VERSION
+        value: "1.0.0"
+
+      # Connexions privées Render (même région obligatoire).
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tonde-pilot-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: tonde-pilot-kv
+          property: connectionString
+
+      # Secret généré par Render (256 bits), jamais dans le dépôt.
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "15"
+      - key: REFRESH_TOKEN_EXPIRE_DAYS
+        value: "7"
+
+      # À renseigner à la création du Blueprint (prompt Render).
+      # Une salle d'attente derrière un Wi-Fi partagé peut dépasser 10 connexions/min.
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: AFRICAS_TALKING_USERNAME
+        sync: false
+      - key: AFRICAS_TALKING_API_KEY
+        sync: false
+      - key: AFRICAS_TALKING_SENDER_ID
+        value: TONDE
+
+      # Scheduler in-process : garder une seule instance (voir DEPLOYMENT.md).
+      - key: SCHEDULER_ENABLED
+        value: "true"
+      - key: WS_CONNECT_LIMIT_PER_MINUTE
+        value: "120"
+
+  # ── File d'attente Redis (Valkey) ─────────────────────────────────────────
+  - type: keyvalue
+    name: tonde-pilot-kv
+    region: frankfurt
+    plan: 256mb
+    maxmemoryPolicy: noeviction
+    persistenceMode: journal-snapshot
+    ipAllowList: [] # Aucun accès externe : réseau privé Render uniquement.
+
+databases:
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  - name: tonde-pilot-db
+    region: frankfurt
+    plan: 0.5c-1g
+    postgresMajorVersion: "15"
+    diskSizeGB: 5
+    storageAutoscalingEnabled: true

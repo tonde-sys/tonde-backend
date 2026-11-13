@@ -37,8 +37,8 @@ Plateforme SaaS B2B multi-tenant de gestion intelligente des files d'attente, co
 
 ```bash
 # 1. Cloner le projet
-git clone https://github.com/TONDE-APP/tonde-backend-.git
-cd tonde-backend-
+git clone https://github.com/tonde-sys/tonde-backend.git
+cd tonde-backend
 
 # 2. Configurer les variables d'environnement
 cp .env.example .env
@@ -55,6 +55,10 @@ docker-compose exec api alembic upgrade head
 # Health   : http://localhost:8000/health
 # Redis UI : http://localhost:8081
 ```
+
+> `docker-compose.yml` est l'environnement de **développement** (rechargement à
+> chaud, mots de passe de démonstration). Pour un pilote réel, utiliser Render
+> (`render.yaml`) ou `docker-compose.prod.yml` — voir **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 
 ---
 
@@ -244,6 +248,9 @@ créés en minuscules, incompatibles avec SQLAlchemy) et ajoute `audit_logs` et 
 ## Tests
 
 ```bash
+# Dépendances de développement (pytest, aiosqlite)
+pip install -r requirements-dev.txt
+
 # Tests unitaires + HTTP de bout en bout (SQLite en mémoire)
 pytest
 
