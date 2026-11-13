@@ -317,16 +317,33 @@ async def test_basic_live_and_ready_probes_are_public(api, db_session):
     health = await api.get("/health")
     live = await api.get("/health/live")
     ready = await api.get("/health/ready")
+    status = await api.get("/health/status")
 
-    assert health.status_code == 200 and health.json()["status"] == "ok"
-    assert health.json()["services"] == {"api": "ok", "redis": "ok", "database": "ok"}
+    assert health.status_code == 200
+    assert health.json() == {"status": "awake", "service": "tonde-api"}
     assert live.status_code == 200 and live.json() == {"status": "alive"}
     assert ready.status_code == 200 and ready.json()["status"] == "ready"
     assert ready.json()["checks"]["redis"]["latency_ms"] is not None
+    assert status.status_code == 200 and status.json()["status"] == "ok"
+    assert status.json()["services"] == {"api": "ok", "redis": "ok", "database": "ok"}
 
 
 @pytest.mark.asyncio
-async def test_readiness_returns_503_when_redis_is_down_but_liveness_stays_up(api, db_session, monkeypatch):
+async def test_wake_health_never_touches_database_or_redis(api, db_session, monkeypatch):
+    from app.services import health_service
+
+    async def must_not_be_called():
+        raise AssertionError("/health ne doit interroger ni PostgreSQL ni Redis")
+
+    monkeypatch.setattr(health_service, "readiness", must_not_be_called)
+
+    response = await api.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "awake", "service": "tonde-api"}
+
+
+@pytest.mark.asyncio
+async def test_readiness_returns_503_when_redis_is_down_but_wake_and_liveness_stay_up(api, db_session, monkeypatch):
     from app.services import health_service
 
     async def redis_down():
@@ -335,12 +352,14 @@ async def test_readiness_returns_503_when_redis_is_down_but_liveness_stays_up(ap
     monkeypatch.setattr(health_service, "check_redis", redis_down)
 
     ready = await api.get("/health/ready")
+    status = await api.get("/health/status")
     health = await api.get("/health")
     live = await api.get("/health/live")
 
     assert ready.status_code == 503 and ready.json()["status"] == "not_ready"
-    assert health.status_code == 503 and health.json()["status"] == "degraded"
-    assert health.json()["services"]["redis"] == "error"
+    assert status.status_code == 503 and status.json()["status"] == "degraded"
+    assert status.json()["services"]["redis"] == "error"
+    assert health.status_code == 200 and health.json()["status"] == "awake"
     assert live.status_code == 200, "le processus vit : Kubernetes ne doit pas le redémarrer pour une panne Redis"
 
 
