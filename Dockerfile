@@ -10,7 +10,9 @@
 #   - utilisateur non-root (uid 10001) ;
 #   - aucune dépendance de test installée ;
 #   - écoute sur $PORT (Render l'injecte, 8000 par défaut) ;
-#   - migrations exécutées séparément (alembic upgrade head), jamais au démarrage.
+#   - migrations exécutées séparément (alembic upgrade head) ou au démarrage
+#     avec RUN_MIGRATIONS_ON_STARTUP=true (obligatoire sur Render gratuit,
+#     qui ne propose ni shell ni preDeployCommand).
 ARG PYTHON_VERSION=3.12
 
 # ── Étape 1 : dépendances ─────────────────────────────────────────────────────
@@ -54,6 +56,7 @@ COPY --chown=tonde:tonde alembic.ini ./
 COPY --chown=tonde:tonde migrations ./migrations
 COPY --chown=tonde:tonde app ./app
 COPY --chown=tonde:tonde bootstrap ./bootstrap
+COPY --chown=tonde:tonde --chmod=755 docker-entrypoint.sh ./docker-entrypoint.sh
 
 USER tonde
 EXPOSE 8000
@@ -64,4 +67,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('PORT', '8000') + '/health/live', timeout=3)"
 
 # Un seul worker : le scheduler de file est in-process. Voir DEPLOYMENT.md.
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips='*'"]
+# Sur Render gratuit (pas de preDeployCommand), mettre RUN_MIGRATIONS_ON_STARTUP=true.
+# Sur un plan payant ou Docker Compose, les migrations restent un step séparé.
+ENTRYPOINT ["./docker-entrypoint.sh"]
