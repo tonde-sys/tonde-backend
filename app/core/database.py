@@ -8,12 +8,19 @@ from app.core.config import settings
 
 
 # ── Moteur de base de données ─────────────────────────────────────────────────
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=settings.DEBUG,      # Affiche les requêtes SQL en mode debug
-    pool_size=10,             # Nombre de connexions simultanées
-    max_overflow=20,          # Connexions supplémentaires si besoin
-)
+# SQLite (tests locaux, outillage) ne supporte pas pool_size/max_overflow.
+# En production PostgreSQL, on garde un pool dimensionné pour un seul worker.
+_engine_options: dict = {
+    "echo": settings.DEBUG,   # Affiche les requêtes SQL en mode debug
+}
+if not settings.DATABASE_URL.startswith("sqlite"):
+    _engine_options.update(
+        pool_size=10,         # Nombre de connexions simultanées
+        max_overflow=20,      # Connexions supplémentaires si besoin
+        pool_pre_ping=True,   # Remplace une connexion morte après une coupure
+    )
+
+engine = create_async_engine(settings.DATABASE_URL, **_engine_options)
 
 # ── Fabrique de sessions ──────────────────────────────────────────────────────
 AsyncSessionLocal = async_sessionmaker(

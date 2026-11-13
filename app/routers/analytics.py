@@ -14,6 +14,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.access import assert_branch_access
 from app.core.database import get_db
 from app.core.deps import get_current_supervisor
 from app.models.user import User
@@ -23,25 +24,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _check_org_access(current_user: User, org_id: str) -> None:
-    """Vérifie que l'utilisateur accède bien à son organisation (sauf super_admin)."""
-    from fastapi import HTTPException, status
-    if (
-        current_user.role.value != "super_admin"
-        and current_user.org_id
-        and current_user.org_id != org_id
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "code": "FORBIDDEN",
-                "message": "Accès refusé — vous ne pouvez consulter que les stats de votre organisation",
-            },
-        )
-
+# Contrôle d'accès : assert_branch_access vérifie l'organisation ET la branch
+# (un superviseur de la branch A ne lit pas les stats de la branch B).
 
 # ── Résumé général ────────────────────────────────────────────────────────────
 
+@router.get("/{org_id}/branches/{agency_id}/analytics/summary", include_in_schema=False)
 @router.get(
     "/{org_id}/agencies/{agency_id}/analytics/summary",
     summary="Résumé des métriques d'une agence",
@@ -63,7 +51,7 @@ async def get_agency_summary(
     Par défaut : 7 derniers jours.
     Nécessite rôle SUPERVISOR minimum.
     """
-    _check_org_access(current_user, org_id)
+    await assert_branch_access(db, current_user, org_id, agency_id)
     svc = AnalyticsService(db)
     result = await svc.get_agency_summary(
         org_id=org_id,
@@ -76,6 +64,7 @@ async def get_agency_summary(
 
 # ── Stats par service ─────────────────────────────────────────────────────────
 
+@router.get("/{org_id}/branches/{agency_id}/analytics/services", include_in_schema=False)
 @router.get(
     "/{org_id}/agencies/{agency_id}/analytics/services",
     summary="Statistiques par service",
@@ -94,7 +83,7 @@ async def get_service_stats(
     Permet de comparer la charge et les temps d'attente entre services.
     Nécessite rôle SUPERVISOR minimum.
     """
-    _check_org_access(current_user, org_id)
+    await assert_branch_access(db, current_user, org_id, agency_id)
     svc = AnalyticsService(db)
     items = await svc.get_service_stats(
         org_id=org_id,
@@ -113,6 +102,7 @@ async def get_service_stats(
 
 # ── Performance par guichet ───────────────────────────────────────────────────
 
+@router.get("/{org_id}/branches/{agency_id}/analytics/counters", include_in_schema=False)
 @router.get(
     "/{org_id}/agencies/{agency_id}/analytics/counters",
     summary="Performance par guichet",
@@ -131,7 +121,7 @@ async def get_counter_performance(
     Permet d'évaluer la productivité par agent et d'équilibrer la charge.
     Nécessite rôle SUPERVISOR minimum.
     """
-    _check_org_access(current_user, org_id)
+    await assert_branch_access(db, current_user, org_id, agency_id)
     svc = AnalyticsService(db)
     items = await svc.get_counter_performance(
         org_id=org_id,
@@ -150,6 +140,7 @@ async def get_counter_performance(
 
 # ── Distribution horaire ──────────────────────────────────────────────────────
 
+@router.get("/{org_id}/branches/{agency_id}/analytics/hourly", include_in_schema=False)
 @router.get(
     "/{org_id}/agencies/{agency_id}/analytics/hourly",
     summary="Distribution horaire du volume de tickets",
@@ -169,7 +160,7 @@ async def get_hourly_distribution(
     Retourne toujours 24 entrées, même si certaines heures ont 0 ticket.
     Nécessite rôle SUPERVISOR minimum.
     """
-    _check_org_access(current_user, org_id)
+    await assert_branch_access(db, current_user, org_id, agency_id)
     svc = AnalyticsService(db)
     items = await svc.get_hourly_distribution(
         org_id=org_id,

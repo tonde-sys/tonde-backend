@@ -1,0 +1,77 @@
+{
+  "organization": {
+    "name": "Organisation Pilote TONDE",
+    "slug": "organisation-pilote",
+    "sector": "other",
+    "description": "Organisation créée pour le pilote TONDE.",
+    "country": "Burundi",
+    "city": "Bujumbura",
+    "phone": "+25700000000",
+    "email": "contact@exemple.bi"
+  },
+  "branch": {
+    "name": "Agence Principale",
+    "slug": "agence-principale",
+    "description": "Agence pilote — à renommer avec les informations réelles.",
+    "address": "Bujumbura, Burundi",
+    "city": "Bujumbura",
+    "opens_at": "08:00",
+    "closes_at": "17:00",
+    "max_daily_tickets": 500,
+    "avg_service_minutes": 5,
+    "is_open": true
+  },
+  "services": [
+    {
+      "name": "Service 1",
+      "ticket_prefix": "A",
+      "avg_duration_minutes": 5
+    },
+    {
+      "name": "Service 2",
+      "ticket_prefix": "B",
+      "avg_duration_minutes": 8
+    },
+    {
+      "name": "Service 3",
+      "ticket_prefix": "C",
+      "avg_duration_minutes": 10
+    }
+  ],
+  "counters": [
+    {
+      "name": "Guichet 1"
+    },
+    {
+      "name": "Guichet 2"
+    }
+  ],
+  "users": [
+    {
+      "name": "Super administrateur TONDE",
+      "email": "superadmin@exemple.bi",
+      "role": "super_admin",
+      "password_env": "BOOTSTRAP_SUPER_ADMIN_PASSWORD"
+    },
+    {
+      "name": "Administrateur de l'organisation",
+      "email": "admin@exemple.bi",
+      "role": "admin_org",
+      "password_env": "BOOTSTRAP_ADMIN_PASSWORD"
+    },
+    {
+      "name": "Agent Guichet 1",
+      "email": "agent1@exemple.bi",
+      "role": "agent",
+      "counter": "Guichet 1",
+      "password_env": "BOOTSTRAP_AGENT1_PASSWORD"
+    },
+    {
+      "name": "Agent Guichet 2",
+      "email": "agent2@exemple.bi",
+      "role": "agent",
+      "counter": "Guichet 2",
+      "password_env": "BOOTSTRAP_AGENT2_PASSWORD"
+    }
+  ]
+}

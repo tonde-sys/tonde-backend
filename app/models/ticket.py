@@ -9,7 +9,10 @@ la machine à états est dans ticket_service.py.
 """
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime, Enum as SAEnum, Integer, ForeignKey, Boolean
+from sqlalchemy import (
+    String, DateTime, Enum as SAEnum, Integer, ForeignKey, Boolean,
+    UniqueConstraint, Index,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
 import enum
@@ -44,6 +47,13 @@ PRIORITY_SCORES: dict[TicketPriority, int] = {
 
 # Transitions d'états autorisées — source de vérité pour la machine à états
 # Toute transition absente de ce dict est INTERDITE
+#
+# Statuts « actifs » (DÉCISION 1) : WAITING, CALLED, SERVING, ABSENT, TRANSFERRED,
+# INCOMPLETE bloquent la création d'un nouveau ticket. Chacun de ces statuts DOIT
+# donc avoir une sortie, sinon le client serait bloqué pour toujours :
+#   - ABSENT     → WAITING (le client revient) ou CANCELLED (fenêtre de retour expirée)
+#   - TRANSFERRED → WAITING (état transitoire : le ticket rejoint la file du service cible)
+#   - INCOMPLETE → WAITING (l'agent remet en file) ou CANCELLED (clôture)
 ALLOWED_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     TicketStatus.WAITING: [
         TicketStatus.CALLED,
@@ -57,20 +67,33 @@ ALLOWED_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     TicketStatus.SERVING: [
         TicketStatus.DONE,
         TicketStatus.INCOMPLETE,
+        TicketStatus.TRANSFERRED,
     ],
     TicketStatus.ABSENT: [
-        TicketStatus.WAITING,  # Le client demande à revenir en file
+        TicketStatus.WAITING,    # Le client demande à revenir en file
+        TicketStatus.CANCELLED,  # Fenêtre de retour expirée
+    ],
+    TicketStatus.TRANSFERRED: [
+        TicketStatus.WAITING,    # Rejoint la file du service cible
+    ],
+    TicketStatus.INCOMPLETE: [
+        TicketStatus.WAITING,    # L'agent remet le client en file
+        TicketStatus.CANCELLED,  # Clôture
     ],
     # États terminaux — aucune transition possible
     TicketStatus.DONE:        [],
-    TicketStatus.TRANSFERRED: [],
     TicketStatus.CANCELLED:   [],
-    TicketStatus.INCOMPLETE:  [],
 }
 
 
 class Ticket(Base):
     __tablename__ = "tickets"
+    __table_args__ = (
+        # Idempotence (offline-first) : un même client_action_id ne crée qu'un ticket par user
+        UniqueConstraint("user_id", "client_action_id", name="uq_tickets_user_client_action"),
+        Index("ix_tickets_user_status", "user_id", "status"),
+        Index("ix_tickets_queue_lookup", "agency_id", "service_id", "status"),
+    )
 
     # ── Identifiant unique ────────────────────────────────────
     id: Mapped[str] = mapped_column(
@@ -106,8 +129,15 @@ class Ticket(Base):
     status: Mapped[TicketStatus] = mapped_column(
         SAEnum(TicketStatus), default=TicketStatus.WAITING
     )
+    # Priorité EFFECTIVE (celle qui détermine l'ordre dans la file).
     priority: Mapped[TicketPriority] = mapped_column(
         SAEnum(TicketPriority), default=TicketPriority.STANDARD
+    )
+    # Priorité DEMANDÉE par le client, en attente de confirmation par un agent.
+    # Un client ne peut jamais s'attribuer lui-même une priorité : le ticket est
+    # créé en STANDARD et l'agent approuve ou rejette la demande.
+    requested_priority: Mapped[TicketPriority | None] = mapped_column(
+        SAEnum(TicketPriority), nullable=True
     )
 
     # ── Guichet assigné ───────────────────────────────────────
@@ -122,7 +152,14 @@ class Ticket(Base):
 
     # ── Estimations de temps ──────────────────────────────────
     estimated_wait_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Attente RÉELLE : de la création à l'appel (renseignée à l'appel du ticket)
     actual_wait_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Durée RÉELLE du service en secondes (served_at → done_at). Alimente l'ETA.
+    service_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ── Idempotence (offline-first) ───────────────────────────
+    # Identifiant généré par le client pour l'action de création.
+    client_action_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # ── Dates clés (timeline du ticket) ──────────────────────
     created_at: Mapped[datetime] = mapped_column(

@@ -27,16 +27,11 @@ pydantic[email]==2.7.1    # Validation des données
 pydantic-settings==2.3.0  # Settings depuis .env
 
 # ── Notifications ─────────────────────────────────────────────────────────────
-africastalking==1.2.5     # SMS Afrique (Burundi, RDC)
-httpx==0.27.0             # Client HTTP async (Firebase FCM)
+httpx==0.27.0             # Client HTTP async (SMS Africa's Talking + Firebase FCM v1)
+# NB : le SDK `africastalking` n'est plus utilisé (synchrone : il bloquait la boucle async).
+#      Les SMS passent par httpx (app/services/sms_gateway.py).
 
-# ── Utilitaires ───────────────────────────────────────────────────────────────
-python-slugify==8.0.4     # Générer des slugs URL
-Pillow==10.3.0            # Traitement images (photos profil)
-qrcode==7.4.2             # Génération QR Code tickets
+# ── Export de données ─────────────────────────────────────────────────────────
+openpyxl==3.1.5           # Export XLSX (tickets et statistiques)
 
-# ── Tests ─────────────────────────────────────────────────────────────────────
-pytest==8.2.2
-pytest-asyncio==0.23.7
-aiosqlite==0.20.0         # SQLite async pour les tests (pas besoin de PostgreSQL)
-httpx==0.27.0             # Client HTTP pour les tests d'intégration
+# Les dépendances de test sont dans requirements-dev.txt.

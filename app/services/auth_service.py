@@ -30,6 +30,7 @@ from app.core.redis import (
     increment_register_attempts, PHONE_REGISTER_MAX, PHONE_BLOCK_SECONDS,
 )
 from app.core.config import settings
+from app.services.sms_gateway import SmsDeliveryError, send_sms
 from app.schemas.auth import (
     RegisterPhoneRequest, VerifyOtpRequest,
     RegisterEmailRequest, LoginEmailRequest,
@@ -98,7 +99,7 @@ class AuthService:
             )
 
         # Générer l'OTP
-        otp = DEV_OTP if settings.ENVIRONMENT == "development" else generate_otp()
+        otp = DEV_OTP if settings.is_development else generate_otp()
 
         # Stocker dans Redis avec TTL (réinitialise aussi le compteur d'échecs)
         await save_otp(phone, otp)
@@ -182,9 +183,9 @@ class AuthService:
                 detail={
                     "code": "PHONE_BLOCKED",
                     "message": (
-                        f"Trop de tentatives incorrectes. "
-                        f"Ce numéro est bloqué pendant 15 minutes. "
-                        f"Si vous n'avez pas demandé ce code, ignorez ce message."
+                        "Trop de tentatives incorrectes. "
+                        "Ce numéro est bloqué pendant 15 minutes. "
+                        "Si vous n'avez pas demandé ce code, ignorez ce message."
                     ),
                     "retry_after_seconds": PHONE_BLOCK_SECONDS,
                 },
@@ -541,29 +542,72 @@ class AuthService:
 
     async def _send_otp_sms(self, phone: str, otp: str) -> None:
         """
-        Envoie l'OTP par SMS via Africa's Talking.
-        En développement, log seulement — aucun SMS envoyé.
-        En production, lève une alerte si le SMS échoue mais ne bloque pas.
-        """
-        if settings.ENVIRONMENT == "development":
-            logger.debug(f"[DEV] SMS simulé → {phone}: votre code est {otp}")
-            return
+        Envoie l'OTP par SMS via la passerelle (httpx async, non bloquant).
 
+        En développement, log seulement — aucun SMS envoyé.
+        Si l'envoi échoue, l'OTP stocké est supprimé et une erreur 503 est renvoyée :
+        répondre « code envoyé » alors que rien n'est parti laisserait l'utilisateur
+        attendre un SMS qui n'arrivera jamais.
+
+        Raises:
+            HTTPException 503: La passerelle SMS n'a pas accepté le message
+        """
+        message = (
+            f"TONDE: Votre code de vérification est {otp}. "
+            f"Valide {settings.OTP_EXPIRE_MINUTES} minutes. "
+            f"Ne le partagez jamais."
+        )
         try:
-            import africastalking
-            africastalking.initialize(
-                settings.AFRICAS_TALKING_USERNAME,
-                settings.AFRICAS_TALKING_API_KEY,
+            await send_sms(phone, message)
+        except SmsDeliveryError as exc:
+            logger.error(f"Échec envoi SMS OTP vers {phone}: {exc}")
+            await delete_otp(phone)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "SMS_UNAVAILABLE",
+                    "message": "Impossible d'envoyer le SMS pour le moment. Réessayez dans quelques instants.",
+                },
+            ) from exc
+
+    # ── Profil ────────────────────────────────────────────────────────────────
+    async def update_profile(self, user: User, name: str | None, language: str | None) -> User:
+        """
+        Met à jour le nom et/ou la langue de l'utilisateur connecté.
+
+        Args:
+            user: Utilisateur connecté
+            name: Nouveau nom (None = inchangé)
+            language: Nouvelle langue (None = inchangée)
+
+        Returns:
+            L'utilisateur mis à jour
+        """
+        if name is not None:
+            user.name = name
+        if language is not None:
+            user.language = language
+        await self.db.commit()
+        await self.db.refresh(user)
+        return user
+
+    async def set_fcm_token(self, user: User, fcm_token: str | None) -> None:
+        """
+        Enregistre (ou efface) le jeton de push de l'appareil de l'utilisateur.
+
+        Un jeton identifie UN appareil : s'il était associé à un autre compte
+        (téléphone partagé, changement de compte), il est retiré de cet autre compte
+        pour que les notifications d'un utilisateur n'arrivent pas chez un autre.
+
+        Args:
+            user: Utilisateur connecté
+            fcm_token: Jeton FCM, ou None pour se désinscrire des push (déconnexion)
+        """
+        if fcm_token:
+            await self.db.execute(
+                update(User)
+                .where(User.fcm_token == fcm_token, User.id != user.id)
+                .values(fcm_token=None)
             )
-            sms = africastalking.SMS
-            message = (
-                f"TONDE: Votre code de vérification est {otp}. "
-                f"Valide {settings.OTP_EXPIRE_MINUTES} minutes. "
-                f"Ne le partagez jamais."
-            )
-            sms.send(message, [phone], sender_id=settings.AFRICAS_TALKING_SENDER_ID)
-            logger.info(f"SMS OTP envoyé: {phone}")
-        except Exception as e:
-            # Ne pas bloquer l'inscription si le SMS échoue
-            # TODO Sprint 1 : ajouter retry avec queue Redis
-            logger.error(f"Échec envoi SMS OTP vers {phone}: {e}", exc_info=True)
+        user.fcm_token = fcm_token
+        await self.db.commit()

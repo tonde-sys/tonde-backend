@@ -10,13 +10,13 @@ Aucune logique métier ici, tout délègue à BranchService.
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.access import assert_branch_access
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.user import User, UserRole
 from app.schemas.branch import (
     CreateBranchRequest,
     UpdateBranchRequest,
-    BranchListResponse,
 )
 from app.schemas.branch_config import UpdateBranchConfigRequest
 from app.services.branch_service import BranchService
@@ -37,6 +37,19 @@ def _require_branch_admin(current_user: User) -> User:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "FORBIDDEN", "message": "Accès réservé aux administrateurs"},
+        )
+    return current_user
+
+
+def _require_org_admin(current_user: User) -> User:
+    """Créer ou supprimer une branch engage toute l'organisation : ADMIN_ORG ou SUPER_ADMIN requis."""
+    if current_user.role not in (UserRole.ADMIN_ORG, UserRole.SUPER_ADMIN):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "FORBIDDEN",
+                "message": "Seul un administrateur d'organisation peut créer ou supprimer une agence",
+            },
         )
     return current_user
 
@@ -73,7 +86,7 @@ async def create_branch(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    _require_branch_admin(current_user)
+    _require_org_admin(current_user)
     _check_org_access(current_user, org_id)
     svc = BranchService(db)
     result = await svc.create(org_id, body, current_user.org_id)
@@ -111,6 +124,7 @@ async def get_branch(
 ) -> dict:
     _require_branch_admin(current_user)
     _check_org_access(current_user, org_id)
+    await assert_branch_access(db, current_user, org_id, branch_id)
     svc = BranchService(db)
     result = await svc.get_by_id(branch_id, current_user.org_id)
     return {"success": True, "data": result}
@@ -126,6 +140,7 @@ async def update_branch(
 ) -> dict:
     _require_branch_admin(current_user)
     _check_org_access(current_user, org_id)
+    await assert_branch_access(db, current_user, org_id, branch_id)
     svc = BranchService(db)
     result = await svc.update(branch_id, body, current_user.org_id)
     return {"success": True, "data": result, "message": "Branch mise à jour"}
@@ -138,7 +153,7 @@ async def delete_branch(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    _require_branch_admin(current_user)
+    _require_org_admin(current_user)
     _check_org_access(current_user, org_id)
     svc = BranchService(db)
     await svc.delete(branch_id, current_user.org_id)
@@ -159,10 +174,11 @@ async def get_branch_config(
 ) -> dict:
     """
     Retourne la configuration complète de la file d'attente.
-    Accessible aux agents, superviseurs et admins de la branch.
+    Accessible aux administrateurs de la branch.
     """
     _require_branch_admin(current_user)
     _check_org_access(current_user, org_id)
+    await assert_branch_access(db, current_user, org_id, branch_id)
     svc = BranchService(db)
     result = await svc.get_config(branch_id, current_user.org_id)
     return {"success": True, "data": result}
@@ -182,10 +198,11 @@ async def update_branch_config(
     """
     Met à jour la configuration de la file d'attente (PATCH partiel).
     Seuls les champs fournis sont modifiés.
-    Réservé aux ADMIN_AGENCY, ADMIN_ORG et SUPER_ADMIN.
+    Réservé aux ADMIN_AGENCY (leur branch), ADMIN_ORG et SUPER_ADMIN.
     """
     _require_branch_admin(current_user)
     _check_org_access(current_user, org_id)
+    await assert_branch_access(db, current_user, org_id, branch_id)
     svc = BranchService(db)
     result = await svc.update_config(branch_id, body, current_user.org_id)
     return {"success": True, "data": result, "message": "Configuration mise à jour"}

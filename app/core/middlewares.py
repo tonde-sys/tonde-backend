@@ -13,15 +13,53 @@ Usage dans un router :
 Note : request: Request doit être le PREMIER paramètre de chaque handler protégé.
 C'est une contrainte de slowapi — il lit l'IP depuis l'objet Request.
 """
+import logging
+
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
+
+logger = logging.getLogger(__name__)
 
 
 # Instance globale partagée par tous les routers.
 # key_func=get_remote_address → limite par adresse IP cliente.
 limiter = Limiter(key_func=get_remote_address)
+
+
+async def check_ws_rate_limit(websocket: WebSocket) -> bool:
+    """
+    Limite le nombre de connexions WebSocket par IP et par minute (DÉCISION 6).
+
+    slowapi ne sait pas protéger un WebSocket : son décorateur exige un paramètre
+    `request: Request` que les routes WebSocket n'ont pas, et plantait à CHAQUE
+    connexion (« parameter `request` must be an instance of Request »). Le compteur
+    est donc tenu dans Redis (INCR + EXPIRE), partagé entre toutes les instances.
+
+    Si Redis est indisponible, la connexion est AUTORISÉE (fail-open) : une panne du
+    limiteur ne doit pas couper le suivi en temps réel de tous les clients.
+
+    Returns:
+        True si la connexion est autorisée, False si la limite est dépassée.
+    """
+    from app.core.config import settings
+    from app.core.redis import get_redis
+
+    limit = settings.WS_CONNECT_LIMIT_PER_MINUTE
+    if limit <= 0:
+        return True  # 0 = limite désactivée
+    host = websocket.client.host if websocket.client else "unknown"
+    try:
+        redis = await get_redis()
+        key = f"tonde:ratelimit:ws:{host}"
+        count = await redis.incr(key)
+        if count == 1:
+            await redis.expire(key, 60)
+        return count <= limit
+    except Exception as exc:  # noqa: BLE001 — fail-open
+        logger.warning(f"Limiteur WebSocket indisponible ({exc}) : connexion autorisée")
+        return True
 
 
 def setup_rate_limiting(app: FastAPI) -> None:

@@ -72,7 +72,7 @@ def upgrade() -> None:
             'supported_languages',
             sa.JSON(),
             nullable=True,
-            server_default='\'["fr"]\'',
+            server_default=sa.text("""'["fr"]'"""),
         ),
     )
 

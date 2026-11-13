@@ -3,7 +3,8 @@ TONDE BACKEND — Point d'entrée principal
 ========================================
 Configure FastAPI, initialise les connexions et branche les routers.
 
-En production : les migrations sont gérées par Alembic.
+En production : les migrations sont gérées par Alembic, la configuration est
+auditée au démarrage (voir app/core/config.py) et la documentation interactive est désactivée.
 En développement : create_tables() peut créer les tables au démarrage
                    si CREATE_TABLES_ON_STARTUP=true dans .env.
 """
@@ -14,26 +15,36 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from app.core.config import settings
-from app.core.redis import get_redis, close_redis
+from app.core.metrics import request_metrics
+from app.core.middlewares import setup_rate_limiting
+from app.core.redis import close_redis, get_redis
 
 # Import explicite des modèles — obligatoire pour que Base.metadata
 # connaisse toutes les tables avant toute opération DB
 import app.models  # noqa: F401
 
-from app.routers import auth, tickets, organizations, branches, counters, employees, analytics
+from app.routers import (
+    analytics,
+    auth,
+    branches,
+    counters,
+    employees,
+    exports,
+    health,
+    notifications,
+    organizations,
+    public,
+    sync,
+    tickets,
+)
 from app.routers import services as services_router
+from app.services.queue_scheduler import QueueScheduler
 from app.websocket.queue_ws import ws_manager
 
 logger = logging.getLogger(__name__)
-
-# ── Rate Limiter (slowapi) ─────────────────────────────────────────────────────
-# Limite globale par IP — les routes sensibles ont leurs propres limites
-limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
 
 
 # ── Démarrage et arrêt de l'app ───────────────────────────────────────────────
@@ -41,7 +52,9 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
 async def lifespan(app: FastAPI):
     """
     Code exécuté au démarrage et à l'arrêt de l'API.
-    Initialise les connexions DB et Redis.
+
+    Démarrage : tables (dev), Redis, listener Pub/Sub, puis Queue Scheduler
+    (reconstruction des files depuis PostgreSQL + auto-absent + maintenance).
 
     En production, NE PAS utiliser create_tables().
     Utiliser : docker-compose exec api alembic upgrade head
@@ -65,22 +78,39 @@ async def lifespan(app: FastAPI):
     await redis.ping()
     logger.info("Redis — Connexion établie")
 
-    # Démarrer le listener Redis Pub/Sub en tâche asyncio de fond
+    # Listener Redis Pub/Sub en tâche asyncio de fond
     # Écoute tonde:events:* — couvre toutes les orgs — se reconnecte auto en cas d'erreur
-    asyncio.create_task(ws_manager.start_redis_listener())
+    listener_task = asyncio.create_task(ws_manager.start_redis_listener())
     logger.info("Redis Pub/Sub — Listener démarré en tâche de fond")
 
+    # Queue Scheduler : warm-up (files + échéances depuis PostgreSQL), auto-absent, maintenance
+    scheduler = QueueScheduler()
+    app.state.scheduler = scheduler
+    if settings.SCHEDULER_ENABLED:
+        await scheduler.start()
+    else:
+        logger.warning("Scheduler désactivé (SCHEDULER_ENABLED=false) : pas d'auto-absent ni de maintenance")
+
     logger.info(f"API prête sur http://localhost:{settings.APP_PORT}")
-    logger.info(f"Documentation : http://localhost:{settings.APP_PORT}/docs")
+    if not settings.is_production:
+        logger.info(f"Documentation : http://localhost:{settings.APP_PORT}/docs")
 
     yield  # L'app tourne ici
 
     # Arrêt propre
+    await scheduler.stop()
+    listener_task.cancel()
+    try:
+        await listener_task
+    except asyncio.CancelledError:
+        pass
     await close_redis()
     logger.info("TONDE API — Arrêt propre")
 
 
 # ── Création de l'app FastAPI ─────────────────────────────────────────────────
+# En production, la documentation interactive n'est PAS exposée : elle décrit
+# précisément toute la surface d'attaque de l'API.
 app = FastAPI(
     title="Tonde API",
     description="""
@@ -95,13 +125,17 @@ Utilisez le bouton **Authorize** ci-dessus et entrez : `Bearer <votre_token>`
 L'OTP de test en développement est toujours **123456**
     """,
     version=settings.APP_VERSION,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
     lifespan=lifespan,
 )
 
-# ── Rate limiting — handler 429 standardisé ───────────────────────────────────
-app.state.limiter = limiter
+# ── Rate limiting — UNE seule instance partagée avec les décorateurs des routers ──
+# Les limites sont définies route par route (@limiter.limit) : login, OTP, refresh,
+# WebSocket, QR public, sync… Avant, main.py créait son propre Limiter (jamais
+# utilisé par les décorateurs), donc la limite « globale » annoncée n'existait pas.
+setup_rate_limiting(app)
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -134,13 +168,31 @@ app.add_middleware(
 )
 
 
+# ── Métriques de requêtes (alimentent /health/detailed) ───────────────────────
+@app.middleware("http")
+async def record_request_metrics(request: Request, call_next):
+    """Compte chaque requête HTTP et son code de réponse (hors WebSocket)."""
+    try:
+        response = await call_next(request)
+    except Exception:
+        request_metrics.record(500)
+        raise
+    request_metrics.record(response.status_code)
+    return response
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
+app.include_router(health.router)  # /health, /health/live, /health/ready, /health/detailed
 app.include_router(auth.router,            prefix="/api/v1/auth",          tags=["🔐 Auth"])
 app.include_router(tickets.router,         prefix="/api/v1/tickets",       tags=["🎫 Tickets"])
+app.include_router(sync.router,            prefix="/api/v1/sync",          tags=["🔄 Sync hors-ligne"])
+app.include_router(notifications.router,   prefix="/api/v1/notifications", tags=["🔔 Notifications"])
 app.include_router(organizations.router,   prefix="/api/v1/organizations", tags=["🏢 Organizations"])
 app.include_router(branches.router,        prefix="/api/v1/organizations", tags=["🏦 Branches"])
 app.include_router(services_router.router, prefix="/api/v1",               tags=["🛎 Services"])
+app.include_router(public.router,          prefix="/api/v1",               tags=["📺 Public"])
 app.include_router(analytics.router,       prefix="/api/v1/organizations", tags=["📊 Analytics"])
+app.include_router(exports.router,         prefix="/api/v1/organizations", tags=["📤 Exports"])
 app.include_router(
     counters.router,
     prefix="/api/v1/organizations/{org_id}/branches/{branch_id}/counters",
@@ -160,58 +212,18 @@ async def root():
         "app": "Tonde API",
         "version": settings.APP_VERSION,
         "status": "running",
-        "docs": "/docs",
+        "docs": None if settings.is_production else "/docs",
         "environment": settings.ENVIRONMENT,
     }
-
-
-@app.get("/health", tags=["🏠 Accueil"])
-async def health_check():
-    """
-    Endpoint de santé — vérifié par Docker, load balancers et monitoring.
-    Teste Redis et retourne un statut dégradé si un service est KO.
-    """
-    from sqlalchemy import text
-    from app.core.database import AsyncSessionLocal
-
-    # Test Redis
-    redis_ok = False
-    try:
-        redis = await get_redis()
-        await redis.ping()
-        redis_ok = True
-    except Exception as e:
-        logger.warning(f"Health check Redis KO: {e}")
-
-    # Test PostgreSQL
-    db_ok = False
-    try:
-        async with AsyncSessionLocal() as session:
-            await session.execute(text("SELECT 1"))
-            db_ok = True
-    except Exception as e:
-        logger.warning(f"Health check DB KO: {e}")
-
-    all_ok = redis_ok and db_ok
-
-    return JSONResponse(
-        status_code=200 if all_ok else 503,
-        content={
-            "status": "ok" if all_ok else "degraded",
-            "version": settings.APP_VERSION,
-            "environment": settings.ENVIRONMENT,
-            "services": {
-                "api": "ok",
-                "redis": "ok" if redis_ok else "error",
-                "database": "ok" if db_ok else "error",
-            },
-        },
-    )
 
 
 # ── Gestion globale des erreurs ───────────────────────────────────────────────
 @app.exception_handler(404)
 async def not_found_handler(request, exc):
+    # Les 404 métier lèvent HTTPException(detail={code, message}) : on les laisse passer.
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict) and "code" in detail:
+        return JSONResponse(status_code=404, content={"detail": detail})
     return JSONResponse(
         status_code=404,
         content={

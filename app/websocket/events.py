@@ -36,6 +36,14 @@ class EventType(str, Enum):
     COUNTER_CLOSE      = "counter_close"      # Guichet fermé (broadcast agence)
     COUNTER_PAUSE      = "counter_pause"      # Guichet en pause (broadcast agence)
 
+    # ── Événements internes / priorité ───────────────────────
+    # QUEUE_SNAPSHOT circule UNIQUEMENT entre instances (via Redis) : il contient
+    # les positions de toute une file. Chaque instance le transforme en un
+    # QUEUE_UPDATE individuel par client connecté — un client ne reçoit jamais
+    # les informations des autres.
+    QUEUE_SNAPSHOT     = "queue_snapshot"
+    PRIORITY_UPDATED   = "priority_updated"   # Priorité confirmée/rejetée par un agent (personnel)
+
     # ── Événements système ───────────────────────────────────
     BROADCAST_MESSAGE  = "broadcast_message"  # Message général (broadcast agence)
     CONNECTED          = "connected"          # Confirmation connexion

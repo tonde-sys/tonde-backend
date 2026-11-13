@@ -21,10 +21,10 @@ DÉCISION 9 — Feuille de route IA :
 import logging
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, case
+from sqlalchemy import select, func, and_
 
+from app.models.branch import Service
 from app.models.queue_log import QueueLog, QueueLogAction
-from app.models.ticket import Ticket, TicketStatus
 
 logger = logging.getLogger(__name__)
 
@@ -190,16 +190,51 @@ class AnalyticsService:
         )
         avg_waits = {row.service_id: float(row.avg_wait or 0) for row in wait_result.fetchall()}
 
+        # Appels et absences par service → taux d'absence par service
+        action_counts = await self.db.execute(
+            select(
+                QueueLog.service_id,
+                QueueLog.action,
+                func.count(QueueLog.id).label("total"),
+            )
+            .where(
+                QueueLog.org_id == org_id,
+                QueueLog.agency_id == agency_id,
+                QueueLog.action.in_([QueueLogAction.TICKET_CALLED, QueueLogAction.TICKET_ABSENT]),
+                QueueLog.created_at >= date_from,
+                QueueLog.created_at <= date_to,
+            )
+            .group_by(QueueLog.service_id, QueueLog.action)
+        )
+        called: dict[str, int] = {}
+        absent: dict[str, int] = {}
+        for row in action_counts.fetchall():
+            (called if row.action == QueueLogAction.TICKET_CALLED else absent)[row.service_id] = row.total
+
         # Agréger les résultats
-        all_service_ids = set(volumes.keys()) | set(avg_waits.keys())
-        return [
-            {
+        all_service_ids = set(volumes.keys()) | set(avg_waits.keys()) | set(called.keys())
+        names: dict[str, str] = {}
+        if all_service_ids:
+            name_rows = await self.db.execute(
+                select(Service.id, Service.name).where(Service.id.in_(all_service_ids))
+            )
+            names = {row.id: row.name for row in name_rows.fetchall()}
+
+        stats = []
+        for sid in sorted(all_service_ids):
+            total_called = called.get(sid, 0)
+            total_absent = absent.get(sid, 0)
+            stats.append({
                 "service_id": sid,
+                "service_name": names.get(sid, ""),
                 "total_tickets": volumes.get(sid, 0),
+                "avg_wait_seconds": round(avg_waits.get(sid, 0)),
                 "avg_wait_minutes": round(avg_waits.get(sid, 0) / 60, 1),
-            }
-            for sid in sorted(all_service_ids)
-        ]
+                "total_called": total_called,
+                "total_absent": total_absent,
+                "absence_rate_percent": round(total_absent / total_called * 100, 1) if total_called else 0.0,
+            })
+        return stats
 
     # ── Performances par guichet ──────────────────────────────────────────────
     async def get_counter_performance(

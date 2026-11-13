@@ -26,6 +26,17 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # 001_initial crée un ancien brouillon de 'refresh_tokens' (is_revoked,
+    # device_info) incompatible avec le modèle actuel (revoked_at, device_id).
+    # Sur une base neuve la table est vide : on la remplace. Si elle est déjà au
+    # nouveau format, il n'y a rien à faire (migration idempotente).
+    inspector = sa.inspect(op.get_bind())
+    if 'refresh_tokens' in inspector.get_table_names():
+        existing_columns = {c['name'] for c in inspector.get_columns('refresh_tokens')}
+        if 'revoked_at' in existing_columns:
+            return
+        op.drop_table('refresh_tokens')
+
     op.create_table(
         'refresh_tokens',
 

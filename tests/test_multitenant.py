@@ -78,7 +78,7 @@ def mock_queue():
     with patch("app.services.ticket_service.add_to_queue", new_callable=AsyncMock, return_value=1):
         with patch("app.services.ticket_service.get_queue_size", new_callable=AsyncMock, return_value=1):
             with patch("app.services.ticket_service.remove_from_queue", new_callable=AsyncMock):
-                with patch("app.services.ticket_service.get_next_ticket", new_callable=AsyncMock):
+                with patch("app.services.ticket_service.pop_next_ticket", new_callable=AsyncMock):
                     with patch("app.services.ticket_service.get_queue_position", new_callable=AsyncMock, return_value=1):
                         yield
 

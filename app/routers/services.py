@@ -9,42 +9,20 @@ Endpoints :
   PATCH  /api/v1/organizations/{org_id}/branches/{branch_id}/services/{service_id}
   DELETE /api/v1/organizations/{org_id}/branches/{branch_id}/services/{service_id}
 
-Dépend de : S2-01 (renommage Branch) — utilise /branches/ dans les URLs.
 Aucune logique métier ici, tout délègue à ServiceService.
+Écriture : ADMIN_AGENCY (sa branch uniquement), ADMIN_ORG, SUPER_ADMIN.
 """
-from fastapi import APIRouter, Depends, Query, HTTPException, status
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.access import assert_branch_access
 from app.core.database import get_db
-from app.core.deps import get_current_user
-from app.models.user import User, UserRole
+from app.core.deps import get_current_admin_agency
+from app.models.user import User
+from app.schemas.service import CreateServiceRequest, UpdateServiceRequest
 from app.services.service_service import ServiceService
 
 router = APIRouter()
-
-
-# ── Guards ────────────────────────────────────────────────────────────────────
-
-def _require_branch_admin(current_user: User) -> User:
-    """ADMIN_AGENCY, ADMIN_ORG ou SUPER_ADMIN requis pour modifier les services."""
-    allowed = (UserRole.ADMIN_AGENCY, UserRole.ADMIN_ORG, UserRole.SUPER_ADMIN)
-    if current_user.role not in allowed:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"code": "FORBIDDEN", "message": "Accès réservé aux administrateurs"},
-        )
-    return current_user
-
-
-def _check_org_access(current_user: User, target_org_id: str) -> None:
-    """Vérifie que l'utilisateur peut agir sur l'organisation cible."""
-    if current_user.role == UserRole.SUPER_ADMIN:
-        return
-    if current_user.org_id != target_org_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"code": "FORBIDDEN", "message": "Vous ne pouvez agir que sur votre propre organisation"},
-        )
 
 
 # ── Endpoints protégés (admin) ────────────────────────────────────────────────
@@ -57,15 +35,13 @@ def _check_org_access(current_user: User, target_org_id: str) -> None:
 async def create_service(
     org_id: str,
     branch_id: str,
-    body: dict,
+    body: CreateServiceRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_agency),
 ) -> dict:
-    """Crée un service dans une branch. Réservé aux admins."""
-    _require_branch_admin(current_user)
-    _check_org_access(current_user, org_id)
-    svc = ServiceService(db)
-    result = await svc.create(org_id=org_id, branch_id=branch_id, data=body)
+    """Crée un service dans une branch. Réservé aux admins de cette branch."""
+    await assert_branch_access(db, current_user, org_id, branch_id)
+    result = await ServiceService(db).create(org_id=org_id, branch_id=branch_id, data=body)
     return {"success": True, "data": result, "message": "Service créé"}
 
 
@@ -78,13 +54,11 @@ async def list_services_admin(
     branch_id: str,
     active_only: bool = Query(False),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_agency),
 ) -> dict:
-    """Liste les services d'une branch. Réservé aux admins."""
-    _require_branch_admin(current_user)
-    _check_org_access(current_user, org_id)
-    svc = ServiceService(db)
-    items = await svc.list(branch_id=branch_id, org_id=org_id, active_only=active_only)
+    """Liste les services d'une branch (y compris inactifs). Réservé aux admins."""
+    await assert_branch_access(db, current_user, org_id, branch_id)
+    items = await ServiceService(db).list(branch_id=branch_id, org_id=org_id, active_only=active_only)
     return {"success": True, "data": items}
 
 
@@ -97,12 +71,10 @@ async def get_service(
     branch_id: str,
     service_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_agency),
 ) -> dict:
-    _require_branch_admin(current_user)
-    _check_org_access(current_user, org_id)
-    svc = ServiceService(db)
-    result = await svc.get_by_id(service_id=service_id, branch_id=branch_id, org_id=org_id)
+    await assert_branch_access(db, current_user, org_id, branch_id)
+    result = await ServiceService(db).get_by_id(service_id=service_id, branch_id=branch_id, org_id=org_id)
     return {"success": True, "data": result}
 
 
@@ -114,14 +86,14 @@ async def update_service(
     org_id: str,
     branch_id: str,
     service_id: str,
-    body: dict,
+    body: UpdateServiceRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_agency),
 ) -> dict:
-    _require_branch_admin(current_user)
-    _check_org_access(current_user, org_id)
-    svc = ServiceService(db)
-    result = await svc.update(service_id=service_id, branch_id=branch_id, org_id=org_id, data=body)
+    await assert_branch_access(db, current_user, org_id, branch_id)
+    result = await ServiceService(db).update(
+        service_id=service_id, branch_id=branch_id, org_id=org_id, data=body
+    )
     return {"success": True, "data": result, "message": "Service mis à jour"}
 
 
@@ -134,12 +106,10 @@ async def delete_service(
     branch_id: str,
     service_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_agency),
 ) -> dict:
-    _require_branch_admin(current_user)
-    _check_org_access(current_user, org_id)
-    svc = ServiceService(db)
-    await svc.delete(service_id=service_id, branch_id=branch_id, org_id=org_id)
+    await assert_branch_access(db, current_user, org_id, branch_id)
+    await ServiceService(db).delete(service_id=service_id, branch_id=branch_id, org_id=org_id)
     return {"success": True, "message": "Service désactivé"}
 
 
@@ -158,6 +128,5 @@ async def list_services_public(
     Accessible sans authentification — utilisé par le mobile
     pour afficher les services disponibles avant de prendre un ticket.
     """
-    svc = ServiceService(db)
-    items = await svc.list(branch_id=branch_id, org_id=None, active_only=True)
+    items = await ServiceService(db).list(branch_id=branch_id, org_id=None, active_only=True)
     return {"success": True, "data": items}

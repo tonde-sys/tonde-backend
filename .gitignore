@@ -2,6 +2,12 @@
 .env
 .env.*
 !.env.example
+!.env.production.example
+
+# ── Bootstrap pilote ─────────────────────────────────────────
+# Le fichier réel contient les emails de l'organisation ; garder
+# uniquement l'exemple versionné.
+bootstrap/pilot.json
 
 # ── Python ───────────────────────────────────────────────────
 __pycache__/

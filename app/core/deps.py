@@ -103,6 +103,31 @@ async def get_current_user(
     return await _load_user(user_id, db)
 
 
+async def get_optional_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(HTTPBearer(auto_error=False)),
+    db: AsyncSession = Depends(get_db),
+) -> User | None:
+    """
+    Retourne l'utilisateur connecté s'il y en a un, sinon None (route publique).
+
+    Un jeton ABSENT donne None. Un jeton PRÉSENT mais invalide est refusé (401) : on
+    ne dégrade pas silencieusement une requête authentifiée en requête anonyme.
+
+    Raises:
+        HTTPException 401: Jeton fourni mais invalide / utilisateur désactivé
+    """
+    if credentials is None:
+        return None
+    user_id = verify_token(credentials.credentials, token_type="access")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "INVALID_TOKEN", "message": "Token invalide ou expiré"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await _load_user(user_id, db)
+
+
 # ── Dépendances par rôle ──────────────────────────────────────────────────────
 async def get_current_agent(
     current_user: User = Depends(_require_role(UserRole.AGENT)),

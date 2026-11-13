@@ -1,0 +1,88 @@
+# TONDE — pile de production autonome (VPS / serveur dédié).
+#
+# Lancement :
+#   cp .env.production.example .env.production
+#   # remplir .env.production (secrets, domaine, SMS)
+#   docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+#
+# Différences volontaires avec docker-compose.yml (développement) :
+#   - pas de montage de code ni de --reload ;
+#   - mots de passe obligatoires, aucune valeur par défaut faible ;
+#   - PostgreSQL et Redis ne sont pas exposés sur Internet ;
+#   - Redis persiste sur disque (appendonly) et n'évince jamais la file ;
+#   - migrations Alembic exécutées avant le démarrage de l'API ;
+#   - conteneur API non-root, en lecture seule, capabilities supprimées.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tonde-api:production
+    env_file:
+      - .env.production
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+      CREATE_TABLES_ON_STARTUP: "false"
+      PORT: "8000"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tonde}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD est obligatoire}@db:5432/${POSTGRES_DB:-tonde_db}
+      REDIS_URL: redis://redis:6379
+    ports:
+      # Par défaut, accessible uniquement depuis l'hôte (reverse proxy Caddy/Nginx).
+      - "${API_BIND_ADDRESS:-127.0.0.1}:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "alembic upgrade head &&
+             exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+             --proxy-headers --forwarded-allow-ips='*'"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tonde}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD est obligatoire}
+      POSTGRES_DB: ${POSTGRES_DB:-tonde_db}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tonde} -d ${POSTGRES_DB:-tonde_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

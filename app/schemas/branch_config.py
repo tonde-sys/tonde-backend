@@ -10,6 +10,25 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 # ── Sous-schéma horaires ──────────────────────────────────────────────────────
 
+def validate_hhmm(value: object, label: str = "horaire") -> str:
+    """
+    Vérifie qu'une valeur est une heure HH:MM RÉELLE (00:00 à 23:59).
+
+    L'ancien contrôle (`\\d{2}:\\d{2}`) acceptait « 25:99 », et une valeur non textuelle
+    provoquait une erreur 500. Les horaires sont comparés tels quels (chaînes zéro-complétées)
+    pour décider si une branch est ouverte : ils doivent donc être strictement valides.
+
+    Raises:
+        ValueError: format invalide ou heure inexistante
+    """
+    if not isinstance(value, str) or not re.fullmatch(r"\d{2}:\d{2}", value):
+        raise ValueError(f"Format horaire invalide pour {label} : utiliser HH:MM")
+    hour, minute = int(value[:2]), int(value[3:])
+    if hour > 23 or minute > 59:
+        raise ValueError(f"Heure inexistante pour {label} : {value}")
+    return value
+
+
 class DayHours(BaseModel):
     """Horaires d'ouverture pour un jour de la semaine."""
     open: str   # ex: "08:00"
@@ -18,9 +37,7 @@ class DayHours(BaseModel):
     @field_validator("open", "close")
     @classmethod
     def valid_time_format(cls, v: str) -> str:
-        if not re.match(r"^\d{2}:\d{2}$", v):
-            raise ValueError("Format horaire invalide, utiliser HH:MM")
-        return v
+        return validate_hhmm(v)
 
 
 # Jours valides
@@ -85,10 +102,11 @@ class UpdateBranchConfigRequest(BaseModel):
                 raise ValueError(
                     f"Horaires invalides pour '{day}'. Format attendu : {{\"open\": \"HH:MM\", \"close\": \"HH:MM\"}}"
                 )
-            # Valider le format HH:MM
+            # Heures réelles (pas « 25:99 ») et ouverture strictement avant fermeture
             for key in ("open", "close"):
-                if not re.match(r"^\d{2}:\d{2}$", hours[key]):
-                    raise ValueError(f"Format horaire invalide pour {day}.{key} : utiliser HH:MM")
+                validate_hhmm(hours[key], f"{day}.{key}")
+            if hours["open"] >= hours["close"]:
+                raise ValueError(f"{day} : l'ouverture ({hours['open']}) doit précéder la fermeture ({hours['close']})")
         return v
 
     @field_validator("supported_languages")

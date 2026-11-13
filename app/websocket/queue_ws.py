@@ -20,18 +20,40 @@ Objectifs de performance :
 import json
 import asyncio
 import logging
-from typing import Dict, Set, Optional
-from fastapi import WebSocket, WebSocketDisconnect
+from typing import Dict, Set
+from fastapi import WebSocket
 
 from app.websocket.events import (
-    EventType, YourTurnEvent, TicketCalledEvent,
-    make_connected_event, make_pong_event,
+    EventType, YourTurnEvent,
 )
 
 logger = logging.getLogger(__name__)
 
 # Canal Redis Pub/Sub pour les événements TONDE
 REDIS_EVENTS_CHANNEL = "tonde:events:{org_id}"
+
+# On compare des VALEURS (str) : les événements arrivent de Redis sous forme de JSON
+# décodé, donc `event["type"]` est une chaîne simple, pas un membre d'EventType.
+
+# Événements adressés à UN client (champ 'ticket_id' obligatoire)
+PERSONAL_EVENTS = {
+    EventType.YOUR_TURN.value,
+    EventType.QUEUE_UPDATE.value,
+    EventType.TICKET_DONE.value,
+    EventType.TICKET_ABSENT.value,
+    EventType.TICKET_TRANSFERRED.value,
+    EventType.ABSENT_WARNING.value,
+    EventType.PRIORITY_UPDATED.value,
+}
+
+# Événements diffusés à toute la salle d'une branch (champ 'agency_id' obligatoire)
+AGENCY_BROADCAST_EVENTS = {
+    EventType.TICKET_CALLED.value,
+    EventType.BROADCAST_MESSAGE.value,
+    EventType.COUNTER_OPEN.value,
+    EventType.COUNTER_CLOSE.value,
+    EventType.COUNTER_PAUSE.value,
+}
 
 
 class QueueWebSocketManager:
@@ -236,20 +258,46 @@ class QueueWebSocketManager:
         """
         event_type = event.get("type")
 
-        if event_type == EventType.YOUR_TURN:
+        # Événements PERSONNELS : un seul client (celui du ticket)
+        if event_type in PERSONAL_EVENTS:
             await self.send_to_ticket(event["ticket_id"], event)
 
-        elif event_type == EventType.TICKET_CALLED:
+        # Événements de SALLE : tous les clients connectés à la branch
+        elif event_type in AGENCY_BROADCAST_EVENTS:
             await self.broadcast_to_agency(event["agency_id"], event)
 
-        elif event_type == EventType.QUEUE_UPDATE:
-            await self.send_to_ticket(event["ticket_id"], event)
-
-        elif event_type == EventType.BROADCAST_MESSAGE:
-            await self.broadcast_to_agency(event["agency_id"], event)
+        # État complet d'une file → un QUEUE_UPDATE individuel par client local
+        elif event_type == EventType.QUEUE_SNAPSHOT.value:
+            await self._dispatch_queue_snapshot(event)
 
         else:
             logger.debug(f"Événement non routé : {event_type}")
+
+    async def _dispatch_queue_snapshot(self, event: dict) -> None:
+        """
+        Transforme un snapshot de file en messages individuels.
+
+        Pour chaque ticket du snapshot connecté SUR CETTE INSTANCE, envoie sa
+        propre position et son ETA. Les clients ne voient jamais les positions
+        ni les identifiants des autres tickets.
+        """
+        positions: dict[str, int] = event.get("positions", {})
+        eta_per_position = int(event.get("eta_seconds_per_position", 0))
+        total = int(event.get("total_in_queue", len(positions)))
+
+        for ticket_id in list(self.connections_by_ticket.keys()):
+            position = positions.get(ticket_id)
+            if position is None:
+                continue
+            ahead = max(0, position - 1)
+            await self.send_to_ticket(ticket_id, {
+                "type": EventType.QUEUE_UPDATE.value,
+                "ticket_id": ticket_id,
+                "position": position,
+                "total_in_queue": total,
+                "estimated_wait_minutes": -(-ahead * eta_per_position // 60),  # arrondi supérieur
+                "current_called_number": event.get("current_called_number", ""),
+            })
 
     async def publish_event(self, org_id: str, event: dict) -> None:
         """

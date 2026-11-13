@@ -13,6 +13,7 @@ from sqlalchemy import select
 from fastapi import HTTPException
 
 from app.models.branch import Branch, Service
+from app.schemas.service import CreateServiceRequest, UpdateServiceRequest
 
 
 class ServiceService:
@@ -20,14 +21,14 @@ class ServiceService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
-    async def create(self, org_id: str, branch_id: str, data: dict) -> dict:
+    async def create(self, org_id: str, branch_id: str, data: CreateServiceRequest) -> dict:
         """
         Crée un nouveau service dans une branch.
 
         Args:
             org_id: ID de l'organisation (isolation multi-tenant)
             branch_id: ID de la branch parente
-            data: name, description, ticket_prefix, avg_duration_minutes, is_active
+            data: Données validées (name, description, ticket_prefix, avg_duration_minutes, is_active)
 
         Returns:
             Dict du service créé
@@ -39,8 +40,8 @@ class ServiceService:
         # Vérifier que la branch existe et appartient à l'org
         await self._verify_branch(branch_id, org_id)
 
-        # Vérifier l'unicité du préfixe dans la branch
-        prefix = data.get("ticket_prefix", "A").upper()
+        # Vérifier l'unicité du préfixe dans la branch (déjà normalisé en majuscules)
+        prefix = data.ticket_prefix
         existing = await self.db.execute(
             select(Service).where(
                 Service.branch_id == branch_id,
@@ -61,11 +62,11 @@ class ServiceService:
             id=str(uuid.uuid4()),
             org_id=org_id,
             branch_id=branch_id,
-            name=data.get("name", "").strip(),
-            description=data.get("description"),
+            name=data.name,
+            description=data.description,
             ticket_prefix=prefix,
-            avg_duration_minutes=data.get("avg_duration_minutes", 5),
-            is_active=data.get("is_active", True),
+            avg_duration_minutes=data.avg_duration_minutes,
+            is_active=data.is_active,
         )
         self.db.add(service)
         await self.db.commit()
@@ -135,16 +136,16 @@ class ServiceService:
         return [self._to_dict(s) for s in services]
 
     async def update(
-        self, service_id: str, branch_id: str, org_id: str, data: dict
+        self, service_id: str, branch_id: str, org_id: str, data: UpdateServiceRequest
     ) -> dict:
         """
-        Met à jour un service (PATCH partiel).
+        Met à jour un service (PATCH partiel : seuls les champs fournis changent).
 
         Args:
             service_id: UUID du service à modifier
             branch_id: UUID de la branch parente
             org_id: org_id de l'appelant pour vérification
-            data: Champs à mettre à jour
+            data: Champs validés à mettre à jour
 
         Returns:
             Dict du service mis à jour
@@ -166,10 +167,8 @@ class ServiceService:
                 detail={"code": "SERVICE_NOT_FOUND", "message": "Service introuvable"},
             )
 
-        allowed_fields = {"name", "description", "avg_duration_minutes", "is_active"}
-        for field, value in data.items():
-            if field in allowed_fields:
-                setattr(service, field, value)
+        for field, value in data.model_dump(exclude_unset=True).items():
+            setattr(service, field, value)
 
         await self.db.commit()
         await self.db.refresh(service)

@@ -28,7 +28,7 @@ def mock_queue(mock_redis):
     with patch("app.services.ticket_service.add_to_queue", new_callable=AsyncMock, return_value=1):
         with patch("app.services.ticket_service.get_queue_size", new_callable=AsyncMock, return_value=1):
             with patch("app.services.ticket_service.remove_from_queue", new_callable=AsyncMock):
-                with patch("app.services.ticket_service.get_next_ticket", new_callable=AsyncMock):
+                with patch("app.services.ticket_service.pop_next_ticket", new_callable=AsyncMock):
                     with patch("app.services.ticket_service.get_queue_position", new_callable=AsyncMock, return_value=1):
                         yield
 
@@ -97,7 +97,7 @@ async def test_create_ticket_success(ticket_service, db_session, mock_queue):
         org_id=org.id,
     )
 
-    assert result.number == "A-1"
+    assert result.number == "A-001"
     assert result.status == "waiting"
     assert result.priority == "standard"
     assert result.position == 1
@@ -277,18 +277,49 @@ async def test_state_machine_invalid_transition_raises_400(ticket_service, db_se
 @pytest.mark.asyncio
 async def test_state_machine_terminal_states_are_blocked(ticket_service, db_session, mock_queue):
     """Les états terminaux (DONE, CANCELLED) n'autorisent aucune transition."""
-    from app.models.ticket import Ticket, ALLOWED_TRANSITIONS
+    from app.models.ticket import ALLOWED_TRANSITIONS
 
-    terminal_states = [
-        TicketStatus.DONE,
-        TicketStatus.CANCELLED,
-        TicketStatus.INCOMPLETE,
-        TicketStatus.TRANSFERRED,
-    ]
-
-    for state in terminal_states:
+    # Seuls DONE et CANCELLED sont terminaux. TRANSFERRED, ABSENT et INCOMPLETE sont des
+    # statuts « actifs » (DÉCISION 1) : ils DOIVENT avoir une sortie, sinon le client
+    # serait bloqué pour toujours (règle « 1 ticket actif »).
+    for state in (TicketStatus.DONE, TicketStatus.CANCELLED):
         assert ALLOWED_TRANSITIONS[state] == [], \
             f"L'état {state} devrait être terminal (aucune transition autorisée)"
+
+
+def test_every_active_status_has_an_exit():
+    """Aucun statut actif ne piège le client : chacun mène à WAITING ou à un état terminal."""
+    from app.models.ticket import ALLOWED_TRANSITIONS
+    from app.services.ticket_service import ACTIVE_STATUSES
+
+    terminal = {TicketStatus.DONE, TicketStatus.CANCELLED}
+    for state in ACTIVE_STATUSES:
+        exits = set(ALLOWED_TRANSITIONS[state])
+        assert exits, f"{state} est actif mais n'a aucune sortie : client bloqué à vie"
+        # Depuis l'état, on doit pouvoir atteindre un état terminal (éventuellement via WAITING)
+        reachable, frontier = set(), set(exits)
+        while frontier:
+            current = frontier.pop()
+            if current in reachable:
+                continue
+            reachable.add(current)
+            frontier |= set(ALLOWED_TRANSITIONS[current])
+        assert reachable & terminal, f"{state} ne mène jamais à un état terminal"
+
+
+def test_new_transitions_are_allowed():
+    """Les transitions du transfert, de l'expiration et de la reprise sont autorisées."""
+    from app.models.ticket import ALLOWED_TRANSITIONS
+
+    assert TicketStatus.TRANSFERRED in ALLOWED_TRANSITIONS[TicketStatus.CALLED]
+    assert TicketStatus.TRANSFERRED in ALLOWED_TRANSITIONS[TicketStatus.SERVING]
+    assert TicketStatus.WAITING in ALLOWED_TRANSITIONS[TicketStatus.TRANSFERRED]
+    assert TicketStatus.CANCELLED in ALLOWED_TRANSITIONS[TicketStatus.ABSENT]
+    assert TicketStatus.WAITING in ALLOWED_TRANSITIONS[TicketStatus.INCOMPLETE]
+    assert TicketStatus.CANCELLED in ALLOWED_TRANSITIONS[TicketStatus.INCOMPLETE]
+    # Interdits : on ne « ressuscite » pas un ticket terminé, ni DONE depuis WAITING
+    assert TicketStatus.WAITING not in ALLOWED_TRANSITIONS[TicketStatus.DONE]
+    assert TicketStatus.DONE not in ALLOWED_TRANSITIONS[TicketStatus.WAITING]
 
 
 # ── TASK-03 : tests règle "1 ticket actif global" ─────────────────────────────
@@ -584,3 +615,120 @@ def test_callnextrequest_valid_with_service_id():
         counter_name="Guichet 1",
     )
     assert req.service_id == "s-1"
+
+
+# ── Fix : clients OTP sans organisation (User.org_id = NULL) ──────────────────
+# Régression : get/cancel/return renvoyaient 404 car la recherche filtrait
+# Ticket.org_id == None. Les clients sont retrouvés par propriétaire (user_id).
+
+async def _create_ticket_for_org_less_client(ticket_service, db_session, user_id: str):
+    """Crée org + branch + service, puis un ticket pour un client sans org."""
+    org = await _create_test_org(db_session)
+    agency = await _create_test_agency(db_session, org.id)
+    service = await _create_test_service(db_session, agency.id, org.id)
+    ticket = await ticket_service.create_ticket(
+        CreateTicketRequest(agency_id=agency.id, service_id=service.id),
+        user_id=user_id,
+        org_id=None,  # client OTP : pas d'organisation
+    )
+    return org, agency, service, ticket
+
+
+@pytest.mark.asyncio
+async def test_org_less_client_can_get_own_ticket(ticket_service, db_session, mock_queue):
+    """Un client sans org retrouve son propre ticket (plus de 404)."""
+    org, agency, service, created = await _create_ticket_for_org_less_client(
+        ticket_service, db_session, "client-otp-get"
+    )
+
+    result = await ticket_service.get_ticket(created.id, "client-otp-get", None)
+
+    assert result.id == created.id
+    assert result.number == created.number
+    assert result.status == "waiting"
+
+
+@pytest.mark.asyncio
+async def test_org_less_client_cannot_get_other_clients_ticket(ticket_service, db_session, mock_queue):
+    """Un client sans org ne peut pas lire le ticket d'un autre → 404 (pas de fuite)."""
+    _, _, _, created = await _create_ticket_for_org_less_client(
+        ticket_service, db_session, "client-owner"
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await ticket_service.get_ticket(created.id, "client-intruder", None)
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail["code"] == "TICKET_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_org_less_client_can_cancel_and_queue_uses_ticket_org(ticket_service, db_session, mock_queue):
+    """L'annulation fonctionne et la file Redis est celle de l'org du ticket."""
+    org, agency, service, created = await _create_ticket_for_org_less_client(
+        ticket_service, db_session, "client-otp-cancel"
+    )
+
+    with patch(
+        "app.services.ticket_service.remove_from_queue", new_callable=AsyncMock
+    ) as remove_mock:
+        result = await ticket_service.cancel_ticket(created.id, "client-otp-cancel", None)
+
+    assert result["success"] is True
+    # remove_from_queue(org_id, agency_id, service_id, ticket_id) — org du ticket, pas None
+    assert remove_mock.call_args.args[0] == org.id
+    assert remove_mock.call_args.args[1] == agency.id
+    assert remove_mock.call_args.args[2] == service.id
+
+
+@pytest.mark.asyncio
+async def test_org_less_client_cannot_cancel_other_clients_ticket(ticket_service, db_session, mock_queue):
+    """Un client sans org ne peut pas annuler le ticket d'un autre → 404."""
+    _, _, _, created = await _create_ticket_for_org_less_client(
+        ticket_service, db_session, "client-owner-2"
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await ticket_service.cancel_ticket(created.id, "client-intruder-2", None)
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_org_less_client_can_return_to_queue_from_absent(ticket_service, db_session, mock_queue):
+    """Un client absent sans org revient en file (ABSENT → WAITING)."""
+    from sqlalchemy import select
+    from app.models.ticket import Ticket
+
+    org, agency, service, created = await _create_ticket_for_org_less_client(
+        ticket_service, db_session, "client-otp-return"
+    )
+    result = await db_session.execute(select(Ticket).where(Ticket.id == created.id))
+    ticket = result.scalar_one()
+    ticket.status = TicketStatus.ABSENT
+    await db_session.commit()
+
+    with patch(
+        "app.services.ticket_service.add_to_queue", new_callable=AsyncMock, return_value=1
+    ) as add_mock:
+        resp = await ticket_service.return_to_queue(
+            created.id, "", user_id="client-otp-return"
+        )
+
+    assert resp["success"] is True
+    await db_session.refresh(ticket)
+    assert ticket.status == TicketStatus.WAITING
+    assert add_mock.call_args.args[0] == org.id
+
+
+@pytest.mark.asyncio
+async def test_return_to_queue_rejects_other_clients_ticket(ticket_service, db_session, mock_queue):
+    """Un client ne peut pas remettre en file le ticket d'un autre → 404."""
+    _, _, _, created = await _create_ticket_for_org_less_client(
+        ticket_service, db_session, "client-owner-3"
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await ticket_service.return_to_queue(created.id, "", user_id="client-intruder-3")
+
+    assert exc_info.value.status_code == 404

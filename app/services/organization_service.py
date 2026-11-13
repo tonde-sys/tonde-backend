@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from fastapi import HTTPException
 import secrets
-import string
 from datetime import datetime, timezone, timedelta
 
 from app.models.organization import Organization
@@ -18,7 +17,6 @@ from app.schemas.organization import (
     UpdateOrganizationRequest,
     OrganizationResponse,
     OrganizationListResponse,
-    JoinByCodeRequest,
     GenerateInvitationCodeRequest,
     OrganizationMemberResponse,
     UserOrganizationListResponse,

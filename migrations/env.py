@@ -13,7 +13,7 @@ Configuré pour :
 import asyncio
 from logging.config import fileConfig
 
-from sqlalchemy import pool
+from sqlalchemy import pool, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -39,6 +39,9 @@ from app.models import (  # noqa: F401
     ticket,
     refresh_token,
     user_organization,
+    queue_log,
+    notification,
+    audit_log,
 )
 
 # ── Configuration Alembic ─────────────────────────────────────────────────────
@@ -75,7 +78,28 @@ def run_migrations_offline() -> None:
 
 
 # ── Mode online async (application réelle des migrations) ────────────────────
+def _ensure_wide_version_column(connection: Connection) -> None:
+    """
+    Élargit alembic_version.version_num à VARCHAR(255).
+
+    Alembic le crée en VARCHAR(32), or nos identifiants de révision sont plus
+    longs (ex. '006_add_notifications_and_queue_logs', 36 caractères) : sans
+    cela, l'application des migrations échoue depuis une base vide.
+    Idempotent : sans effet si la colonne est déjà assez large.
+    """
+    connection.execute(text(
+        "CREATE TABLE IF NOT EXISTS alembic_version ("
+        "version_num VARCHAR(255) NOT NULL, "
+        "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+    ))
+    connection.execute(text(
+        "ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(255)"
+    ))
+    connection.commit()
+
+
 def do_run_migrations(connection: Connection) -> None:
+    _ensure_wide_version_column(connection)
     context.configure(
         connection=connection,
         target_metadata=target_metadata,

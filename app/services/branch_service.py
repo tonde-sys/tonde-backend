@@ -20,6 +20,7 @@ from app.schemas.branch import (
     BranchResponse,
     BranchListResponse,
 )
+from app.schemas.branch_config import BranchConfigResponse, UpdateBranchConfigRequest
 
 
 class BranchService:
@@ -249,8 +250,6 @@ class BranchService:
         Raises:
             HTTPException 404: Si la branch est introuvable ou hors org
         """
-        from app.schemas.branch_config import BranchConfigResponse
-
         query = select(Branch).where(Branch.id == branch_id)
         if caller_org_id is not None:
             query = query.where(Branch.org_id == caller_org_id)

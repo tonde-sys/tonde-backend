@@ -1,7 +1,7 @@
 """
 Sécurité : JWT, hachage de mots de passe, OTP.
 """
-import random
+import secrets
 import string
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -85,10 +85,13 @@ def verify_token(token: str, token_type: str = "access") -> Optional[str]:
 # ── OTP — Code de vérification par SMS ───────────────────────────────────────
 def generate_otp(length: int = 6) -> str:
     """
-    Génère un code OTP à 6 chiffres.
+    Génère un code OTP à 6 chiffres avec un générateur cryptographiquement sûr.
+
+    `secrets` (CSPRNG du système) et non `random` (Mersenne Twister, prévisible
+    à partir de quelques sorties) : un code de vérification doit être imprévisible.
     Exemple : "483921"
     """
-    return "".join(random.choices(string.digits, k=length))
+    return "".join(secrets.choice(string.digits) for _ in range(length))
 
 
 # ── En dev : OTP fixe pour les tests ─────────────────────────────────────────
