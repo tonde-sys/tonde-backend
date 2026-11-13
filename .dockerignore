@@ -1,0 +1,22 @@
+# Contexte de build minimal : l'image ne doit contenir que l'application.
+.git
+.github
+.kiro
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.coverage
+htmlcov
+coverage.xml
+tests
+.env
+.env.*
+!.env.example
+bootstrap/pilot.json
+*.log
+PERSONAL_CONTEXT.md
+TEAM_WORKFLOW.md
+docker-compose*.yml
+render.yaml
