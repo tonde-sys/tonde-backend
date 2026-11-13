@@ -473,6 +473,21 @@ readiness probe.
   avec `BOOTSTRAP_PASSWORDS_JSON`.
 - Clé Africa's Talking / Firebase : mettre à jour dans Render, redéployer.
 
+**Sans shell (Render gratuit)** : la rotation passe par l'entrypoint.
+
+1. Générer des mots de passe forts (gestionnaire de secrets).
+2. Dans **Environment**, définir :
+   - `BOOTSTRAP_PASSWORDS_JSON` : `{"email":"mot-de-passe", ...}` pour tous les
+     comptes à rotationner ;
+   - `BOOTSTRAP_RESET_PASSWORDS=true`.
+3. Redéployer et vérifier chaque login.
+4. **Retirer `BOOTSTRAP_RESET_PASSWORDS`** (et `BOOTSTRAP_PASSWORDS_JSON`) puis
+   redéployer. Sinon chaque redémarrage réapplique ces mots de passe.
+
+> Les mots de passe restent dans l'environnement Render tant que
+> `BOOTSTRAP_RESET_PASSWORDS` est présent. Les retirer ferme la fenêtre de
+> rotation ; `BOOTSTRAP_CONFIG_JSON` suffit ensuite pour le bootstrap idempotent.
+
 ---
 
 ## 6. Sécurité — checklist avant pilote

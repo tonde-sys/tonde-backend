@@ -9,6 +9,10 @@
 #                                   démarrage. Idempotent : les redémarrages ne
 #                                   créent pas de doublon et ne changent pas les
 #                                   mots de passe existants.
+#   BOOTSTRAP_RESET_PASSWORDS=true  réinitialise les mots de passe des comptes
+#                                   existants depuis BOOTSTRAP_PASSWORDS_JSON.
+#                                   À retirer après la rotation : sinon chaque
+#                                   redémarrage réapplique ces mots de passe.
 set -eu
 
 if [ "${RUN_MIGRATIONS_ON_STARTUP:-false}" = "true" ]; then
@@ -19,7 +23,12 @@ fi
 if [ -n "${BOOTSTRAP_CONFIG_JSON:-}" ]; then
     echo "[entrypoint] bootstrap de l'organisation pilote..."
     printf '%s' "$BOOTSTRAP_CONFIG_JSON" > /tmp/tonde-bootstrap.json
-    python -m app.cli bootstrap --config /tmp/tonde-bootstrap.json
+    if [ "${BOOTSTRAP_RESET_PASSWORDS:-false}" = "true" ]; then
+        echo "[entrypoint] rotation des mots de passe depuis BOOTSTRAP_PASSWORDS_JSON..."
+        python -m app.cli bootstrap --config /tmp/tonde-bootstrap.json --reset-passwords
+    else
+        python -m app.cli bootstrap --config /tmp/tonde-bootstrap.json
+    fi
     rm -f /tmp/tonde-bootstrap.json
 fi
 
