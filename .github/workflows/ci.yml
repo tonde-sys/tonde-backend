@@ -6,10 +6,15 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: Tests & Qualité
+    name: Migrations, tests et image
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     services:
       postgres:
@@ -22,7 +27,7 @@ jobs:
           --health-cmd pg_isready
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
         ports:
           - 5432:5432
 
@@ -32,9 +37,16 @@ jobs:
           --health-cmd "redis-cli ping"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
         ports:
           - 6379:6379
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://tonde:tonde123@localhost:5432/tonde_db
+      REDIS_URL: redis://localhost:6379
+      JWT_SECRET_KEY: ci-test-secret-key-not-for-production
+      ENVIRONMENT: development
+      CREATE_TABLES_ON_STARTUP: "false"
 
     steps:
       - name: Checkout
@@ -45,15 +57,36 @@ jobs:
         with:
           python-version: "3.12"
           cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-dev.txt
+
+      - name: Apply Alembic migrations from an empty database
+        run: alembic upgrade head
 
       - name: Run tests
-        env:
-          DATABASE_URL: postgresql+asyncpg://tonde:tonde123@localhost:5432/tonde_db
-          REDIS_URL: redis://localhost:6379
-          JWT_SECRET_KEY: ci-test-secret-key-not-for-production
-          ENVIRONMENT: development
-          CREATE_TABLES_ON_STARTUP: "false"
         run: pytest --tb=short -q
+
+      - name: Validate production configuration guardrails
+        env:
+          ENVIRONMENT: production
+          DEBUG: "false"
+          CREATE_TABLES_ON_STARTUP: "false"
+          DATABASE_URL: postgresql://tonde:tonde123@localhost:5432/tonde_db
+          JWT_SECRET_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          ALLOWED_ORIGINS: https://app.example.com
+        run: |
+          python - <<'PY'
+          from app.core.config import Settings
+
+          settings = Settings()
+          assert settings.DATABASE_URL.startswith("postgresql+asyncpg://")
+          assert settings.is_production
+          print("Configuration de production valide.")
+          PY
+
+      - name: Build production image
+        run: docker build --tag tonde-api:ci .
