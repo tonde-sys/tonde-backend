@@ -59,7 +59,9 @@ ALLOWED_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.INCOMPLETE,
     ],
     TicketStatus.ABSENT: [
-        TicketStatus.WAITING,  # Le client demande à revenir en file
+        TicketStatus.WAITING,     # Le client demande à revenir en file
+        TicketStatus.CANCELLED,   # …ou renonce : sans cette sortie, un client
+                                  # absent restait bloqué (ABSENT est « actif »)
     ],
     # États terminaux — aucune transition possible
     TicketStatus.DONE:        [],

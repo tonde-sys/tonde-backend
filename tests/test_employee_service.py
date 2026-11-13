@@ -48,6 +48,16 @@ async def _create_user(db_session, email: str = "agent@test.bi", name: str = "Ag
     return user.id
 
 
+def _caller(org_id: str, role: UserRole = UserRole.ADMIN_ORG) -> User:
+    """
+    Utilisateur appelant factice.
+
+    EmployeeService ne lit que `role` et `org_id` sur l'appelant : inutile de
+    persister cette instance. Le rôle détermine les rôles attribuables.
+    """
+    return User(id=f"caller-{role.value}", org_id=org_id, role=role)
+
+
 # ── Create ────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -58,7 +68,8 @@ async def test_create_employee_success(employee_service, org_service, db_session
 
     result = await employee_service.create(
         org_id,
-        CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT)
+        CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT),
+        caller=_caller(org_id),
     )
 
     assert result.org_id == org_id
@@ -76,7 +87,8 @@ async def test_create_employee_updates_user_role(employee_service, org_service, 
 
     await employee_service.create(
         org_id,
-        CreateEmployeeRequest(user_id=user_id, role=UserRole.SUPERVISOR)
+        CreateEmployeeRequest(user_id=user_id, role=UserRole.SUPERVISOR),
+        caller=_caller(org_id),
     )
 
     result = await db_session.execute(select(User).where(User.id == user_id))
@@ -93,7 +105,8 @@ async def test_create_employee_user_not_found_raises_404(employee_service, org_s
     with pytest.raises(HTTPException) as exc_info:
         await employee_service.create(
             org_id,
-            CreateEmployeeRequest(user_id="bad-user-id", role=UserRole.AGENT)
+            CreateEmployeeRequest(user_id="bad-user-id", role=UserRole.AGENT),
+            caller=_caller(org_id),
         )
 
     assert exc_info.value.status_code == 404
@@ -106,10 +119,10 @@ async def test_create_employee_duplicate_raises_409(employee_service, org_servic
     org_id = await _create_org(org_service)
     user_id = await _create_user(db_session, email="dup@test.bi")
 
-    await employee_service.create(org_id, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT))
+    await employee_service.create(org_id, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT), caller=_caller(org_id))
 
     with pytest.raises(HTTPException) as exc_info:
-        await employee_service.create(org_id, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT))
+        await employee_service.create(org_id, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT), caller=_caller(org_id))
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail["code"] == "EMPLOYEE_EXISTS"
@@ -131,7 +144,7 @@ async def test_get_employee_by_id_success(employee_service, org_service, db_sess
     """Récupère un employé par son ID."""
     org_id = await _create_org(org_service)
     user_id = await _create_user(db_session, email="get@test.bi")
-    created = await employee_service.create(org_id, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT))
+    created = await employee_service.create(org_id, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT), caller=_caller(org_id))
 
     result = await employee_service.get_by_id(created.id, org_id)
     assert result.id == created.id
@@ -144,7 +157,7 @@ async def test_get_employee_wrong_org_raises_404(employee_service, org_service, 
     org_a = await _create_org(org_service, slug="org-a", name="Org A")
     org_b = await _create_org(org_service, slug="org-b", name="Org B")
     user_id = await _create_user(db_session, email="isolation@test.bi")
-    created = await employee_service.create(org_a, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT))
+    created = await employee_service.create(org_a, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT), caller=_caller(org_a))
 
     with pytest.raises(HTTPException) as exc_info:
         await employee_service.get_by_id(created.id, org_b)
@@ -176,9 +189,9 @@ async def test_list_employees_filtered_by_org(employee_service, org_service, db_
     user_2 = await _create_user(db_session, email="u2@test.bi")
     user_3 = await _create_user(db_session, email="u3@test.bi")
 
-    await employee_service.create(org_a, CreateEmployeeRequest(user_id=user_1, role=UserRole.AGENT))
-    await employee_service.create(org_a, CreateEmployeeRequest(user_id=user_2, role=UserRole.SUPERVISOR))
-    await employee_service.create(org_b, CreateEmployeeRequest(user_id=user_3, role=UserRole.AGENT))
+    await employee_service.create(org_a, CreateEmployeeRequest(user_id=user_1, role=UserRole.AGENT), caller=_caller(org_a))
+    await employee_service.create(org_a, CreateEmployeeRequest(user_id=user_2, role=UserRole.SUPERVISOR), caller=_caller(org_a))
+    await employee_service.create(org_b, CreateEmployeeRequest(user_id=user_3, role=UserRole.AGENT), caller=_caller(org_b))
 
     result_a = await employee_service.list(org_id=org_a)
     assert result_a.total == 2
@@ -193,8 +206,8 @@ async def test_list_employees_filter_by_role(employee_service, org_service, db_s
     org_id = await _create_org(org_service)
     u1 = await _create_user(db_session, email="agent1@test.bi")
     u2 = await _create_user(db_session, email="super1@test.bi")
-    await employee_service.create(org_id, CreateEmployeeRequest(user_id=u1, role=UserRole.AGENT))
-    await employee_service.create(org_id, CreateEmployeeRequest(user_id=u2, role=UserRole.SUPERVISOR))
+    await employee_service.create(org_id, CreateEmployeeRequest(user_id=u1, role=UserRole.AGENT), caller=_caller(org_id))
+    await employee_service.create(org_id, CreateEmployeeRequest(user_id=u2, role=UserRole.SUPERVISOR), caller=_caller(org_id))
 
     agents = await employee_service.list(org_id=org_id, role=UserRole.AGENT)
     assert agents.total == 1
@@ -208,11 +221,12 @@ async def test_update_employee_role(employee_service, org_service, db_session):
     """Mise à jour du rôle d'un employé."""
     org_id = await _create_org(org_service)
     user_id = await _create_user(db_session, email="upd@test.bi")
-    created = await employee_service.create(org_id, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT))
+    created = await employee_service.create(org_id, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT), caller=_caller(org_id))
 
     updated = await employee_service.update(
         created.id, org_id,
-        UpdateEmployeeRequest(role=UserRole.SUPERVISOR)
+        UpdateEmployeeRequest(role=UserRole.SUPERVISOR),
+        caller=_caller(org_id),
     )
     assert updated.role == "supervisor"
 
@@ -223,10 +237,14 @@ async def test_update_employee_wrong_org_raises_404(employee_service, org_servic
     org_a = await _create_org(org_service, slug="upd-a", name="Upd A")
     org_b = await _create_org(org_service, slug="upd-b", name="Upd B")
     user_id = await _create_user(db_session, email="updiso@test.bi")
-    created = await employee_service.create(org_a, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT))
+    created = await employee_service.create(org_a, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT), caller=_caller(org_a))
 
     with pytest.raises(HTTPException) as exc_info:
-        await employee_service.update(created.id, org_b, UpdateEmployeeRequest(role=UserRole.SUPERVISOR))
+        await employee_service.update(
+            created.id, org_b,
+            UpdateEmployeeRequest(role=UserRole.SUPERVISOR),
+            caller=_caller(org_b),
+        )
 
     assert exc_info.value.status_code == 404
 
@@ -239,7 +257,7 @@ async def test_deactivate_employee_resets_user_to_client(employee_service, org_s
     from sqlalchemy import select
     org_id = await _create_org(org_service)
     user_id = await _create_user(db_session, email="deact@test.bi")
-    created = await employee_service.create(org_id, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT))
+    created = await employee_service.create(org_id, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT), caller=_caller(org_id))
 
     await employee_service.deactivate(created.id, org_id)
 
@@ -254,7 +272,7 @@ async def test_deactivate_employee_excluded_from_list(employee_service, org_serv
     """Un employé désactivé n'apparaît plus dans list()."""
     org_id = await _create_org(org_service)
     user_id = await _create_user(db_session, email="excl@test.bi")
-    created = await employee_service.create(org_id, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT))
+    created = await employee_service.create(org_id, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT), caller=_caller(org_id))
 
     result_before = await employee_service.list(org_id=org_id)
     assert result_before.total == 1
@@ -271,7 +289,7 @@ async def test_deactivate_employee_wrong_org_raises_404(employee_service, org_se
     org_a = await _create_org(org_service, slug="dea-a", name="Dea A")
     org_b = await _create_org(org_service, slug="dea-b", name="Dea B")
     user_id = await _create_user(db_session, email="deaiso@test.bi")
-    created = await employee_service.create(org_a, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT))
+    created = await employee_service.create(org_a, CreateEmployeeRequest(user_id=user_id, role=UserRole.AGENT), caller=_caller(org_a))
 
     with pytest.raises(HTTPException) as exc_info:
         await employee_service.deactivate(created.id, org_b)

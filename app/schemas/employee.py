@@ -8,6 +8,13 @@ from app.models.employee import EmployeeStatus
 
 
 # ── Requêtes ──────────────────────────────────────────────────────────────────
+# Rôles qu'un client HTTP peut mentionner dans un corps de requête.
+# SUPER_ADMIN est exclu au niveau du schéma (première barrière) : ce rôle ne
+# s'attribue jamais via l'API, uniquement par provisionnement manuel.
+# La seconde barrière (rôle de l'appelant vs rôle visé) est dans EmployeeService.
+API_FORBIDDEN_ROLES = {UserRole.CLIENT, UserRole.SUPER_ADMIN}
+
+
 class CreateEmployeeRequest(BaseModel):
     """Crée un employé en liant un User existant à une organisation."""
     user_id: str
@@ -18,9 +25,12 @@ class CreateEmployeeRequest(BaseModel):
     @field_validator("role")
     @classmethod
     def role_must_be_staff(cls, v: UserRole) -> UserRole:
-        """Un CLIENT ne peut pas être employé."""
-        if v == UserRole.CLIENT:
-            raise ValueError("Un client ne peut pas être enregistré comme employé")
+        """Ni un CLIENT ni un SUPER_ADMIN ne peuvent être attribués par l'API."""
+        if v in API_FORBIDDEN_ROLES:
+            raise ValueError(
+                f"Le rôle '{v.value}' ne peut pas être attribué via l'API. "
+                "Rôles acceptés : agent, supervisor, admin_agency, admin_org."
+            )
         return v
 
 
@@ -34,8 +44,11 @@ class UpdateEmployeeRequest(BaseModel):
     @field_validator("role")
     @classmethod
     def role_must_be_staff(cls, v: UserRole | None) -> UserRole | None:
-        if v == UserRole.CLIENT:
-            raise ValueError("Un client ne peut pas être enregistré comme employé")
+        if v is not None and v in API_FORBIDDEN_ROLES:
+            raise ValueError(
+                f"Le rôle '{v.value}' ne peut pas être attribué via l'API. "
+                "Rôles acceptés : agent, supervisor, admin_agency, admin_org."
+            )
         return v
 
 

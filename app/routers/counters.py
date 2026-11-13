@@ -1,5 +1,5 @@
 """
-Router Counters — /api/v1/organizations/{org_id}/agencies/{agency_id}/counters
+Router Counters — /api/v1/organizations/{org_id}/branches/{branch_id}/counters
 Aucune logique métier ici, tout délègue à CounterService.
 """
 from fastapi import APIRouter, Depends, Query
@@ -39,7 +39,7 @@ def _get_effective_org_id(current_user: User, org_id: str) -> str:
 @router.post("", status_code=201)
 async def create_counter(
     org_id: str,
-    agency_id: str,
+    branch_id: str,
     body: CreateCounterRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_agent),
@@ -47,14 +47,14 @@ async def create_counter(
     """Crée un nouveau guichet dans une agence. Réservé aux agents et admins."""
     effective_org_id = _get_effective_org_id(current_user, org_id)
     service = CounterService(db)
-    result = await service.create(effective_org_id, agency_id, body)
+    result = await service.create(effective_org_id, branch_id, body)
     return {"success": True, "data": result, "message": "Guichet créé"}
 
 
 @router.get("", response_model=None)
 async def list_counters(
     org_id: str,
-    agency_id: str,
+    branch_id: str,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     active_only: bool = Query(False),
@@ -66,7 +66,7 @@ async def list_counters(
     service = CounterService(db)
     result = await service.list(
         org_id=effective_org_id,
-        agency_id=agency_id,
+        agency_id=branch_id,
         page=page,
         page_size=page_size,
         active_only=active_only,
@@ -77,7 +77,7 @@ async def list_counters(
 @router.get("/{counter_id}", response_model=None)
 async def get_counter(
     org_id: str,
-    agency_id: str,
+    branch_id: str,
     counter_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_agent),
@@ -92,7 +92,7 @@ async def get_counter(
 @router.patch("/{counter_id}", response_model=None)
 async def update_counter(
     org_id: str,
-    agency_id: str,
+    branch_id: str,
     counter_id: str,
     body: UpdateCounterRequest,
     db: AsyncSession = Depends(get_db),
@@ -108,7 +108,7 @@ async def update_counter(
 @router.post("/{counter_id}/open", response_model=None)
 async def open_counter(
     org_id: str,
-    agency_id: str,
+    branch_id: str,
     counter_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_agent),
@@ -123,7 +123,7 @@ async def open_counter(
 @router.post("/{counter_id}/close", response_model=None)
 async def close_counter(
     org_id: str,
-    agency_id: str,
+    branch_id: str,
     counter_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_agent),
@@ -138,7 +138,7 @@ async def close_counter(
 @router.delete("/{counter_id}", status_code=200)
 async def delete_counter(
     org_id: str,
-    agency_id: str,
+    branch_id: str,
     counter_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_agent),

@@ -64,10 +64,22 @@ async def verify_otp(
 
 
 @router.post("/register/email", summary="Inscription par email")
+@limiter.limit("5/minute")
 async def register_email(
+    request: Request,
     body: RegisterEmailRequest,
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Inscription directe par email + mot de passe (agents et admins).
+
+    Limité à 5 créations/minute par IP : sans plafond, cet endpoint permettait
+    de créer des comptes en masse (et de saturer la base).
+
+    NOTE : l'email n'est pas vérifié — aucun fournisseur SMTP n'est configuré
+    dans Settings. Tant que ce n'est pas le cas, la vérification d'adresse
+    reste à implémenter côté infrastructure (voir roadmap sécurité).
+    """
     service = AuthService(db)
     return await service.register_email(body)
 

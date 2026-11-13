@@ -170,6 +170,43 @@ def _queue_key(org_id: str, agency_id: str, service_id: str) -> str:
     return f"tonde:{org_id}:{agency_id}:{service_id}:queue"
 
 
+async def next_daily_sequence(
+    agency_id: str,
+    prefix: str,
+    day: str,
+    db_max: int,
+    ttl_seconds: int = 2 * 24 * 3600,
+) -> int:
+    """
+    Retourne le prochain numéro de séquence du jour, de façon ATOMIQUE.
+
+    Pourquoi Redis et pas un COUNT en base : deux guichetiers qui créent un
+    ticket au même instant lisaient le même COUNT et recevaient tous les deux
+    « A-5 ». Redis INCR est atomique et sérialise les appels concurrents.
+
+    Le compteur est amorcé avec le MAX(sequence) déjà présent en base (et non
+    un COUNT : des tickets peuvent avoir été supprimés). `SET NX` garantit
+    qu'une seule instance pose l'amorce, même en cas de démarrage simultané
+    de plusieurs workers.
+
+    Args:
+        agency_id: Agence concernée (chaque agence a sa numérotation)
+        prefix: Préfixe du service (A, B, C…)
+        day: Jour au format ISO (YYYY-MM-DD) — la séquence repart à 1 chaque jour
+        db_max: Plus grand numéro de séquence déjà attribué aujourd'hui en base
+        ttl_seconds: Durée de vie de la clé (2 jours : couvre le passage de minuit)
+
+    Returns:
+        Le numéro de séquence à utiliser (db_max + 1 au premier appel du jour)
+    """
+    r = await get_redis()
+    key = f"tonde:seq:{agency_id}:{prefix}:{day}"
+
+    # Amorce uniquement si la clé n'existe pas encore
+    await r.set(key, db_max, nx=True, ex=ttl_seconds)
+    return int(await r.incr(key))
+
+
 async def add_to_queue(
     org_id: str, agency_id: str, service_id: str, ticket_id: str, priority: int = 0
 ) -> int:

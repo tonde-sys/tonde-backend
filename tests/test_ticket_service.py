@@ -25,12 +25,17 @@ from app.schemas.ticket import CreateTicketRequest
 @pytest.fixture
 def mock_queue(mock_redis):
     """Mock des helpers Redis de file d'attente — signatures avec service_id (TASK-04)."""
-    with patch("app.services.ticket_service.add_to_queue", new_callable=AsyncMock, return_value=1):
-        with patch("app.services.ticket_service.get_queue_size", new_callable=AsyncMock, return_value=1):
-            with patch("app.services.ticket_service.remove_from_queue", new_callable=AsyncMock):
-                with patch("app.services.ticket_service.get_next_ticket", new_callable=AsyncMock):
-                    with patch("app.services.ticket_service.get_queue_position", new_callable=AsyncMock, return_value=1):
-                        yield
+    async def _fake_next_sequence(agency_id, prefix, day, db_max):
+        """Reproduit le démarrage à froid du compteur : MAX(sequence) + 1."""
+        return db_max + 1
+
+    with patch("app.services.ticket_service.next_daily_sequence", side_effect=_fake_next_sequence):
+        with patch("app.services.ticket_service.add_to_queue", new_callable=AsyncMock, return_value=1):
+            with patch("app.services.ticket_service.get_queue_size", new_callable=AsyncMock, return_value=1):
+                with patch("app.services.ticket_service.remove_from_queue", new_callable=AsyncMock):
+                    with patch("app.services.ticket_service.get_next_ticket", new_callable=AsyncMock):
+                        with patch("app.services.ticket_service.get_queue_position", new_callable=AsyncMock, return_value=1):
+                            yield
 
 
 async def _create_test_org(db_session) -> Organization:
@@ -295,7 +300,13 @@ async def test_state_machine_terminal_states_are_blocked(ticket_service, db_sess
 
 @pytest.mark.asyncio
 async def test_active_statuses_constant():
-    """ACTIVE_STATUSES contient exactement les 6 statuts bloquants attendus."""
+    """
+    ACTIVE_STATUSES contient exactement les 4 statuts dont on peut sortir.
+
+    TRANSFERRED et INCOMPLETE en sont volontairement exclus : ce sont des états
+    terminaux (ALLOWED_TRANSITIONS = []). Les y laisser bloquait le client à vie
+    après un transfert ou un service interrompu.
+    """
     from app.services.ticket_service import ACTIVE_STATUSES
 
     expected = {
@@ -303,10 +314,19 @@ async def test_active_statuses_constant():
         TicketStatus.CALLED,
         TicketStatus.SERVING,
         TicketStatus.ABSENT,
-        TicketStatus.TRANSFERRED,
-        TicketStatus.INCOMPLETE,
     }
     assert set(ACTIVE_STATUSES) == expected
+
+
+def test_terminal_states_never_block_new_ticket():
+    """Aucun état terminal ne doit figurer dans ACTIVE_STATUSES."""
+    from app.services.ticket_service import ACTIVE_STATUSES
+    from app.models.ticket import ALLOWED_TRANSITIONS
+
+    terminal = {s for s, allowed in ALLOWED_TRANSITIONS.items() if not allowed}
+    assert terminal & set(ACTIVE_STATUSES) == set(), (
+        "Un état terminal dans ACTIVE_STATUSES bloque définitivement le client"
+    )
 
 
 @pytest.mark.asyncio
@@ -584,3 +604,120 @@ def test_callnextrequest_valid_with_service_id():
         counter_name="Guichet 1",
     )
     assert req.service_id == "s-1"
+
+
+# ── Fix : clients OTP sans organisation (User.org_id = NULL) ──────────────────
+# Régression : get/cancel/return renvoyaient 404 car la recherche filtrait
+# Ticket.org_id == None. Les clients sont retrouvés par propriétaire (user_id).
+
+async def _create_ticket_for_org_less_client(ticket_service, db_session, user_id: str):
+    """Crée org + branch + service, puis un ticket pour un client sans org."""
+    org = await _create_test_org(db_session)
+    agency = await _create_test_agency(db_session, org.id)
+    service = await _create_test_service(db_session, agency.id, org.id)
+    ticket = await ticket_service.create_ticket(
+        CreateTicketRequest(agency_id=agency.id, service_id=service.id),
+        user_id=user_id,
+        org_id=None,  # client OTP : pas d'organisation
+    )
+    return org, agency, service, ticket
+
+
+@pytest.mark.asyncio
+async def test_org_less_client_can_get_own_ticket(ticket_service, db_session, mock_queue):
+    """Un client sans org retrouve son propre ticket (plus de 404)."""
+    org, agency, service, created = await _create_ticket_for_org_less_client(
+        ticket_service, db_session, "client-otp-get"
+    )
+
+    result = await ticket_service.get_ticket(created.id, "client-otp-get", None)
+
+    assert result.id == created.id
+    assert result.number == created.number
+    assert result.status == "waiting"
+
+
+@pytest.mark.asyncio
+async def test_org_less_client_cannot_get_other_clients_ticket(ticket_service, db_session, mock_queue):
+    """Un client sans org ne peut pas lire le ticket d'un autre → 404 (pas de fuite)."""
+    _, _, _, created = await _create_ticket_for_org_less_client(
+        ticket_service, db_session, "client-owner"
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await ticket_service.get_ticket(created.id, "client-intruder", None)
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail["code"] == "TICKET_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_org_less_client_can_cancel_and_queue_uses_ticket_org(ticket_service, db_session, mock_queue):
+    """L'annulation fonctionne et la file Redis est celle de l'org du ticket."""
+    org, agency, service, created = await _create_ticket_for_org_less_client(
+        ticket_service, db_session, "client-otp-cancel"
+    )
+
+    with patch(
+        "app.services.ticket_service.remove_from_queue", new_callable=AsyncMock
+    ) as remove_mock:
+        result = await ticket_service.cancel_ticket(created.id, "client-otp-cancel", None)
+
+    assert result["success"] is True
+    # remove_from_queue(org_id, agency_id, service_id, ticket_id) — org du ticket, pas None
+    assert remove_mock.call_args.args[0] == org.id
+    assert remove_mock.call_args.args[1] == agency.id
+    assert remove_mock.call_args.args[2] == service.id
+
+
+@pytest.mark.asyncio
+async def test_org_less_client_cannot_cancel_other_clients_ticket(ticket_service, db_session, mock_queue):
+    """Un client sans org ne peut pas annuler le ticket d'un autre → 404."""
+    _, _, _, created = await _create_ticket_for_org_less_client(
+        ticket_service, db_session, "client-owner-2"
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await ticket_service.cancel_ticket(created.id, "client-intruder-2", None)
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_org_less_client_can_return_to_queue_from_absent(ticket_service, db_session, mock_queue):
+    """Un client absent sans org revient en file (ABSENT → WAITING)."""
+    from sqlalchemy import select
+    from app.models.ticket import Ticket
+
+    org, agency, service, created = await _create_ticket_for_org_less_client(
+        ticket_service, db_session, "client-otp-return"
+    )
+    result = await db_session.execute(select(Ticket).where(Ticket.id == created.id))
+    ticket = result.scalar_one()
+    ticket.status = TicketStatus.ABSENT
+    await db_session.commit()
+
+    with patch(
+        "app.services.ticket_service.add_to_queue", new_callable=AsyncMock, return_value=1
+    ) as add_mock:
+        resp = await ticket_service.return_to_queue(
+            created.id, "", user_id="client-otp-return"
+        )
+
+    assert resp["success"] is True
+    await db_session.refresh(ticket)
+    assert ticket.status == TicketStatus.WAITING
+    assert add_mock.call_args.args[0] == org.id
+
+
+@pytest.mark.asyncio
+async def test_return_to_queue_rejects_other_clients_ticket(ticket_service, db_session, mock_queue):
+    """Un client ne peut pas remettre en file le ticket d'un autre → 404."""
+    _, _, _, created = await _create_ticket_for_org_less_client(
+        ticket_service, db_session, "client-owner-3"
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await ticket_service.return_to_queue(created.id, "", user_id="client-intruder-3")
+
+    assert exc_info.value.status_code == 404

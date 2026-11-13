@@ -14,11 +14,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from app.core.config import settings
+from app.core.middlewares import setup_rate_limiting
 from app.core.redis import get_redis, close_redis
 
 # Import explicite des modèles — obligatoire pour que Base.metadata
@@ -30,10 +29,6 @@ from app.routers import services as services_router
 from app.websocket.queue_ws import ws_manager
 
 logger = logging.getLogger(__name__)
-
-# ── Rate Limiter (slowapi) ─────────────────────────────────────────────────────
-# Limite globale par IP — les routes sensibles ont leurs propres limites
-limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
 
 
 # ── Démarrage et arrêt de l'app ───────────────────────────────────────────────
@@ -100,8 +95,11 @@ L'OTP de test en développement est toujours **123456**
     lifespan=lifespan,
 )
 
-# ── Rate limiting — handler 429 standardisé ───────────────────────────────────
-app.state.limiter = limiter
+# ── Rate limiting — instance unique + SlowAPIMiddleware ──────────────────────
+# setup_rate_limiting() installe le middleware qui rend default_limits effectif
+# (200/minute par IP sur toutes les routes HTTP) et attache app.state.limiter.
+# Doit précéder add_middleware(CORS) pour que CORS reste le plus externe.
+setup_rate_limiting(app)
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -211,7 +209,21 @@ async def health_check():
 
 # ── Gestion globale des erreurs ───────────────────────────────────────────────
 @app.exception_handler(404)
-async def not_found_handler(request, exc):
+async def not_found_handler(request: Request, exc) -> JSONResponse:
+    """
+    Uniformise les 404 au format d'erreur TONDE.
+
+    Les 404 MÉTIER (TICKET_NOT_FOUND, BRANCH_NOT_FOUND…) portent déjà un code :
+    ils sont renvoyés tels quels. Avant, ce handler les écrasait tous par
+    « cette route n'existe pas », ce qui rendait le débogage mobile impossible.
+    """
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict) and "code" in detail:
+        return JSONResponse(
+            status_code=404,
+            content={"success": False, "error": detail},
+        )
+
     return JSONResponse(
         status_code=404,
         content={
@@ -224,9 +236,17 @@ async def not_found_handler(request, exc):
     )
 
 
-@app.exception_handler(500)
-async def server_error_handler(request, exc):
-    logger.error(f"Erreur 500 sur {request.url.path}: {exc}")
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """
+    Capture les exceptions NON gérées.
+
+    @app.exception_handler(500) ne se déclenche que pour une HTTPException(500)
+    explicite : une vraie erreur inattendue (panne DB, KeyError, timeout Redis)
+    renvoyait la page HTML par défaut de Starlette, hors du contrat JSON de
+    l'API — le mobile recevait alors un corps illisible.
+    """
+    logger.error(f"Erreur non gérée sur {request.url.path}: {exc}", exc_info=exc)
     return JSONResponse(
         status_code=500,
         content={

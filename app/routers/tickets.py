@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import get_current_user, get_current_agent, get_ws_user
-from app.core.middlewares import limiter
+from app.core.middlewares import check_ws_connection_limit, WS_CLOSE_RATE_LIMITED
 from app.models.user import User
 from app.schemas.ticket import CreateTicketRequest, CallNextRequest
 from app.services.ticket_service import TicketService
@@ -44,7 +44,12 @@ async def create_ticket(
     Retourne numéro, position dans la file et temps estimé.
     """
     service = TicketService(db)
-    return await service.create_ticket(body, current_user.id, _get_org_id(current_user))
+    return await service.create_ticket(
+        body,
+        current_user.id,
+        _get_org_id(current_user),
+        actor_role=current_user.role,
+    )
 
 
 @router.get("/history", summary="Historique des tickets")
@@ -68,7 +73,12 @@ async def get_ticket(
     db: AsyncSession = Depends(get_db),
 ):
     service = TicketService(db)
-    return await service.get_ticket(ticket_id, current_user.id, _get_org_id(current_user))
+    return await service.get_ticket(
+        ticket_id,
+        current_user.id,
+        _get_org_id(current_user),
+        actor_role=current_user.role,
+    )
 
 
 @router.delete("/{ticket_id}", summary="Annuler un ticket")
@@ -172,15 +182,27 @@ async def return_to_queue(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Transition ABSENT → WAITING. Le client redemande sa place."""
+    """
+    Transition ABSENT → WAITING. Le client redemande sa place.
+
+    Un client (sans organisation) ne peut remettre en file que son propre
+    ticket : son user_id est transmis au service pour retrouver le ticket.
+    Le staff (agent et plus) agit dans le périmètre de son organisation.
+    """
+    from app.models.user import UserRole
+
     service = TicketService(db)
-    return await service.return_to_queue(ticket_id, _get_org_id(current_user))
+    is_client = current_user.role == UserRole.CLIENT
+    return await service.return_to_queue(
+        ticket_id,
+        current_user.org_id or "",
+        user_id=current_user.id if is_client else None,
+    )
 
 
 # ── WebSocket endpoints ───────────────────────────────────────────────────────
 
 @router.websocket("/ws/queue/{ticket_id}")
-@limiter.limit("10/minute")
 async def websocket_queue(
     websocket: WebSocket,
     ticket_id: str,
@@ -205,7 +227,15 @@ async def websocket_queue(
     from app.core.security import verify_token
     from app.models.ticket import Ticket, TicketStatus
     from sqlalchemy import select
-    
+
+    # Anti-abus : max 10 connexions / minute / IP (slowapi ne gère pas les WS)
+    if not await check_ws_connection_limit(websocket):
+        await websocket.close(
+            code=WS_CLOSE_RATE_LIMITED,
+            reason="Trop de connexions. Réessayez dans une minute.",
+        )
+        return
+
     # Authentifier via le token JWT en query param
     user_id = verify_token(token, token_type="access")
     if not user_id:
@@ -253,7 +283,6 @@ async def websocket_queue(
 
 
 @router.websocket("/ws/counter/{counter_id}")
-@limiter.limit("10/minute")
 async def websocket_counter(
     websocket: WebSocket,
     counter_id: str,
@@ -272,7 +301,15 @@ async def websocket_counter(
     from app.models.user import UserRole
     from app.models.counter import Counter
     from sqlalchemy import select
-    
+
+    # Anti-abus : max 10 connexions / minute / IP (slowapi ne gère pas les WS)
+    if not await check_ws_connection_limit(websocket):
+        await websocket.close(
+            code=WS_CLOSE_RATE_LIMITED,
+            reason="Trop de connexions. Réessayez dans une minute.",
+        )
+        return
+
     # Authentifier et vérifier le rôle
     try:
         user_id = verify_token(token, token_type="access")

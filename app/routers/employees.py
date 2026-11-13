@@ -49,7 +49,7 @@ async def create_employee(
     """
     effective_org_id = _get_effective_org_id(current_user, org_id)
     service = EmployeeService(db)
-    result = await service.create(effective_org_id, body)
+    result = await service.create(effective_org_id, body, caller=current_user)
     return {"success": True, "data": result, "message": "Employé créé"}
 
 
@@ -101,7 +101,7 @@ async def update_employee(
     """Met à jour le rôle, l'affectation ou le statut d'un employé."""
     effective_org_id = _get_effective_org_id(current_user, org_id)
     service = EmployeeService(db)
-    result = await service.update(employee_id, effective_org_id, body)
+    result = await service.update(employee_id, effective_org_id, body, caller=current_user)
     return {"success": True, "data": result, "message": "Employé mis à jour"}
 
 

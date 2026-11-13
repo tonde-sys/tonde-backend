@@ -22,10 +22,97 @@ from app.schemas.employee import (
 )
 
 
+# ── Rôles assignables, par rôle de l'appelant ────────────────────────────────
+# Principe : on ne peut jamais attribuer un rôle supérieur ou égal au sien.
+# SUPER_ADMIN est volontairement ABSENT de toutes les listes : ce rôle ne
+# s'attribue pas via l'API (provisionnement manuel uniquement), sinon un admin
+# d'agence pouvait se promouvoir administrateur de toute la plateforme.
+ASSIGNABLE_ROLES: dict[UserRole, frozenset[UserRole]] = {
+    UserRole.SUPER_ADMIN: frozenset({
+        UserRole.AGENT,
+        UserRole.SUPERVISOR,
+        UserRole.ADMIN_AGENCY,
+        UserRole.ADMIN_ORG,
+    }),
+    UserRole.ADMIN_ORG: frozenset({
+        UserRole.AGENT,
+        UserRole.SUPERVISOR,
+        UserRole.ADMIN_AGENCY,
+    }),
+    UserRole.ADMIN_AGENCY: frozenset({
+        UserRole.AGENT,
+        UserRole.SUPERVISOR,
+    }),
+}
+
+
 class EmployeeService:
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+
+    # ── Garde-fous de sécurité ────────────────────────────────────────────────
+    def _assert_role_assignable(self, caller: User, target_role: UserRole) -> None:
+        """
+        Vérifie que l'appelant a le droit d'attribuer ce rôle.
+
+        Args:
+            caller: Utilisateur authentifié qui effectue l'opération
+            target_role: Rôle que l'on cherche à attribuer
+
+        Raises:
+            HTTPException 403: Rôle non attribuable par cet appelant
+        """
+        allowed = ASSIGNABLE_ROLES.get(caller.role, frozenset())
+        if target_role not in allowed:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "ROLE_NOT_ASSIGNABLE",
+                    "message": (
+                        f"Le rôle '{target_role.value}' ne peut pas être attribué "
+                        f"par un '{caller.role.value}'. "
+                        f"Rôles autorisés : {sorted(r.value for r in allowed) or 'aucun'}"
+                    ),
+                },
+            )
+
+    def _assert_user_can_be_enrolled(self, user: User, org_id: str) -> None:
+        """
+        Empêche l'absorption d'un utilisateur appartenant à une autre organisation.
+
+        Sans ce contrôle, un admin d'agence pouvait ajouter comme "employé" un
+        utilisateur d'une organisation concurrente : le service écrasait alors
+        son role ET son org_id (prise de contrôle inter-tenant).
+
+        Args:
+            user: Utilisateur cible
+            org_id: Organisation dans laquelle on veut l'enrôler
+
+        Raises:
+            HTTPException 403: La cible est un super-admin (compte protégé)
+            HTTPException 409: La cible appartient déjà à une autre organisation
+        """
+        if user.role == UserRole.SUPER_ADMIN:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "SUPER_ADMIN_PROTECTED",
+                    "message": "Un super-admin ne peut pas être enrôlé comme employé",
+                },
+            )
+
+        if user.org_id and user.org_id != org_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "USER_IN_ANOTHER_ORG",
+                    "message": (
+                        "Cet utilisateur appartient déjà à une autre organisation. "
+                        "Il doit d'abord la quitter avant de rejoindre celle-ci."
+                    ),
+                },
+            )
 
     async def _verify_user_exists(self, user_id: str) -> User:
         """
@@ -49,7 +136,7 @@ class EmployeeService:
         return user
 
     async def create(
-        self, org_id: str, data: CreateEmployeeRequest
+        self, org_id: str, data: CreateEmployeeRequest, caller: User
     ) -> EmployeeResponse:
         """
         Crée un employé en liant un User existant à une organisation.
@@ -57,15 +144,20 @@ class EmployeeService:
         Args:
             org_id: ID de l'organisation (isolation multi-tenant)
             data: user_id, role, agency_id (optionnel), counter_id (optionnel)
+            caller: Utilisateur authentifié — détermine les rôles attribuables
 
         Returns:
             EmployeeResponse avec l'employé créé
 
         Raises:
+            HTTPException 403: Rôle non attribuable ou cible protégée
             HTTPException 404: Si l'utilisateur n'existe pas
-            HTTPException 409: Si l'utilisateur est déjà employé dans cette org
+            HTTPException 409: Déjà employé dans cette org, ou user d'une autre org
         """
-        await self._verify_user_exists(data.user_id)
+        self._assert_role_assignable(caller, data.role)
+
+        user = await self._verify_user_exists(data.user_id)
+        self._assert_user_can_be_enrolled(user, org_id)
 
         # Vérifier qu'il n'est pas déjà employé dans cette org
         existing = await self.db.execute(
@@ -91,10 +183,6 @@ class EmployeeService:
         self.db.add(employee)
 
         # Mettre à jour le rôle du User pour refléter son nouveau rôle
-        user_result = await self.db.execute(
-            select(User).where(User.id == data.user_id)
-        )
-        user = user_result.scalar_one()
         user.role = data.role
         user.org_id = org_id
 
@@ -187,7 +275,11 @@ class EmployeeService:
         )
 
     async def update(
-        self, employee_id: str, org_id: str, data: UpdateEmployeeRequest
+        self,
+        employee_id: str,
+        org_id: str,
+        data: UpdateEmployeeRequest,
+        caller: User,
     ) -> EmployeeResponse:
         """
         Met à jour le rôle, l'affectation ou le statut d'un employé.
@@ -196,11 +288,13 @@ class EmployeeService:
             employee_id: UUID de l'employé
             org_id: Isolation multi-tenant
             data: Champs à mettre à jour
+            caller: Utilisateur authentifié — détermine les rôles attribuables
 
         Returns:
             EmployeeResponse mis à jour
 
         Raises:
+            HTTPException 403: Rôle non attribuable ou employé super-admin
             HTTPException 404: Si l'employé n'existe pas dans l'org
         """
         result = await self.db.execute(
@@ -217,18 +311,33 @@ class EmployeeService:
             )
 
         update_data = data.model_dump(exclude_unset=True)
+        new_role = update_data.get("role")
 
-        # Si le rôle change, mettre à jour aussi le User
-        if "role" in update_data:
-            user_result = await self.db.execute(
-                select(User).where(User.id == employee.user_id)
+        # Charger le User associé une seule fois — utile pour les deux contrôles
+        user_result = await self.db.execute(
+            select(User).where(User.id == employee.user_id)
+        )
+        user = user_result.scalar_one_or_none()
+
+        # Un super-admin ne se modifie pas via l'API de gestion des employés
+        if user and user.role == UserRole.SUPER_ADMIN:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "SUPER_ADMIN_PROTECTED",
+                    "message": "Un super-admin ne peut pas être modifié via la gestion des employés",
+                },
             )
-            user = user_result.scalar_one_or_none()
-            if user:
-                user.role = update_data["role"]
+
+        # Si le rôle change, vérifier qu'il est attribuable par l'appelant
+        if new_role is not None:
+            self._assert_role_assignable(caller, new_role)
 
         for field, value in update_data.items():
             setattr(employee, field, value)
+
+        if new_role is not None and user:
+            user.role = new_role
 
         await self.db.commit()
         await self.db.refresh(employee)

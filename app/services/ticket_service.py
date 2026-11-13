@@ -16,6 +16,7 @@ import logging
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from fastapi import HTTPException, status
 
 from app.models.ticket import (
@@ -24,9 +25,11 @@ from app.models.ticket import (
 )
 from app.models.branch import Branch, Service
 from app.models.queue_log import QueueLog, QueueLogAction
+from app.models.user import UserRole
 from app.core.redis import (
     add_to_queue, get_queue_position,
     get_queue_size, remove_from_queue, get_next_ticket,
+    next_daily_sequence,
 )
 from app.schemas.ticket import CreateTicketRequest, TicketResponse, TicketHistoryResponse
 
@@ -34,13 +37,16 @@ logger = logging.getLogger(__name__)
 
 # Statuts considérés comme "actifs" — bloquent la création d'un nouveau ticket.
 # Règle MVP DÉCISION 1 : 1 seul ticket actif par utilisateur sur TOUTE la plateforme.
+#
+# ATTENTION : ne lister ici QUE des statuts dont on peut sortir.
+# TRANSFERRED et INCOMPLETE sont des états TERMINAUX (ALLOWED_TRANSITIONS = []).
+# Les inclure bloquait définitivement le client : impossible de reprendre un
+# ticket après un transfert ou un service interrompu, sans aucune échappatoire.
 ACTIVE_STATUSES: list[TicketStatus] = [
     TicketStatus.WAITING,
     TicketStatus.CALLED,
     TicketStatus.SERVING,
     TicketStatus.ABSENT,
-    TicketStatus.TRANSFERRED,
-    TicketStatus.INCOMPLETE,
 ]
 
 # Mapping status → QueueLogAction pour l'audit trail
@@ -55,6 +61,15 @@ STATUS_TO_LOG_ACTION: dict[TicketStatus, QueueLogAction] = {
     TicketStatus.INCOMPLETE:  QueueLogAction.TICKET_INCOMPLETE,
 }
 
+# Priorités qu'un client peut s'attribuer lui-même.
+# PRIORITY (femme enceinte, personne âgée, handicap) est une déclaration
+# socialement vérifiable à l'accueil ; VIP et EMERGENCY sont des privilèges
+# payants ou médicaux qui doivent être attribués par le staff.
+CLIENT_ALLOWED_PRIORITIES: frozenset[TicketPriority] = frozenset({
+    TicketPriority.STANDARD,
+    TicketPriority.PRIORITY,
+})
+
 
 class TicketService:
     def __init__(self, db: AsyncSession):
@@ -62,7 +77,11 @@ class TicketService:
 
     # ── Créer un nouveau ticket ───────────────────────────────────────────────
     async def create_ticket(
-        self, data: CreateTicketRequest, user_id: str, org_id: str | None
+        self,
+        data: CreateTicketRequest,
+        user_id: str,
+        org_id: str | None,
+        actor_role: UserRole | None = None,
     ) -> TicketResponse:
         """
         Crée un ticket et l'insère dans la file d'attente Redis.
@@ -72,15 +91,24 @@ class TicketService:
             user_id: ID de l'utilisateur connecté
             org_id: ID de l'organisation (isolation multi-tenant)
                     Peut être None pour les clients OTP sans affiliation
+            actor_role: Rôle de l'appelant. Détermine les priorités autorisées.
+                        None est traité comme CLIENT (refus par défaut).
 
         Returns:
             TicketResponse avec numéro, position, ETA et QR token
 
         Raises:
             HTTPException 400: Agence fermée ou données invalides
-            HTTPException 403: Agence n'appartient pas à l'org
+            HTTPException 403: Agence d'une autre org, ou priorité non autorisée
             HTTPException 409: Ticket actif déjà existant
         """
+        # Résoudre la priorité EN PREMIER — contrôle par rôle obligatoire.
+        # Sans ce garde-fou, n'importe quel client pouvait se déclarer
+        # "emergency" et passer devant toute la file. Fail-fast : on refuse
+        # avant toute lecture DB inutile.
+        priority = self._resolve_priority(data.priority, actor_role)
+        priority_score = PRIORITY_SCORES[priority]
+
         # Récupérer la branch — si org_id est None, on cherche globalement
         # puis on utilise son org_id pour le reste
         branch = await self._get_agency_for_creation(data.agency_id, org_id)
@@ -114,32 +142,52 @@ class TicketService:
                 },
             )
 
-        # Calculer le prochain numéro de séquence (réinitialisé chaque jour)
-        sequence = await self._get_next_sequence(data.agency_id, service.ticket_prefix)
-        ticket_number = f"{service.ticket_prefix}-{sequence}"
+        # ── Création atomique du ticket + son audit trail ────────────────────
+        # Un seul commit : soit le ticket ET sa ligne QueueLog existent, soit
+        # rien. Avant, trois commit() successifs pouvaient laisser un ticket
+        # sans trace d'audit si le process mourait entre deux.
+        prefix = service.ticket_prefix          # capturé avant tout rollback
+        avg_service_minutes = branch.avg_service_minutes
+        redis_org_id = ticket_org_id or "public"
+        ticket = None
 
-        # Résoudre la priorité
-        priority = TicketPriority(data.priority) if data.priority in TicketPriority._value2member_map_ else TicketPriority.STANDARD
-        priority_score = PRIORITY_SCORES[priority]
+        for attempt in range(2):
+            sequence = await self._get_next_sequence(data.agency_id, prefix)
+            candidate = Ticket(
+                number=f"{prefix}-{sequence}",
+                prefix=prefix,
+                sequence=sequence,
+                user_id=user_id,
+                org_id=ticket_org_id,
+                agency_id=data.agency_id,
+                service_id=data.service_id,
+                priority=priority,
+                status=TicketStatus.WAITING,
+            )
+            self.db.add(candidate)
+            try:
+                await self.db.flush()   # obtenir candidate.id avant commit
+            except IntegrityError:
+                # Filet de sécurité : l'index unique (agency, prefix, sequence,
+                # jour) a détecté un doublon malgré le compteur Redis.
+                await self.db.rollback()
+                if attempt == 0:
+                    logger.warning(
+                        f"Numéro de ticket en collision (tentative {attempt + 1}), "
+                        f"nouvelle séquence pour {prefix} @ {data.agency_id}"
+                    )
+                    continue
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "TICKET_NUMBER_CONFLICT",
+                        "message": "Impossible d'attribuer un numéro de ticket. Réessayez dans un instant.",
+                    },
+                )
+            ticket = candidate
+            break
 
-        # Persister le ticket
-        ticket = Ticket(
-            number=ticket_number,
-            prefix=service.ticket_prefix,
-            sequence=sequence,
-            user_id=user_id,
-            org_id=ticket_org_id,
-            agency_id=data.agency_id,
-            service_id=data.service_id,
-            priority=priority,
-            status=TicketStatus.WAITING,
-        )
-        self.db.add(ticket)
-        await self.db.flush()   # obtenir ticket.id avant commit
-        await self.db.commit()
-        await self.db.refresh(ticket)
-
-        # ── Audit trail : log la création ─────────────────────────────────────
+        # Audit trail dans la MÊME transaction que le ticket
         await self._log_action(
             ticket=ticket,
             action=QueueLogAction.TICKET_CREATED,
@@ -148,19 +196,43 @@ class TicketService:
             elapsed_seconds=0,
         )
         await self.db.commit()
+        await self.db.refresh(ticket)
 
-        # Insérer dans la file Redis — segmentée par service (DÉCISION 5)
-        redis_org_id = ticket_org_id or "public"
-        position = await add_to_queue(redis_org_id, data.agency_id, data.service_id, ticket.id, priority_score)
-        total = await get_queue_size(redis_org_id, data.agency_id, data.service_id)
+        # ── Insertion dans la file Redis (état dérivé, non transactionnel) ───
+        # Si Redis échoue, le ticket existerait en base mais dans aucune file :
+        # le client attendrait indéfiniment un appel qui ne viendrait jamais.
+        # On compense donc en annulant le ticket avant de remonter l'erreur.
+        try:
+            position = await add_to_queue(
+                redis_org_id, data.agency_id, data.service_id, ticket.id, priority_score
+            )
+            total = await get_queue_size(redis_org_id, data.agency_id, data.service_id)
+        except Exception as e:
+            logger.critical(
+                f"File Redis indisponible — annulation du ticket {ticket.number}: {e}",
+                exc_info=True,
+            )
+            await self._cancel_ghost_ticket(ticket)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "QUEUE_UNAVAILABLE",
+                    "message": (
+                        "Le service de file d'attente est momentanément indisponible. "
+                        "Aucun ticket n'a été créé. Réessayez dans quelques instants."
+                    ),
+                },
+            )
 
-        # Calculer l'ETA
-        eta = max(0, (position - 1) * branch.avg_service_minutes)
+        # Calculer l'ETA (donnée dérivée — un échec ici n'invalide pas le ticket)
+        eta = max(0, (position - 1) * avg_service_minutes)
+        try:
+            ticket.estimated_wait_minutes = eta
+            await self.db.commit()
+        except Exception as e:
+            logger.warning(f"ETA non persistée pour {ticket.number}: {e}")
 
-        ticket.estimated_wait_minutes = eta
-        await self.db.commit()
-
-        logger.info(f"Ticket créé: {ticket_number} | org={ticket_org_id} | position={position} | ETA={eta}min")
+        logger.info(f"Ticket créé: {ticket.number} | org={ticket_org_id} | position={position} | ETA={eta}min")
 
         return TicketResponse(
             id=ticket.id,
@@ -176,19 +248,74 @@ class TicketService:
             created_at=ticket.created_at,
         )
 
+    async def _cancel_ghost_ticket(self, ticket: Ticket) -> None:
+        """
+        Annule un ticket qui n'a pas pu être inséré dans la file Redis.
+
+        Compense une création partielle : sans cela, le ticket resterait
+        WAITING en base pour toujours, invisible de tous les guichets.
+        Best-effort : on ne veut pas masquer l'erreur d'origine.
+
+        Args:
+            ticket: Le ticket à annuler
+        """
+        try:
+            ticket.status = TicketStatus.CANCELLED
+            await self._log_action(
+                ticket=ticket,
+                action=QueueLogAction.TICKET_CANCELLED,
+                from_status=TicketStatus.WAITING,
+                to_status=TicketStatus.CANCELLED,
+            )
+            await self.db.commit()
+            logger.warning(f"Ticket fantôme annulé: {ticket.number}")
+        except Exception as e:
+            logger.critical(
+                f"Échec de l'annulation du ticket fantôme {ticket.id}: {e}",
+                exc_info=True,
+            )
+
     # ── Obtenir le statut d'un ticket ─────────────────────────────────────────
     async def get_ticket(
-        self, ticket_id: str, user_id: str, org_id: str
+        self,
+        ticket_id: str,
+        user_id: str,
+        org_id: str | None,
+        actor_role: UserRole | None = None,
     ) -> TicketResponse:
         """
         Retourne les informations actuelles d'un ticket.
 
-        Sécurité : un client ne peut voir que ses propres tickets.
-        org_id garantit l'isolation multi-tenant.
-        """
-        ticket = await self._get_ticket_by_id(ticket_id, org_id)
+        Sécurité :
+          - Un CLIENT ne voit que ses propres tickets.
+          - Le STAFF (agent, superviseur, admin) voit tous les tickets de son
+            organisation — indispensable au desktop guichetier, qui doit
+            retrouver le ticket qu'il vient d'appeler.
+          - org_id garantit l'isolation multi-tenant dans les deux cas.
 
-        if ticket.user_id != user_id:
+        Args:
+            ticket_id: ID du ticket
+            user_id: ID de l'utilisateur connecté
+            org_id: Organisation de l'utilisateur. None pour un client OTP
+                    (sans organisation) : le ticket est alors retrouvé par
+                    propriétaire, et l'org du ticket sert pour la suite.
+            actor_role: Rôle de l'appelant. None est traité comme CLIENT.
+
+        Raises:
+            HTTPException 403: Ticket d'un autre utilisateur (client uniquement)
+            HTTPException 404: Ticket introuvable ou hors organisation
+        """
+        is_staff = actor_role is not None and actor_role != UserRole.CLIENT
+
+        if org_id is None:
+            ticket = await self._get_ticket_for_owner(ticket_id, user_id)
+            org_id = ticket.org_id
+        else:
+            ticket = await self._get_ticket_by_id(ticket_id, org_id)
+
+        # Le staff agit dans le périmètre de son organisation (déjà filtré par
+        # _get_ticket_by_id). Seul un client est restreint à ses propres tickets.
+        if not is_staff and ticket.user_id != user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"code": "FORBIDDEN", "message": "Accès non autorisé à ce ticket"},
@@ -220,13 +347,32 @@ class TicketService:
 
     # ── Annuler un ticket ─────────────────────────────────────────────────────
     async def cancel_ticket(
-        self, ticket_id: str, user_id: str, org_id: str
+        self, ticket_id: str, user_id: str, org_id: str | None
     ) -> dict:
         """
         Le client annule son ticket.
-        Seuls les tickets WAITING peuvent être annulés par le client.
+        Seuls les tickets WAITING ou ABSENT peuvent être annulés par le client.
+
+        ABSENT est annulable : sans cette sortie, un client marqué absent
+        restait bloqué (ABSENT bloque la création d'un nouveau ticket) sans
+        autre option que de revenir en file d'attente.
+
+        Args:
+            ticket_id: ID du ticket à annuler
+            user_id: ID de l'utilisateur connecté (doit être le propriétaire)
+            org_id: Organisation de l'utilisateur. None pour un client OTP :
+                    l'org du ticket est alors utilisée pour la file Redis.
+
+        Raises:
+            HTTPException 400: Transition interdite (ticket non WAITING)
+            HTTPException 403: Le ticket appartient à un autre utilisateur
+            HTTPException 404: Ticket introuvable
         """
-        ticket = await self._get_ticket_by_id(ticket_id, org_id)
+        if org_id is None:
+            ticket = await self._get_ticket_for_owner(ticket_id, user_id)
+            org_id = ticket.org_id
+        else:
+            ticket = await self._get_ticket_by_id(ticket_id, org_id)
 
         if ticket.user_id != user_id:
             raise HTTPException(
@@ -354,14 +500,30 @@ class TicketService:
 
     # ── Remettre un ticket absent en file ─────────────────────────────────────
     async def return_to_queue(
-        self, ticket_id: str, org_id: str
+        self, ticket_id: str, org_id: str, user_id: str | None = None
     ) -> dict:
         """
         Le client absent demande à revenir dans la file.
         Transition : ABSENT → WAITING
         Le ticket revient en fin de file (priorité dégradée).
+
+        Args:
+            ticket_id: ID du ticket absent
+            org_id: Organisation de l'appelant (agent / staff)
+            user_id: Si fourni (appel d'un client OTP sans organisation), le
+                     ticket est retrouvé par propriétaire et l'org du ticket
+                     remplace org_id. Un client ne peut donc remettre en file
+                     que son propre ticket.
+
+        Raises:
+            HTTPException 400: Transition interdite (ticket non ABSENT)
+            HTTPException 404: Ticket introuvable (ou appartenant à un autre user)
         """
-        ticket = await self._get_ticket_by_id(ticket_id, org_id)
+        if user_id is not None:
+            ticket = await self._get_ticket_for_owner(ticket_id, user_id)
+            org_id = ticket.org_id
+        else:
+            ticket = await self._get_ticket_by_id(ticket_id, org_id)
         await self._transition(ticket, TicketStatus.WAITING)
 
         # Remettre en file avec priorité standard (pénalité) — service_id depuis le ticket
@@ -538,6 +700,59 @@ class TicketService:
         self.db.add(log)
 
     # ── Helpers privés ────────────────────────────────────────────────────────
+    def _resolve_priority(
+        self, raw_priority: str, actor_role: UserRole | None
+    ) -> TicketPriority:
+        """
+        Valide la priorité demandée contre le rôle de l'appelant.
+
+        Règle de sécurité : VIP et EMERGENCY ne sont JAMAIS auto-attribuables
+        par un client. Sans ce contrôle, un simple `priority="emergency"` dans
+        le corps de la requête suffisait à passer devant toute la file — ce qui
+        détruit la promesse d'équité du produit.
+
+        Args:
+            raw_priority: Valeur brute reçue du client ("standard", "vip"…)
+            actor_role: Rôle de l'appelant (None = client anonyme)
+
+        Returns:
+            La priorité validée
+
+        Raises:
+            HTTPException 400: Priorité inconnue
+            HTTPException 403: Priorité réservée au staff
+        """
+        try:
+            requested = TicketPriority(raw_priority)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "INVALID_PRIORITY",
+                    "message": (
+                        f"Priorité inconnue : '{raw_priority}'. "
+                        f"Valeurs acceptées : {[p.value for p in TicketPriority]}"
+                    ),
+                },
+            )
+
+        is_staff = actor_role is not None and actor_role != UserRole.CLIENT
+        if not is_staff and requested not in CLIENT_ALLOWED_PRIORITIES:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "PRIORITY_FORBIDDEN",
+                    "message": (
+                        f"La priorité '{requested.value}' ne peut pas être "
+                        "auto-attribuée. Présentez-vous à l'accueil : un agent "
+                        "l'appliquera si votre situation le justifie."
+                    ),
+                    "allowed_priorities": sorted(p.value for p in CLIENT_ALLOWED_PRIORITIES),
+                },
+            )
+
+        return requested
+
     async def _get_agency_for_creation(
         self, agency_id: str, user_org_id: str | None
     ) -> Branch:
@@ -612,6 +827,36 @@ class TicketService:
             )
         return ticket
 
+    async def _get_ticket_for_owner(self, ticket_id: str, user_id: str) -> Ticket:
+        """
+        Récupère un ticket par son ID ET son propriétaire (client sans organisation).
+
+        Les clients OTP ont User.org_id = NULL : on ne peut pas filtrer par org_id
+        de l'utilisateur. L'isolation vient du filtre user_id — un client ne peut
+        jamais atteindre le ticket d'un autre. Retourne 404 (jamais 403) pour ne
+        pas révéler l'existence d'un ticket appartenant à quelqu'un d'autre.
+
+        Args:
+            ticket_id: ID du ticket
+            user_id: ID du propriétaire attendu
+
+        Raises:
+            HTTPException 404: Ticket introuvable ou appartenant à un autre user
+        """
+        result = await self.db.execute(
+            select(Ticket).where(
+                Ticket.id == ticket_id,
+                Ticket.user_id == user_id,
+            )
+        )
+        ticket = result.scalar_one_or_none()
+        if not ticket:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "TICKET_NOT_FOUND", "message": "Ticket introuvable"},
+            )
+        return ticket
+
     async def _get_active_ticket(self, user_id: str) -> Ticket | None:
         """
         Vérifie si l'utilisateur possède un ticket actif sur toute la plateforme.
@@ -625,28 +870,55 @@ class TicketService:
         Returns:
             Le ticket actif trouvé, ou None si l'utilisateur est libre.
         """
+        # limit(1) + first() : si deux tickets actifs existaient malgré tout
+        # (création concurrente avant contrainte d'unicité), on renvoie le plus
+        # ancien au lieu de lever MultipleResultsFound → 500.
         result = await self.db.execute(
-            select(Ticket).where(
+            select(Ticket)
+            .where(
                 Ticket.user_id == user_id,
                 Ticket.status.in_(ACTIVE_STATUSES),
             )
+            .order_by(Ticket.created_at.asc())
+            .limit(1)
         )
-        return result.scalar_one_or_none()
+        return result.scalars().first()
 
     async def _get_next_sequence(self, agency_id: str, prefix: str) -> int:
         """
         Génère le prochain numéro de séquence pour le jour en cours.
         La séquence repart à 1 chaque jour à minuit UTC.
+
+        Deux niveaux de protection contre les doublons :
+          1. Compteur Redis atomique (INCR) — élimine la course entre requêtes
+             concurrentes, qui était la cause réelle des « A-5 » en double.
+          2. Repli sur MAX(sequence) + 1 si Redis est indisponible, avec
+             l'index unique en base comme dernier rempart (cf. migration 007).
+
+        MAX et non COUNT : compter les tickets du jour donnait un numéro déjà
+        utilisé si un ticket avait été supprimé entre-temps.
         """
         today_start = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         result = await self.db.execute(
-            select(func.count(Ticket.id)).where(
+            select(func.max(Ticket.sequence)).where(
                 Ticket.agency_id == agency_id,
                 Ticket.prefix == prefix,
                 Ticket.created_at >= today_start,
             )
         )
-        count = result.scalar() or 0
-        return count + 1
+        db_max = result.scalar() or 0
+
+        try:
+            return await next_daily_sequence(
+                agency_id, prefix, today_start.date().isoformat(), db_max
+            )
+        except Exception as e:
+            # Redis est un prérequis de l'app (vérifié au démarrage) : ce repli
+            # ne devrait jamais s'activer. Il évite un 500 en cas de coupure.
+            logger.error(
+                f"Compteur Redis indisponible, repli sur MAX(sequence)+1: {e}",
+                exc_info=True,
+            )
+            return db_max + 1
