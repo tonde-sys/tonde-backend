@@ -68,6 +68,23 @@ def test_valid_production_configuration_starts():
     assert config.is_production is True and config.is_development is False
 
 
+def test_production_refuses_wildcard_cors_origin():
+    with pytest.raises(ValidationError, match="ALLOWED_ORIGINS"):
+        make_settings(ENVIRONMENT="production", DEBUG=False, ALLOWED_ORIGINS="*")
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("postgres://u:p@h:5432/db", "postgresql+asyncpg://u:p@h:5432/db"),
+        ("postgresql://u:p@h:5432/db", "postgresql+asyncpg://u:p@h:5432/db"),
+        ("postgresql+asyncpg://u:p@h:5432/db", "postgresql+asyncpg://u:p@h:5432/db"),
+    ],
+)
+def test_managed_database_urls_are_normalized_for_asyncpg(raw, expected):
+    assert make_settings(DATABASE_URL=raw).DATABASE_URL == expected
+
+
 def test_unknown_environment_is_refused():
     with pytest.raises(ValidationError, match="ENVIRONMENT"):
         make_settings(ENVIRONMENT="prod")        # une faute de frappe ne doit pas passer en « dev » sans bruit

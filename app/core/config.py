@@ -11,7 +11,7 @@ l'application de démarrer au lieu de tourner silencieusement en mode vulnérabl
 import logging
 from typing import List
 
-from pydantic import ConfigDict, model_validator
+from pydantic import ConfigDict, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 VALID_ENVIRONMENTS = ("development", "staging", "production")
@@ -99,6 +99,25 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
 
     # ── Propriétés dérivées ───────────────────────────────────
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def _normalize_database_url(cls, value: str) -> str:
+        """
+        Accepte les URLs fournies par les plateformes managées.
+
+        Render (et Heroku) injectent ``postgres://`` ou ``postgresql://`` ;
+        SQLAlchemy async a besoin du driver explicite ``postgresql+asyncpg://``.
+        Une URL déjà qualifiée est laissée intacte.
+        """
+        if not isinstance(value, str):
+            return value
+        url = value.strip()
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
+        if url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+        return url
+
     @property
     def is_development(self) -> bool:
         """True en développement (OTP de test 123456, SMS simulés)."""
@@ -151,6 +170,11 @@ class Settings(BaseSettings):
                 problems.append("DEBUG doit être false")
             if self.CREATE_TABLES_ON_STARTUP:
                 problems.append("CREATE_TABLES_ON_STARTUP doit être false (utiliser Alembic)")
+            if "*" in self.get_allowed_origins():
+                problems.append(
+                    "ALLOWED_ORIGINS ne peut pas contenir '*' "
+                    "(incompatible avec allow_credentials=True)"
+                )
             if problems:
                 raise ValueError("Configuration de production dangereuse : " + " ; ".join(problems))
 
