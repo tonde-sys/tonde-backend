@@ -91,15 +91,27 @@ par `RUN_MIGRATIONS_ON_STARTUP=true` dans le `docker-entrypoint.sh`.
    - `tonde-pilot-kv` (Key Value, plan gratuit, sans persistance).
 5. Le premier déploiement applique `alembic upgrade head` au démarrage
    (`RUN_MIGRATIONS_ON_STARTUP=true`), puis lance l'API.
-6. Vérifier `https://tonde-api-pilot.onrender.com/health` →
+6. Vérifier `https://<service>.onrender.com/health` →
    `{"status":"awake","service":"tonde-api"}` (aucune requête base/Redis).
 
 > Le nom du service peut être changé dans `render.yaml` avant le premier sync.
 > Le changer après création recrée un service.
+>
+> **Déploiement de démonstration actuel** : le nom `tonde-api-pilot` était déjà
+> pris globalement sur `onrender.com`, Render a donc suffixé les ressources :
+>
+> | Ressource | Nom réel | URL / identifiant |
+> |---|---|---|
+> | API | `tonde-api-pilot-fx1j` | `https://tonde-api-pilot-fx1j.onrender.com` |
+> | PostgreSQL | `tonde-pilot-db-fx1j` | — |
+> | Key Value | `tonde-pilot-kv-fx1j` | — |
+>
+> Les commandes ci-dessous utilisent cette URL réelle. Pour un nouveau
+> déploiement, remplacer `BASE` par l'URL affichée par Render.
 
 ### 3.2 Vérifier les secrets
 
-Dans **tonde-api-pilot → Environment** :
+Dans **tonde-api-pilot-fx1j → Environment** :
 
 - `JWT_SECRET_KEY` doit être présent et généré par Render (ne jamais le lire à voix haute).
 - `DATABASE_URL` et `REDIS_URL` sont des références privées Render.
@@ -124,7 +136,7 @@ variable d'environnement `BOOTSTRAP_CONFIG_JSON` du service, puis redéployer.
 générés apparaissent **une seule fois** dans les logs du premier démarrage.
 Laisser `BOOTSTRAP_PASSWORDS_JSON` vide pour les générer aléatoirement.
 
-**Render payant / VPS** : ouvrir **Shell** sur `tonde-api-pilot` et créer
+**Render payant / VPS** : ouvrir **Shell** sur `tonde-api-pilot-fx1j` et créer
 `/tmp/pilot.json` à partir de `bootstrap/pilot.example.json`.
 
 ```bash
@@ -234,7 +246,7 @@ python -m app.cli bootstrap \
 ### 3.4 Vérification post-déploiement
 
 ```bash
-BASE=https://tonde-api-pilot.onrender.com
+BASE=https://tonde-api-pilot-fx1j.onrender.com
 
 curl -fsS $BASE/health
 curl -fsS $BASE/health/ready
@@ -307,7 +319,7 @@ Le plan gratuit Render endort un web service après **15 minutes** sans trafic.
 Un seul moniteur UptimeRobot suffit :
 
 1. Créer un moniteur **HTTP(s)**.
-2. URL : `https://tonde-api-pilot.onrender.com/health`.
+2. URL : `https://tonde-api-pilot-fx1j.onrender.com/health`.
 3. Intervalle : **5 minutes** (minimum du plan gratuit).
 4. Type de contrôle : **Keyword**, mot-clé `awake` (ou `"status":"awake"`).
 5. Région : choisir la plus proche (Europe/Francfort).
@@ -433,7 +445,7 @@ Tester une restauration au moins une fois avant le pilote.
 
 ```bash
 # Render : Dashboard → Logs, ou CLI
-render logs tonde-api-pilot --tail
+render logs tonde-api-pilot-fx1j --tail
 
 # VPS
 docker compose --env-file .env.production -f docker-compose.prod.yml logs -f api
