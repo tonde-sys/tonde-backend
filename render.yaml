@@ -1,17 +1,21 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# TONDE — Blueprint Render pour le pilote (une organisation)
+# TONDE — Blueprint Render GRATUIT pour la démo / le MVP (une organisation)
 #
 # Création : Dashboard Render → New → Blueprint → repo tonde-sys/tonde-backend
 #            branche main, chemin render.yaml.
 #
-# Coût indicatif (workspace Hobby, Frankfurt) :
-#   web 0.5c-512mb  :  7 $/mois
-#   Postgres 0.5c-1g: 19 $/mois + stockage 0,30 $/Go
-#   Key Value 256mb : 10 $/mois
-#   → environ 36 $/mois hors stockage/bande passante.
+# Coût : 0 $/mois. Contreparties du plan gratuit Render :
+#   - le web s'endort après 15 min sans trafic → UptimeRobot ping /health
+#     toutes les 5 min pour le garder éveillé ;
+#   - pas de shell, pas de preDeployCommand, pas de one-off job → les
+#     migrations Alembic tournent au démarrage (RUN_MIGRATIONS_ON_STARTUP) ;
+#   - PostgreSQL gratuit expire après 30 jours et ne doit pas être utilisé
+#     pour un pilote de longue durée ;
+#   - Key Value gratuit n'a pas de persistance : Redis est un accélérateur,
+#     PostgreSQL reste la vérité et les files sont reconstruites au démarrage.
 #
-# Les plans payants sont volontaires : le plan gratuit n'a ni shell, ni
-# preDeployCommand, ni persistance Redis, et la base gratuite expire en 30 jours.
+# Pour un pilote réel de plus de 30 jours, passer le Blueprint aux plans
+# payants décrits dans DEPLOYMENT.md.
 # ═══════════════════════════════════════════════════════════════════════════
 
 services:
@@ -20,13 +24,11 @@ services:
     name: tonde-api-pilot
     runtime: docker
     region: frankfurt
-    plan: 0.5c-512mb
+    plan: free
     branch: main
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /health
-    preDeployCommand: alembic upgrade head
-    maxShutdownDelaySeconds: 30
     envVars:
       - key: ENVIRONMENT
         value: production
@@ -34,6 +36,8 @@ services:
         value: "false"
       - key: CREATE_TABLES_ON_STARTUP
         value: "false"
+      - key: RUN_MIGRATIONS_ON_STARTUP
+        value: "true"
       - key: APP_VERSION
         value: "1.0.0"
 
@@ -58,14 +62,15 @@ services:
       - key: REFRESH_TOKEN_EXPIRE_DAYS
         value: "7"
 
-      # À renseigner à la création du Blueprint (prompt Render).
-      # Une salle d'attente derrière un Wi-Fi partagé peut dépasser 10 connexions/min.
+      # Origine du cockpit web. Remplacer par l'URL réelle du front si besoin.
+      # Jamais "*" en production (l'application refuse de démarrer).
       - key: ALLOWED_ORIGINS
-        sync: false
-      - key: AFRICAS_TALKING_USERNAME
-        sync: false
-      - key: AFRICAS_TALKING_API_KEY
-        sync: false
+        value: https://tonde-web.onrender.com
+
+      # Facultatif pour une démo backend : ajouter AFRICAS_TALKING_USERNAME et
+      # AFRICAS_TALKING_API_KEY dans Dashboard → Environment pour activer les
+      # SMS. Sans clés, les endpoints OTP répondent 503 SMS_UNAVAILABLE ; les
+      # logins staff par mot de passe et le bootstrap restent utilisables.
       - key: AFRICAS_TALKING_SENDER_ID
         value: TONDE
 
@@ -79,16 +84,14 @@ services:
   - type: keyvalue
     name: tonde-pilot-kv
     region: frankfurt
-    plan: 256mb
+    plan: free
     maxmemoryPolicy: noeviction
-    persistenceMode: journal-snapshot
+    persistenceMode: off # Le plan gratuit ne persiste pas ; PostgreSQL reste la vérité.
     ipAllowList: [] # Aucun accès externe : réseau privé Render uniquement.
 
 databases:
   # ── PostgreSQL ────────────────────────────────────────────────────────────
   - name: tonde-pilot-db
     region: frankfurt
-    plan: 0.5c-1g
+    plan: free
     postgresMajorVersion: "15"
-    diskSizeGB: 5
-    storageAutoscalingEnabled: true

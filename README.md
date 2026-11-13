@@ -52,13 +52,16 @@ docker-compose exec api alembic upgrade head
 
 # 5. Vérifier que l'API est vivante
 # Swagger  : http://localhost:8000/docs
-# Health   : http://localhost:8000/health
+# Health   : http://localhost:8000/health          (ultra-léger, sans base)
+# Readiness: http://localhost:8000/health/ready    (PostgreSQL + Redis)
 # Redis UI : http://localhost:8081
 ```
 
 > `docker-compose.yml` est l'environnement de **développement** (rechargement à
-> chaud, mots de passe de démonstration). Pour un pilote réel, utiliser Render
-> (`render.yaml`) ou `docker-compose.prod.yml` — voir **[DEPLOYMENT.md](DEPLOYMENT.md)**.
+> chaud, mots de passe de démonstration). Pour une démo gratuite, utiliser le
+> Blueprint Render `render.yaml` (plans `free`, UptimeRobot sur `/health`). Pour
+> un pilote réel de longue durée, utiliser les plans payants ou
+> `docker-compose.prod.yml` — voir **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 
 ---
 
@@ -217,7 +220,7 @@ sortie, et les tickets bloqués sont clos automatiquement (voir *Expirations*).
 | Hors-ligne | `GET /sync/state` · `POST /sync/actions` (idempotent) · `GET /sync/changes?since=` (7 jours max) |
 | Notifications | `GET /notifications` · `POST /notifications/{id}/read` · `POST /notifications/read-all` · `PUT /auth/me/fcm-token` |
 | Exports (superviseur+) | `GET /organizations/{org}/tickets/export` · `…/branches/{id}/tickets/export` · `…/branches/{id}/stats/export` (`format=csv` ou `xlsx`) |
-| Exploitation | `GET /health` · `/health/live` · `/health/ready` · `/health/detailed` (admin) |
+| Exploitation | `GET /health` (réveil, sans base) · `/health/live` · `/health/ready` (base + Redis) · `/health/status` · `/health/detailed` (admin) |
 
 ---
 
