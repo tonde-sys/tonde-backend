@@ -18,6 +18,7 @@ import logging
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from fastapi import FastAPI, WebSocket
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,13 @@ logger = logging.getLogger(__name__)
 
 # Instance globale partagée par tous les routers.
 # key_func=get_remote_address → limite par adresse IP cliente.
-limiter = Limiter(key_func=get_remote_address)
+# default_limits protège TOUTES les routes HTTP d'un plafond par IP dès que
+# SlowAPIMiddleware est installé (voir setup_rate_limiting) — y compris les
+# routes non décorées, qui sinon n'avaient aucune protection.
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=["200/minute"],
+)
 
 
 async def check_ws_rate_limit(websocket: WebSocket) -> bool:
@@ -68,8 +75,13 @@ def setup_rate_limiting(app: FastAPI) -> None:
     Doit être appelée dans main.py après la création de l'app,
     avant app.add_middleware() et app.include_router().
 
+    Sans SlowAPIMiddleware, `default_limits` n'est JAMAIS appliqué : seules les
+    routes portant un @limiter.limit explicite seraient protégées, et le plafond
+    global annoncé (200/minute) resterait décoratif.
+
     Args:
         app: Instance FastAPI à protéger
     """
     app.state.limiter = limiter
+    app.add_middleware(SlowAPIMiddleware)
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)

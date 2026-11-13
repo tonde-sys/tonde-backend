@@ -342,7 +342,11 @@ class TicketService:
     # ══ Consultation ═══════════════════════════════════════════════════════════
 
     async def get_ticket(
-        self, ticket_id: str, user_id: str, org_id: str | None
+        self,
+        ticket_id: str,
+        user_id: str,
+        org_id: str | None,
+        actor_role: UserRole | None = None,
     ) -> TicketResponse:
         """
         Retourne les informations actuelles d'un ticket.
@@ -369,7 +373,13 @@ class TicketService:
         else:
             ticket = await self._get_ticket_by_id(ticket_id, org_id)
 
-        if ticket.user_id != user_id:
+        # Le contrôle de propriété ne s'applique QU'AUX clients.
+        # Un agent/superviseur/admin consulte les tickets de son organisation :
+        # sans cette exception, un guichetier ne pouvait pas ouvrir le ticket
+        # qu'il venait lui-même d'appeler (403 systématique), ce qui bloquait
+        # tout l'enchaînement /serving → /done côté desktop.
+        is_staff = actor_role is not None and actor_role != UserRole.CLIENT
+        if not is_staff and ticket.user_id != user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"code": "FORBIDDEN", "message": "Accès non autorisé à ce ticket"},

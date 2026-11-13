@@ -236,9 +236,21 @@ async def not_found_handler(request, exc):
     )
 
 
-@app.exception_handler(500)
-async def server_error_handler(request, exc):
-    logger.error(f"Erreur 500 sur {request.url.path}: {exc}")
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc: Exception):
+    """
+    Filet de sécurité pour TOUTE exception non gérée.
+
+    On enregistre Exception et non 500 : Starlette n'invoque jamais un handler
+    déclaré sur la classe 500 (aucune exception de ce type n'est levée). Le
+    handler `500` précédent était donc du code mort, et les vraies erreurs
+    sortaient en texte brut « Internal Server Error » — sans enveloppe JSON,
+    sans log applicatif, et sans en-têtes CORS côté client.
+
+    Les HTTPException (4xx/5xx métier) ne passent PAS ici : Starlette les
+    traite avant avec leur propre handler.
+    """
+    logger.exception(f"Erreur non gérée sur {request.method} {request.url.path}")
     return JSONResponse(
         status_code=500,
         content={

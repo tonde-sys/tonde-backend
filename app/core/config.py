@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     FIREBASE_PROJECT_ID: str = ""
     FIREBASE_SERVICE_ACCOUNT_JSON: str = ""
 
+    # ── IA (Coarena, API compatible OpenAI) ──────────────────
+    AI_BASE_URL: str = "https://coarena.ai/api/v1"
+    AI_API_KEY: str = ""
+    AI_MODEL: str = "claude-sonnet-5-5"
+    AI_TIMEOUT_SECONDS: float = 30.0
+
     # ── Queue Engine : délais ─────────────────────────────────
     # Délai laissé au client appelé pour se présenter avant d'être ABSENT.
     ABSENT_TIMEOUT_SECONDS: int = 180
@@ -108,6 +114,10 @@ class Settings(BaseSettings):
         Render (et Heroku) injectent ``postgres://`` ou ``postgresql://`` ;
         SQLAlchemy async a besoin du driver explicite ``postgresql+asyncpg://``.
         Une URL déjà qualifiée est laissée intacte.
+
+        La query string n'est PAS touchée ici : database.py a besoin de voir les
+        paramètres d'origine (``sslmode``) pour décider d'activer TLS, avant de
+        les retirer pour asyncpg. Voir Settings.adapt_url_for_asyncpg().
         """
         if not isinstance(value, str):
             return value
@@ -117,6 +127,61 @@ class Settings(BaseSettings):
         if url.startswith("postgresql://"):
             url = "postgresql+asyncpg://" + url[len("postgresql://"):]
         return url
+
+    @staticmethod
+    def url_requires_ssl(url: str) -> bool:
+        """
+        True si cette URL de connexion impose TLS.
+
+        Neon, Supabase et Render PostgreSQL managé refusent les connexions non
+        chiffrées. On le détecte avant de retirer ``sslmode`` de l'URL.
+
+        Args:
+            url: URL SQLAlchemy brute (avant adaptation asyncpg)
+
+        Returns:
+            True si TLS est requis, False sinon.
+        """
+        if not isinstance(url, str):
+            return False
+        lowered = url.lower()
+        if "sslmode=require" in lowered or "sslmode=verify" in lowered:
+            return True
+        if "ssl=true" in lowered or "ssl=require" in lowered:
+            return True
+        return ".neon.tech" in lowered or ".supabase." in lowered
+
+    @staticmethod
+    def adapt_url_for_asyncpg(url: str) -> str:
+        """
+        Retire de la query string les paramètres que seul libpq comprend.
+
+        asyncpg ne comprend ni ``sslmode`` ni ``channel_binding`` : il lève
+        « connect() got an unexpected keyword argument 'sslmode' » au premier
+        SELECT. Le TLS est appliqué par database.py via connect_args.
+
+        Args:
+            url: URL SQLAlchemy ``postgresql+asyncpg://…?sslmode=require``
+
+        Returns:
+            URL sans ``sslmode`` ni ``channel_binding`` ; les autres paramètres
+            (``application_name``, ``options``…) sont préservés.
+        """
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+        if not isinstance(url, str) or not url.startswith("postgresql+asyncpg://"):
+            return url
+
+        parts = urlsplit(url)
+        if not parts.query:
+            return url
+
+        libpq_only = {"sslmode", "channel_binding"}
+        original = parse_qsl(parts.query, keep_blank_values=True)
+        kept = [(k, v) for k, v in original if k not in libpq_only]
+        if len(kept) == len(original):
+            return url  # rien à retirer
+        return urlunsplit(parts._replace(query=urlencode(kept)))
 
     @property
     def is_development(self) -> bool:

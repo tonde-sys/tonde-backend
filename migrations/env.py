@@ -48,7 +48,12 @@ from app.models import (  # noqa: F401
 config = context.config
 
 # Injecter l'URL DB depuis les settings TONDE (lit le .env)
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# adapt_url_for_asyncpg retire les paramètres libpq (sslmode, channel_binding)
+# qu'asyncpg refuse. Le '%' est échappé : configparser interpréterait sinon la
+# valeur comme une interpolation et planterait sur un mot de passe encodé.
+config.set_main_option(
+    "sqlalchemy.url", settings.adapt_url_for_asyncpg(settings.DATABASE_URL).replace("%", "%%")
+)
 
 # Logger depuis alembic.ini
 if config.config_file_name is not None:
@@ -112,10 +117,16 @@ def do_run_migrations(connection: Connection) -> None:
 
 async def run_async_migrations() -> None:
     """Lance les migrations avec le moteur async asyncpg."""
+    connect_args: dict = {}
+    if settings.url_requires_ssl(settings.DATABASE_URL):
+        # Neon / Supabase : TLS obligatoire, non déductible de l'URL nettoyée.
+        connect_args["ssl"] = True
+
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args=connect_args,
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

@@ -41,11 +41,21 @@ services:
       - key: APP_VERSION
         value: "1.0.0"
 
-      # Connexions privées Render (même région obligatoire).
+      # ── PostgreSQL : base EXTERNE (Neon) ───────────────────────────────
+      # La base n'est plus provisionnée par Render : elle vit sur Neon, qui
+      # offre la persistance et les sauvegardes que le PostgreSQL gratuit de
+      # Render n'assure pas (expiration à 30 jours).
+      #
+      # sync: false → la valeur N'EST PAS dans le dépôt. À renseigner une fois
+      # dans Dashboard → tonde-api-pilot → Environment :
+      #
+      #   DATABASE_URL = postgresql://<user>:<password>@<endpoint>.neon.tech/<db>?sslmode=require
+      #
+      # L'application normalise l'URL (postgres:// → postgresql+asyncpg://) et
+      # convertit sslmode en TLS asyncpg : ne pas ajouter de driver à la main.
       - key: DATABASE_URL
-        fromDatabase:
-          name: tonde-pilot-db
-          property: connectionString
+        sync: false
+
       - key: REDIS_URL
         fromService:
           type: keyvalue
@@ -89,9 +99,11 @@ services:
     persistenceMode: off # Le plan gratuit ne persiste pas ; PostgreSQL reste la vérité.
     ipAllowList: [] # Aucun accès externe : réseau privé Render uniquement.
 
-databases:
-  # ── PostgreSQL ────────────────────────────────────────────────────────────
-  - name: tonde-pilot-db
-    region: frankfurt
-    plan: free
-    postgresMajorVersion: "15"
+# ── PostgreSQL ────────────────────────────────────────────────────────────────
+# Volontairement ABSENT : la base est hébergée sur Neon (voir DATABASE_URL
+# ci-dessus, en sync: false). Appliquer ce Blueprint supprime l'ancienne
+# instance Render « tonde-pilot-db ». Avant d'appliquer :
+#   1. créer la base Neon et récupérer sa chaîne de connexion ;
+#   2. renseigner DATABASE_URL dans Dashboard → Environment ;
+#   3. déployer (les migrations tournent au démarrage) ;
+#   4. seulement ensuite retirer l'ancienne base.

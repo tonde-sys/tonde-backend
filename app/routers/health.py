@@ -24,7 +24,11 @@ from app.services import health_service
 router = APIRouter(tags=["🏠 Accueil"])
 
 
-@router.get("/health", summary="Réveil ultra-léger (sans base ni Redis)")
+@router.api_route(
+    "/health",
+    methods=["GET", "HEAD"],
+    summary="Réveil ultra-léger (sans base ni Redis)",
+)
 def health_check():
     """
     Endpoint de réveil pour UptimeRobot et les load balancers.
@@ -32,11 +36,16 @@ def health_check():
     Aucune dépendance n'est interrogée : la réponse est produite par le
     processus FastAPI lui-même. Cela évite de réveiller PostgreSQL/Redis et
     de consommer une connexion à chaque ping.
+
+    HEAD est déclaré explicitement : FastAPI n'ajoute pas HEAD aux routes GET,
+    et UptimeRobot sonde d'abord en HEAD. Sans cette ligne, la sonde recevait
+    « 405 Method Not Allowed » (en-tête `allow: GET`) et le moniteur basculait
+    en échec — alors que le service répondait parfaitement en GET.
     """
     return {"status": "awake", "service": "tonde-api"}
 
 
-@router.get("/health/live", summary="Liveness probe")
+@router.api_route("/health/live", methods=["GET", "HEAD"], summary="Liveness probe")
 async def liveness():
     """Le processus répond. Aucune dépendance testée : un redémarrage ne doit pas dépendre de la base."""
     return {"status": "alive"}
