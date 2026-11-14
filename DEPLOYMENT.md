@@ -321,9 +321,17 @@ Un seul moniteur UptimeRobot suffit :
 1. Créer un moniteur **HTTP(s)**.
 2. URL : `https://tonde-api-pilot-fx1j.onrender.com/health`.
 3. Intervalle : **5 minutes** (minimum du plan gratuit).
-4. Type de contrôle : **Keyword**, mot-clé `awake` (ou `"status":"awake"`).
+4. Timeout : **60 s**. Un service Render endormi met 30 à 50 s à répondre au
+   premier appel ; un timeout de 30 s produit de faux incidents.
 5. Région : choisir la plus proche (Europe/Francfort).
 6. Activer les alertes e-mail.
+
+> **UptimeRobot sonde en `HEAD`, pas en `GET`.** FastAPI n'ajoute pas `HEAD`
+> automatiquement aux routes `GET` : une route déclarée avec `@router.get`
+> répond 405 à un `HEAD`, et le moniteur passe DOWN alors que le service va
+> très bien. C'est pourquoi `/health` et `/health/live` sont déclarés avec
+> `@router.api_route(..., methods=["GET", "HEAD"])`. Ne pas revenir à
+> `@router.get` sans revérifier : `curl -I https://…/health` doit renvoyer 200.
 
 Pourquoi `/health` et pas `/health/ready` : `/health` répond depuis le processus
 FastAPI sans ouvrir de connexion PostgreSQL ou Redis. Un ping toutes les 5 minutes
@@ -333,6 +341,55 @@ avec un intervalle plus large (10–15 min) pour ne pas surcharger la base.
 
 > Un service 24/7 consomme ≈ 730 h/mois sur les 750 h gratuites de Render.
 > Ne pas multiplier les moniteurs sur le même service.
+
+### 3.7 Déplacer PostgreSQL hors de Render (Neon)
+
+Le PostgreSQL gratuit de Render **expire 30 jours après sa création** et devient
+inaccessible. Le déplacer chez Neon allonge la durée de vie sans changer l'API,
+qui reste sur Render.
+
+**Ordre impératif — ne pas inverser les étapes, sinon le service tombe.**
+
+1. Dans Neon, créer le projet et copier **deux** chaînes de connexion :
+   - l'URL **directe** (`ep-xxx.…neon.tech`) — pour les migrations ;
+   - l'URL **poolée** (`ep-xxx-pooler.…neon.tech`) — facultative, pour l'API.
+
+2. Dans Render → *Environment*, renseigner :
+
+   ```
+   DATABASE_URL=postgresql://user:pwd@ep-xxx-pooler.eu-central-1.aws.neon.tech/neondb?sslmode=require
+   MIGRATION_DATABASE_URL=postgresql://user:pwd@ep-xxx.eu-central-1.aws.neon.tech/neondb?sslmode=require
+   ```
+
+   `MIGRATION_DATABASE_URL` est facultative : sans elle, Alembic utilise
+   `DATABASE_URL`. La renseigner permet d'utiliser le pooler pour l'API tout en
+   gardant la connexion directe pour les migrations, ce que Neon recommande
+   (le mode transaction du pooler ne conserve pas les paramètres de session).
+
+3. Déployer. `RUN_MIGRATIONS_ON_STARTUP=true` fait tourner `alembic upgrade head`
+   sur la nouvelle base, puis `BOOTSTRAP_CONFIG_JSON` recrée l'organisation.
+
+4. Vérifier **avant de supprimer quoi que ce soit** :
+
+   ```bash
+   curl https://<service>.onrender.com/health/ready
+   # {"status":"ready","checks":{"database":{"status":"healthy"},…}}
+
+   curl -X POST https://<service>.onrender.com/api/v1/auth/login \
+     -H "Content-Type: application/json" \
+     -d '{"email":"admin@<org>.bi","password":"…"}'
+   ```
+
+5. **Seulement ensuite**, supprimer l'instance PostgreSQL dans Render.
+
+Deux points à connaître :
+
+- `sslmode` et `channel_binding` sont retirés automatiquement de l'URL avant
+  d'être transmis à `asyncpg`, qui les refuse ; TLS est réactivé via
+  `connect_args`. Rien à faire manuellement.
+- Neon suspend son compute après quelques minutes d'inactivité. `/health` ne
+  touche pas la base, donc elle reste froide : la première requête réelle après
+  une pause paie ~500 ms de réveil. Acceptable, mais à savoir avant une démo.
 
 ---
 
