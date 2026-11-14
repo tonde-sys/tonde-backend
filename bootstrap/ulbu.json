@@ -1,0 +1,74 @@
+{
+  "organization": {
+    "name": "Université Lumière de Bujumbura (ULBU)",
+    "slug": "ulbu",
+    "sector": "university",
+    "description": "Université Lumière de Bujumbura",
+    "country": "Burundi",
+    "city": "Bujumbura",
+    "phone": "+2570000000",
+    "email": "contact@ulbu.bi",
+    "website": "https://ulbu.bi",
+    "logo_url": "https://ulbu.bi/logo.png"
+  },
+  "branch": {
+    "name": "Mutanga-Nord",
+    "slug": "mutanga-nord",
+    "description": "Campus de Mutanga Nord de l'Université Lumière de Bujumbura",
+    "address": "Bujumbura, Burundi",
+    "city": "Bujumbura",
+    "opens_at": "10:00",
+    "closes_at": "14:00",
+    "max_daily_tickets": 100,
+    "avg_service_minutes": 5,
+    "is_open": true
+  },
+  "services": [
+    {
+      "name": "Prise de Photo",
+      "ticket_prefix": "T",
+      "avg_duration_minutes": 3
+    },
+    {
+      "name": "Demande de la carte",
+      "ticket_prefix": "C",
+      "avg_duration_minutes": 5
+    }
+  ],
+  "counters": [
+    {
+      "name": "Guichet 1"
+    },
+    {
+      "name": "Guichet 2"
+    }
+  ],
+  "users": [
+    {
+      "name": "Super Admin ULBU",
+      "email": "superadmin@ulbu.bi",
+      "role": "super_admin",
+      "password_env": "ULBU_ADMIN_PASSWORD"
+    },
+    {
+      "name": "Administrateur de l'organisation",
+      "email": "admin@ulbu.bi",
+      "role": "admin_org",
+      "password_env": "ULBU_ADMIN_PASSWORD"
+    },
+    {
+      "name": "Agent Guichet 1",
+      "email": "agent1@ulbu.bi",
+      "role": "agent",
+      "counter": "Guichet 1",
+      "password_env": "ULBU_ADMIN_PASSWORD"
+    },
+    {
+      "name": "Agent Guichet 2",
+      "email": "agent2@ulbu.bi",
+      "role": "agent",
+      "counter": "Guichet 2",
+      "password_env": "ULBU_ADMIN_PASSWORD"
+    }
+  ]
+}
