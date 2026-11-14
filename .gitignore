@@ -47,3 +47,7 @@ Thumbs.db
 
 # ── Alembic ──────────────────────────────────────────────────
 # Ne pas ignorer les migrations — elles doivent être versionnées
+
+# Outils de developpement locaux
+.workbuddy-ai/
+.kiro/

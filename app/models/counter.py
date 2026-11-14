@@ -5,7 +5,14 @@ Un Counter (guichet) est le point physique où un agent
 sert les clients. Chaque guichet appartient à une Branch (agence)
 et à une Organisation.
 
-Un guichet peut être ouvert, fermé ou en pause.
+Un guichet a DEUX états seulement, portés par deux colonnes distinctes :
+  - `is_open`   : le guichet accepte des tickets (ouvert / fermé) ;
+  - `is_active` : le guichet existe (désactivé = retiré du service).
+
+Il n'existe PAS d'état « en pause » : fermer un guichet (`is_open = false`)
+n'annule pas le ticket en cours, il empêche seulement d'en appeler de
+nouveaux. Un besoin de pause sans libérer le ticket devrait introduire un
+champ dédié — ne pas déduire une pause de `is_open`.
 Le champ current_ticket_id stocke le ticket en cours de service.
 """
 import uuid

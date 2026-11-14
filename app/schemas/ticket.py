@@ -56,6 +56,15 @@ class TicketResponse(BaseModel):
     created_at: datetime
     counter_name: Optional[str] = None       # Guichet assigné si appelé
 
+    # ── Horodatages du cycle de vie ───────────────────────────
+    # Exposés pour que le poste guichet calcule la durée de service réelle
+    # (served_at → done_at) au lieu de la déduire de l'instant du fetch.
+    # Sans eux, après une reprise/reconnexion, un ticket déjà en service
+    # apparaît comme venant d'être appelé et la durée affichée est fausse.
+    called_at: Optional[datetime] = None
+    served_at: Optional[datetime] = None
+    done_at: Optional[datetime] = None
+
 
 class TicketHistoryResponse(BaseModel):
     """Réponse paginée pour l'historique des tickets."""

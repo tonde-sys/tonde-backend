@@ -109,12 +109,7 @@ async def get_ticket(
     db: AsyncSession = Depends(get_db),
 ):
     service = TicketService(db)
-    return await service.get_ticket(
-        ticket_id,
-        current_user.id,
-        _get_org_id(current_user),
-        actor_role=current_user.role,
-    )
+    return await service.get_ticket(ticket_id, current_user)
 
 
 @router.delete("/{ticket_id}", summary="Annuler un ticket")

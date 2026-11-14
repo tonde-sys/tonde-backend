@@ -17,10 +17,16 @@ from fastapi import HTTPException
 from app.models.organization import Organization
 from app.models.branch import Branch, Service
 from app.models.ticket import TicketStatus, TicketPriority
+from app.models.user import User, UserRole
 from app.schemas.ticket import CreateTicketRequest
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
+
+def _client(user_id: str) -> User:
+    """Viewer client synthétique (non persisté) : get_ticket ne lit que viewer.id."""
+    return User(id=user_id, role=UserRole.CLIENT, org_id=None)
+
 
 @pytest.fixture
 def mock_queue(mock_redis):
@@ -641,7 +647,7 @@ async def test_org_less_client_can_get_own_ticket(ticket_service, db_session, mo
         ticket_service, db_session, "client-otp-get"
     )
 
-    result = await ticket_service.get_ticket(created.id, "client-otp-get", None)
+    result = await ticket_service.get_ticket(created.id, _client("client-otp-get"))
 
     assert result.id == created.id
     assert result.number == created.number
@@ -656,7 +662,7 @@ async def test_org_less_client_cannot_get_other_clients_ticket(ticket_service, d
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await ticket_service.get_ticket(created.id, "client-intruder", None)
+        await ticket_service.get_ticket(created.id, _client("client-intruder"))
 
     assert exc_info.value.status_code == 404
     assert exc_info.value.detail["code"] == "TICKET_NOT_FOUND"

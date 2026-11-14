@@ -12,7 +12,7 @@ from app.schemas.auth import (
     RegisterPhoneRequest, VerifyOtpRequest,
     RegisterEmailRequest, LoginEmailRequest,
     RefreshTokenRequest, LogoutRequest,
-    UpdateProfileRequest, FcmTokenRequest, UserInToken,
+    UpdateProfileRequest, FcmTokenRequest,
 )
 from app.services.auth_service import AuthService
 
@@ -136,9 +136,22 @@ async def logout_all(
 # ── Profil de l'utilisateur connecté ──────────────────────────────────────────
 
 @router.get("/me", summary="Mon profil")
-async def get_me(current_user: User = Depends(get_current_user)):
-    """Retourne le profil de l'utilisateur connecté."""
-    return {"success": True, "data": UserInToken.model_validate(current_user)}
+async def get_me(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Profil de l'utilisateur connecté, avec son contexte de travail.
+
+    `memberships` liste les rattachements staff actifs (organisation, branche,
+    guichet, rôle). Le poste guichet s'en sert pour se configurer seul : sans
+    cela il fallait saisir l'organisation et le guichet à la main, avec un
+    risque d'ouvrir un guichet auquel l'agent n'est pas affecté
+    (COUNTER_NOT_ASSIGNED). Un utilisateur peut avoir plusieurs rattachements
+    (multi-organisations) : c'est le client qui choisit.
+    """
+    token = await AuthService(db).build_user_token(current_user)
+    return {"success": True, "data": token}
 
 
 @router.patch("/me", summary="Modifier mon profil")
@@ -148,8 +161,13 @@ async def update_me(
     db: AsyncSession = Depends(get_db),
 ):
     """Met à jour le nom et/ou la langue (fr, en, rn, sw). Seuls les champs fournis changent."""
-    user = await AuthService(db).update_profile(current_user, body.name, body.language)
-    return {"success": True, "data": UserInToken.model_validate(user), "message": "Profil mis à jour"}
+    service = AuthService(db)
+    user = await service.update_profile(current_user, body.name, body.language)
+    return {
+        "success": True,
+        "data": await service.build_user_token(user),
+        "message": "Profil mis à jour",
+    }
 
 
 @router.put("/me/fcm-token", summary="Enregistrer le jeton de notifications push")

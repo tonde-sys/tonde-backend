@@ -341,49 +341,54 @@ class TicketService:
 
     # ══ Consultation ═══════════════════════════════════════════════════════════
 
-    async def get_ticket(
-        self,
-        ticket_id: str,
-        user_id: str,
-        org_id: str | None,
-        actor_role: UserRole | None = None,
-    ) -> TicketResponse:
+    async def get_ticket(self, ticket_id: str, viewer: User) -> TicketResponse:
         """
-        Retourne les informations actuelles d'un ticket.
+        Retourne les informations actuelles d'un ticket, selon qui le demande.
 
-        Sécurité : un client ne peut voir que ses propres tickets.
-        org_id garantit l'isolation multi-tenant.
+        Deux chemins distincts, choisis sur le RÔLE et non sur la présence d'un
+        org_id — c'était le défaut : un SUPER_ADMIN a `org_id = None` (il n'est
+        rattaché à aucune organisation), tombait donc dans le chemin CLIENT et
+        recevait 404 sur un ticket parfaitement valide.
+
+        - CLIENT : uniquement ses propres tickets.
+            * sans organisation (OTP) → recherche par propriétaire ;
+            * avec organisation (code d'invitation) → recherche dans l'org puis
+              contrôle de propriété (403).
+        - STAFF (agent et au-dessus) : ticket de son organisation, et de sa
+          branch pour les rôles non transverses (`_assert_staff_in_branch`).
+          Sans ce contrôle, un agent de l'agence A lisait les tickets de
+          l'agence B de la même organisation.
 
         Auto-réparation : si le ticket est WAITING mais absent de Redis (Redis vidé ou
         redémarré), il est remis en file à sa place d'origine avant de calculer sa position.
 
         Args:
             ticket_id: ID du ticket
-            user_id: ID de l'utilisateur connecté
-            org_id: Organisation de l'utilisateur. None pour un client OTP
-                    (sans organisation) : le ticket est alors retrouvé par
-                    propriétaire, et l'org du ticket sert pour la suite.
+            viewer: Utilisateur authentifié (client ou membre du staff)
 
         Raises:
-            HTTPException 403: Le ticket appartient à un autre utilisateur
-            HTTPException 404: Ticket introuvable
+            HTTPException 403: Ticket d'un autre client, ou d'une autre branch
+            HTTPException 404: Ticket introuvable dans le périmètre du demandeur
         """
-        if org_id is None:
-            ticket = await self._get_ticket_for_owner(ticket_id, user_id)
+        if viewer.role == UserRole.CLIENT:
+            if viewer.org_id is None:
+                # _get_ticket_for_owner filtre déjà sur user_id : 404, jamais 403.
+                ticket = await self._get_ticket_for_owner(ticket_id, viewer.id)
+            else:
+                ticket = await self._get_ticket_by_id(ticket_id, viewer.org_id)
+                if ticket.user_id != viewer.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail={
+                            "code": "FORBIDDEN",
+                            "message": "Accès non autorisé à ce ticket",
+                        },
+                    )
         else:
-            ticket = await self._get_ticket_by_id(ticket_id, org_id)
+            # Staff : périmètre organisation (SUPER_ADMIN = toutes), puis branch.
+            ticket = await self._get_ticket_for_staff(ticket_id, viewer)
+            await self._assert_staff_in_branch(viewer, ticket)
 
-        # Le contrôle de propriété ne s'applique QU'AUX clients.
-        # Un agent/superviseur/admin consulte les tickets de son organisation :
-        # sans cette exception, un guichetier ne pouvait pas ouvrir le ticket
-        # qu'il venait lui-même d'appeler (403 systématique), ce qui bloquait
-        # tout l'enchaînement /serving → /done côté desktop.
-        is_staff = actor_role is not None and actor_role != UserRole.CLIENT
-        if not is_staff and ticket.user_id != user_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={"code": "FORBIDDEN", "message": "Accès non autorisé à ce ticket"},
-            )
         return await self._build_response(ticket)
 
     async def get_ws_snapshot(self, ticket_id: str, user_id: str) -> dict | None:
@@ -1600,6 +1605,9 @@ class TicketService:
             estimated_wait_minutes=eta,
             created_at=ticket.created_at,
             counter_name=ticket.counter_name,
+            called_at=ticket.called_at,
+            served_at=ticket.served_at,
+            done_at=ticket.done_at,
         )
 
     async def _current_called_number(self, service_id: str) -> str | None:

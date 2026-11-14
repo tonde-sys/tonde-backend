@@ -83,6 +83,25 @@ class LogoutRequest(BaseModel):
 
 
 # ── Réponse après connexion réussie ──────────────────────────────────────────
+class MembershipInfo(BaseModel):
+    """
+    Rattachement d'un utilisateur à une organisation (Employee actif).
+
+    Exposé au poste guichet pour qu'il sache, sans configuration manuelle,
+    dans quelle organisation / branche / guichet l'agent travaille. Un
+    utilisateur peut en avoir plusieurs (multi-organisations) : c'est une
+    liste, et c'est le client qui choisit.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    employee_id: str
+    org_id: str
+    branch_id: str | None = None
+    counter_id: str | None = None
+    role: str
+    status: str
+
+
 class UserInToken(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -93,6 +112,11 @@ class UserInToken(BaseModel):
     role: str
     language: str
     is_verified: bool
+    # org_id = None pour un client OTP et pour un SUPER_ADMIN (équipe Tonde,
+    # rattachée à aucune organisation). Ne pas en déduire le rôle.
+    org_id: str | None = None
+    # Rattachements staff actifs. Vide pour un client.
+    memberships: list[MembershipInfo] = []
 
 
 class AuthResponse(BaseModel):

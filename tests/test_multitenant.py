@@ -107,7 +107,7 @@ async def test_user_org_a_cannot_see_ticket_of_org_b(db_session, mock_redis, moc
     # L'user d'org A tente de récupérer un ticket d'org B
     svc_a = TicketService(db_session)
     with pytest.raises(HTTPException) as exc_info:
-        await svc_a.get_ticket(ticket.id, user_a.id, org_a)
+        await svc_a.get_ticket(ticket.id, user_a)
 
     assert exc_info.value.status_code == 404
     assert exc_info.value.detail["code"] == "TICKET_NOT_FOUND"

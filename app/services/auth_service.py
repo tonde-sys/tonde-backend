@@ -17,6 +17,7 @@ from sqlalchemy import select, update
 from fastapi import HTTPException, status
 
 from app.models.user import User
+from app.models.employee import Employee, EmployeeStatus
 from app.models.refresh_token import RefreshToken
 from app.core.security import (
     hash_password, verify_password,
@@ -34,7 +35,7 @@ from app.services.sms_gateway import SmsDeliveryError, send_sms
 from app.schemas.auth import (
     RegisterPhoneRequest, VerifyOtpRequest,
     RegisterEmailRequest, LoginEmailRequest,
-    AuthResponse, UserInToken, RefreshResponse,
+    AuthResponse, UserInToken, RefreshResponse, MembershipInfo,
 )
 
 logger = logging.getLogger(__name__)
@@ -248,15 +249,7 @@ class AuthService:
         return AuthResponse(
             access_token=access_token,
             refresh_token=refresh_token_str,
-            user=UserInToken(
-                id=user.id,
-                name=user.name,
-                phone=user.phone,
-                email=user.email,
-                role=user.role.value,
-                language=user.language,
-                is_verified=user.is_verified,
-            ),
+            user=await self.build_user_token(user),
         )
 
     # ── Inscription par email ─────────────────────────────────────────────────
@@ -284,7 +277,7 @@ class AuthService:
         await self.db.flush()
 
         # Persister le refresh token
-        auth_response = self._create_auth_response(user, device_id=data.device_id if hasattr(data, "device_id") else None)
+        auth_response = await self._create_auth_response(user, device_id=data.device_id if hasattr(data, "device_id") else None)
         await self._persist_refresh_token(user_id=user.id, token=auth_response.refresh_token)
         await self.db.commit()
         await self.db.refresh(user)
@@ -323,7 +316,7 @@ class AuthService:
         await self.db.flush()
 
         # Persister le refresh token
-        auth_response = self._create_auth_response(user, device_id=data.device_id if hasattr(data, "device_id") else None)
+        auth_response = await self._create_auth_response(user, device_id=data.device_id if hasattr(data, "device_id") else None)
         await self._persist_refresh_token(user_id=user.id, token=auth_response.refresh_token)
         await self.db.commit()
 
@@ -492,20 +485,61 @@ class AuthService:
 
         return user
 
-    def _create_auth_response(self, user: User, device_id: str | None = None) -> AuthResponse:
+    async def get_memberships(self, user: User) -> list[MembershipInfo]:
+        """
+        Rattachements staff ACTIFS de l'utilisateur (org, branche, guichet, rôle).
+
+        Permet au poste guichet de se configurer seul : sans ces informations, il
+        fallait saisir l'organisation et le guichet à la main, et un agent pouvait
+        choisir un guichet auquel il n'était pas affecté (COUNTER_NOT_ASSIGNED).
+
+        Un utilisateur peut appartenir à plusieurs organisations : on renvoie une
+        liste, le client choisit.
+
+        Args:
+            user: Utilisateur authentifié
+
+        Returns:
+            Liste (éventuellement vide pour un client) des rattachements actifs.
+        """
+        result = await self.db.execute(
+            select(Employee).where(
+                Employee.user_id == user.id,
+                Employee.status == EmployeeStatus.ACTIVE,
+            )
+        )
+        return [
+            MembershipInfo(
+                employee_id=employee.id,
+                org_id=employee.org_id,
+                branch_id=employee.agency_id,
+                counter_id=employee.counter_id,
+                role=employee.role.value,
+                status=employee.status.value,
+            )
+            for employee in result.scalars().all()
+        ]
+
+    async def build_user_token(self, user: User) -> UserInToken:
+        """Construit le profil exposé au client, rattachements inclus."""
+        return UserInToken(
+            id=user.id,
+            name=user.name,
+            phone=user.phone,
+            email=user.email,
+            role=user.role.value,
+            language=user.language,
+            is_verified=user.is_verified,
+            org_id=user.org_id,
+            memberships=await self.get_memberships(user),
+        )
+
+    async def _create_auth_response(self, user: User, device_id: str | None = None) -> AuthResponse:
         """Construit la réponse JWT standard après connexion réussie."""
         return AuthResponse(
             access_token=create_access_token(user.id),
             refresh_token=create_refresh_token(user.id),
-            user=UserInToken(
-                id=user.id,
-                name=user.name,
-                phone=user.phone,
-                email=user.email,
-                role=user.role.value,
-                language=user.language,
-                is_verified=user.is_verified,
-            ),
+            user=await self.build_user_token(user),
         )
 
     async def _persist_refresh_token(

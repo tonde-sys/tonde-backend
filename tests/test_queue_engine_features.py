@@ -23,9 +23,9 @@ from app.core.config import settings
 from app.core.redis import get_queue_size
 from app.models.audit_log import AuditAction, AuditLog
 from app.models.branch import Branch, Service
+from app.models.user import User, UserRole
 from app.models.queue_log import QueueLog, QueueLogAction
 from app.models.ticket import Ticket, TicketPriority, TicketStatus
-from app.models.user import UserRole
 from app.schemas.ticket import CreateTicketRequest
 from app.services.queue_scheduler import QueueScheduler
 from app.services.ticket_service import is_branch_open_now
@@ -37,6 +37,11 @@ from tests.test_queue_atomicity import (  # noqa: F401  (fixtures importées par
     _world,
     real_redis,
 )
+
+
+def _client(user_id: str) -> User:
+    """Viewer client synthétique (non persisté) : get_ticket ne lit que viewer.id."""
+    return User(id=user_id, role=UserRole.CLIENT, org_id=None)
 
 
 async def _make_service(db_session, org_id: str, agency_id: str, prefix: str, name: str,
@@ -492,7 +497,7 @@ async def test_get_ticket_self_heals_when_missing_from_redis(ticket_service, db_
     key = f"tonde:{org.id}:{agency.id}:{service.id}:queue"
     await real_redis.delete(key)
 
-    view = await ticket_service.get_ticket(ticket.id, "client-1", None)
+    view = await ticket_service.get_ticket(ticket.id, _client("client-1"))
 
     assert view.position == 1 and view.total_in_queue == 1
     assert await real_redis.zscore(key, ticket.id) is not None
