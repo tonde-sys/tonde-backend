@@ -35,6 +35,18 @@ class Settings(BaseSettings):
     # ── Base de données ───────────────────────────────────────
     DATABASE_URL: str
 
+    # URL dédiée aux migrations. Facultative : si elle est vide, Alembic
+    # réutilise DATABASE_URL.
+    #
+    # Elle n'existe que pour un cas précis : une base servie derrière un pooler
+    # en mode transaction (Neon `-pooler`, PgBouncer, Supabase pooler). Les
+    # migrations de schéma demandent des fonctionnalités de session que le mode
+    # transaction ne conserve pas, et Neon recommande explicitement la connexion
+    # directe pour `alembic upgrade`, `pg_dump` et `pg_restore`. On peut donc
+    # pointer DATABASE_URL sur le pooler pour l'API et garder cette variable sur
+    # l'endpoint direct pour les migrations.
+    MIGRATION_DATABASE_URL: str = ""
+
     # ── Migrations ────────────────────────────────────────────
     # True uniquement en développement pour créer les tables sans Alembic.
     # En production, toujours False — utiliser 'alembic upgrade head'.
@@ -105,7 +117,7 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
 
     # ── Propriétés dérivées ───────────────────────────────────
-    @field_validator("DATABASE_URL", mode="before")
+    @field_validator("DATABASE_URL", "MIGRATION_DATABASE_URL", mode="before")
     @classmethod
     def _normalize_database_url(cls, value: str) -> str:
         """
@@ -122,11 +134,24 @@ class Settings(BaseSettings):
         if not isinstance(value, str):
             return value
         url = value.strip()
+        if not url:
+            return url
         if url.startswith("postgres://"):
             url = "postgresql://" + url[len("postgres://"):]
         if url.startswith("postgresql://"):
             url = "postgresql+asyncpg://" + url[len("postgresql://"):]
         return url
+
+    @property
+    def MIGRATION_URL(self) -> str:
+        """
+        URL utilisée par Alembic.
+
+        Retourne ``MIGRATION_DATABASE_URL`` si elle est définie, sinon
+        ``DATABASE_URL``. Permet d'utiliser le pooler pour l'API tout en gardant
+        une connexion directe pour les migrations, comme le recommande Neon.
+        """
+        return self.MIGRATION_DATABASE_URL or self.DATABASE_URL
 
     @staticmethod
     def url_requires_ssl(url: str) -> bool:
@@ -161,7 +186,9 @@ class Settings(BaseSettings):
         SELECT. Le TLS est appliqué par database.py via connect_args.
 
         Args:
-            url: URL SQLAlchemy ``postgresql+asyncpg://…?sslmode=require``
+            url: URL SQLAlchemy ``postgresql+asyncpg://…?sslmode=require``, ou
+                 une URL brute ``postgresql://`` / ``postgres://`` (normalisée
+                 ici). Une URL non PostgreSQL est renvoyée inchangée.
 
         Returns:
             URL sans ``sslmode`` ni ``channel_binding`` ; les autres paramètres
@@ -169,8 +196,20 @@ class Settings(BaseSettings):
         """
         from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-        if not isinstance(url, str) or not url.startswith("postgresql+asyncpg://"):
+        if not isinstance(url, str):
             return url
+
+        # Tolérer une URL brute : sans cette normalisation, un appel avec
+        # ``postgresql://…?sslmode=require`` renverrait l'URL inchangée et
+        # asyncpg planterait au premier SELECT. Idempotent sur une URL déjà
+        # qualifiée.
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
+        if url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+
+        if not url.startswith("postgresql+asyncpg://"):
+            return url  # sqlite et autres drivers : rien à retirer
 
         parts = urlsplit(url)
         if not parts.query:

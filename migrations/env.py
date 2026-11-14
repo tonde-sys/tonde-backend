@@ -48,11 +48,17 @@ from app.models import (  # noqa: F401
 config = context.config
 
 # Injecter l'URL DB depuis les settings TONDE (lit le .env)
+# MIGRATION_URL vaut MIGRATION_DATABASE_URL si elle est définie, sinon
+# DATABASE_URL. Une base derrière un pooler en mode transaction (Neon -pooler,
+# PgBouncer) ne conserve pas les paramètres de session dont les migrations de
+# schéma ont besoin : Neon recommande la connexion directe pour `alembic
+# upgrade`, `pg_dump` et `pg_restore`. Cette variable permet donc d'utiliser le
+# pooler pour l'API sans casser les migrations.
 # adapt_url_for_asyncpg retire les paramètres libpq (sslmode, channel_binding)
 # qu'asyncpg refuse. Le '%' est échappé : configparser interpréterait sinon la
 # valeur comme une interpolation et planterait sur un mot de passe encodé.
 config.set_main_option(
-    "sqlalchemy.url", settings.adapt_url_for_asyncpg(settings.DATABASE_URL).replace("%", "%%")
+    "sqlalchemy.url", settings.adapt_url_for_asyncpg(settings.MIGRATION_URL).replace("%", "%%")
 )
 
 # Logger depuis alembic.ini
@@ -118,7 +124,7 @@ def do_run_migrations(connection: Connection) -> None:
 async def run_async_migrations() -> None:
     """Lance les migrations avec le moteur async asyncpg."""
     connect_args: dict = {}
-    if settings.url_requires_ssl(settings.DATABASE_URL):
+    if settings.url_requires_ssl(settings.MIGRATION_URL):
         # Neon / Supabase : TLS obligatoire, non déductible de l'URL nettoyée.
         connect_args["ssl"] = True
 
