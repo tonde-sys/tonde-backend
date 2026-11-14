@@ -229,6 +229,33 @@ depuis des variables d'environnement (`password_env`).
 9. `POST /api/v1/organizations/{org_id}/invitation-code` — code d'invitation
    pour que les usagers rejoignent l'organisation sans intervention manuelle
 
+### I.1 Script automatique (recommandé)
+
+`scripts/create_org.py` enchaîne les étapes 2 → 7 ci-dessus en un seul appel de
+commande, avec un compte `super_admin` existant. Aucune dépendance : uniquement
+la bibliothèque standard Python.
+
+```bash
+export TONDE_SUPER_PASSWORD='...'          # mot de passe du super-admin
+export TONDE_ADMIN_PASSWORD='...'          # mot de passe du futur admin_org
+
+python scripts/create_org.py \
+  --super-email superadmin@ulbu.bi \
+  --org-name "Clinique Espoir" --org-slug clinique-espoir --sector hospital \
+  --city Bujumbura --branch-name "Siège" --branch-slug siege \
+  --service "Consultation|C|10" --service "Laboratoire|L|15" \
+  --counter "Guichet 1" --counter "Guichet 2" \
+  --admin-name "Alice N." --admin-email alice@espoir.bi \
+  --admin-counter "Guichet 1"
+```
+
+- `--dry-run` affiche les requêtes sans les envoyer.
+- `--json` renvoie les identifiants créés (utile en CI).
+- Le script s'arrête à la première erreur en nommant l'étape fautive ; si le
+  compte admin existe déjà, il le réutilise (idempotent sur cette étape).
+- L'admin doit **se reconnecter** ensuite : son token d'inscription porte encore
+  le rôle `client`, pas `admin_org`.
+
 ---
 
 ## J. Points à décider avec l'organisation
