@@ -87,12 +87,47 @@ par `RUN_MIGRATIONS_ON_STARTUP=true` dans le `docker-entrypoint.sh`.
    par l'URL réelle du front. **Jamais `*`.**
 4. Valider. Render crée :
    - `tonde-api-pilot` (web Docker, plan gratuit) ;
-   - `tonde-pilot-db` (PostgreSQL 15, plan gratuit) ;
    - `tonde-pilot-kv` (Key Value, plan gratuit, sans persistance).
+   Le PostgreSQL n'est plus créé par le Blueprint : la base est sur Neon, voir
+   §3.7.
 5. Le premier déploiement applique `alembic upgrade head` au démarrage
    (`RUN_MIGRATIONS_ON_STARTUP=true`), puis lance l'API.
 6. Vérifier `https://<service>.onrender.com/health` →
    `{"status":"awake","service":"tonde-api"}` (aucune requête base/Redis).
+
+#### Installer la GitHub App Render AVANT de compter sur l'auto-deploy
+
+C'est le piège le plus coûteux de cette mise en place : **un service peut
+afficher `Auto-Deploy: Yes` et ne jamais se déployer**. Render sait alors cloner
+le dépôt (il est public) mais n'a aucun moyen d'être prévenu des pushs.
+
+1. Ouvrir <https://github.com/apps/render/installations/new>.
+2. Choisir l'**organisation propriétaire du dépôt** (ici `tonde-sys`, pas une
+   autre), puis *Only select repositories* → cocher `tonde-sys/tonde-backend`.
+3. Dans Render → service → **Settings → Repository**, vérifier le dépôt et la
+   branche, puis enregistrer : c'est l'enregistrement qui rattache le service à
+   l'installation.
+
+**Vérification obligatoire** — pousser un commit vide et regarder le champ
+`trigger` du déploiement :
+
+```bash
+git commit --allow-empty -m "test: webhook" && git push origin main
+```
+
+| `trigger` observé | Signification |
+|---|---|
+| `new_commit` | ✅ le webhook fonctionne |
+| `api` | ❌ déploiement forcé à la main : l'App n'est pas rattachée |
+| `blueprint_sync` | premier déploiement uniquement |
+
+> **La page *Settings → Webhooks* du dépôt GitHub reste vide, et c'est normal.**
+> Render utilise une GitHub App, dont les événements arrivent sur l'endpoint de
+> l'App, pas sur un webhook de dépôt. Chercher un webhook dans le dépôt fait
+> perdre du temps. Les livraisons se consultent dans
+> **GitHub → organisation → Settings → GitHub Apps → Render → Advanced →
+> Recent Deliveries**, ou dans l'onglet **Events** de Render.
+
 
 > Le nom du service peut être changé dans `render.yaml` avant le premier sync.
 > Le changer après création recrée un service.
@@ -103,7 +138,7 @@ par `RUN_MIGRATIONS_ON_STARTUP=true` dans le `docker-entrypoint.sh`.
 > | Ressource | Nom réel | URL / identifiant |
 > |---|---|---|
 > | API | `tonde-api-pilot-fx1j` | `https://tonde-api-pilot-fx1j.onrender.com` |
-> | PostgreSQL | `tonde-pilot-db-fx1j` | — |
+> | PostgreSQL | ~~`tonde-pilot-db-fx1j`~~ supprimé | remplacé par Neon (§3.7) |
 > | Key Value | `tonde-pilot-kv-fx1j` | — |
 >
 > Les commandes ci-dessous utilisent cette URL réelle. Pour un nouveau
@@ -114,7 +149,9 @@ par `RUN_MIGRATIONS_ON_STARTUP=true` dans le `docker-entrypoint.sh`.
 Dans **tonde-api-pilot-fx1j → Environment** :
 
 - `JWT_SECRET_KEY` doit être présent et généré par Render (ne jamais le lire à voix haute).
-- `DATABASE_URL` et `REDIS_URL` sont des références privées Render.
+- `DATABASE_URL` pointe vers Neon (URL **poolée**), `MIGRATION_DATABASE_URL` vers
+  la même base en **direct** — voir §3.7. `REDIS_URL` reste une référence privée
+  Render.
 - `ENVIRONMENT=production`, `DEBUG=false`, `CREATE_TABLES_ON_STARTUP=false`.
 - `RUN_MIGRATIONS_ON_STARTUP=true` sur le plan gratuit (sinon les tables
   n'existent pas au premier démarrage).
