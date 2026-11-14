@@ -49,11 +49,20 @@ services:
       # sync: false → la valeur N'EST PAS dans le dépôt. À renseigner une fois
       # dans Dashboard → tonde-api-pilot → Environment :
       #
-      #   DATABASE_URL = postgresql://<user>:<password>@<endpoint>.neon.tech/<db>?sslmode=require
+      #   DATABASE_URL = postgresql://<user>:<password>@<endpoint>-pooler.<region>.neon.tech/<db>?sslmode=require
+      #   MIGRATION_DATABASE_URL = postgresql://<user>:<password>@<endpoint>.<region>.neon.tech/<db>?sslmode=require
       #
       # L'application normalise l'URL (postgres:// → postgresql+asyncpg://) et
       # convertit sslmode en TLS asyncpg : ne pas ajouter de driver à la main.
       - key: DATABASE_URL
+        sync: false
+
+      # Connexion DIRECTE (sans -pooler), utilisée par Alembic uniquement.
+      # Facultative : si elle est vide, Alembic retombe sur DATABASE_URL. À
+      # renseigner quand DATABASE_URL passe par le pooler Neon, dont le mode
+      # transaction ne conserve pas les paramètres de session dont un
+      # `alembic upgrade` a besoin.
+      - key: MIGRATION_DATABASE_URL
         sync: false
 
       - key: REDIS_URL
