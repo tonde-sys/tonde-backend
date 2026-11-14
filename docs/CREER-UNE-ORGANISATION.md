@@ -241,3 +241,61 @@ depuis des variables d'environnement (`password_env`).
   clients au-delà du seuil.
 - **SMS** : nécessite un compte Africa's Talking actif ; sans clés, les
   notifications restent in-app.
+
+---
+
+## K. Exemple réel : l'organisation ULBU (pilote)
+
+Le fichier `bootstrap/ulbu.json` contient la configuration complète de
+l'Université Lumière de Bujumbura, validée puis exécutée sur une base vierge :
+
+```
+organizations=1  branches=1  services=2  counters=2  users=4  employees=3
+```
+
+**Deux pièges rencontrés dans le brouillon initial**, à connaître avant de
+préparer le fichier d'une nouvelle organisation :
+
+| Symptôme | Cause | Correction |
+|---|---|---|
+| Le logo n'apparaît jamais | Le champ s'appelle `logo_url`, pas `logo`. Un champ inconnu est ignoré sans erreur. | `"logo_url": "https://…"` |
+| Mot de passe ignoré, un mot de passe aléatoire est généré | `password_env` attend le **nom d'une variable d'environnement**, pas le mot de passe lui-même. `os.getenv("ULBU_Admin@156")` renvoie `None`. | `"password_env": "ULBU_ADMIN_PASSWORD"` puis `export ULBU_ADMIN_PASSWORD='…'` |
+
+### Création sur une base existante
+
+```bash
+export ULBU_ADMIN_PASSWORD='le-mot-de-passe'
+python -m app.cli bootstrap --config bootstrap/ulbu.json --dry-run   # vérifier
+python -m app.cli bootstrap --config bootstrap/ulbu.json            # créer
+```
+
+Le bootstrap est **idempotent** : relancé, il ne crée pas de doublon et ne
+change pas les mots de passe existants. Il ne complète que les champs vides
+d'une fiche déjà présente.
+
+### Création automatique sur Render (sans shell)
+
+Le plan gratuit n'offre ni shell ni `preDeployCommand`. Le point d'entrée
+`docker-entrypoint.sh` lit deux variables d'environnement au démarrage :
+
+- `BOOTSTRAP_CONFIG_JSON` — le contenu de `ulbu.json` sur **une seule ligne**
+- `BOOTSTRAP_PASSWORDS_JSON` — `{"admin@ulbu.bi":"…","agent1@ulbu.bi":"…"}`
+
+Aucun mot de passe ne doit figurer dans `BOOTSTRAP_CONFIG_JSON` : il est lisible
+dans le dashboard. Les deux variables sont lues à chaque redémarrage, donc le
+bootstrap se rejoue — sans effet de bord.
+
+### Vérification après création
+
+```bash
+curl -X POST https://<service>.onrender.com/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@ulbu.bi","password":"…"}'
+```
+
+La réponse doit contenir `user.org_id` et `user.memberships` avec le
+`branch_id` — et le `counter_id` pour un agent. C'est ce bloc `memberships` qui
+permet au poste desktop d'ouvrir directement le bon guichet.
+
+> Le chemin exact est `/api/v1/auth/login`. `/openapi.json` et `/docs` renvoient
+> 404 en production (`DEBUG=false`), il ne faut pas s'en servir pour explorer.
