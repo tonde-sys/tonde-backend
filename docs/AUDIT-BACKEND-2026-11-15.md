@@ -411,6 +411,20 @@ Reste à faire côté produit (hors de ce dépôt) : l'écran desktop qui consom
 route (liste, tri, bouton « appeler ce ticket »). Le contrat est figé par
 `QueueListResponse`, les 15 tests et deux tests HTTP de bout en bout.
 
+**Preuve en production** (ULBU Mutanga-Nord, agent du Guichet 1, 17:35 locale) :
+
+```
+GET /api/v1/tickets/queue?agency_id=335f…&service_id=a248…   -> 200
+{"service_name": "Demande de la carte",
+ "waiting": 0, "called": 0, "serving": 0,
+ "average_wait_minutes": null, "entries": []}
+GET (sans jeton)                                             -> 403
+GET (agence inconnue)                                        -> 404 BRANCH_NOT_FOUND
+```
+
+La file est vide parce que l'agence a fermé à 17:00 — c'est la décision 1 qui
+s'applique, et elle se vérifie aussi par cette route.
+
 ### 9. Un seul WebSocket par ticket
 
 `connections_by_ticket` est un `dict[str, WebSocket]` (`queue_ws.py:71`). Une
@@ -638,6 +652,24 @@ script CLI, suffirait à sortir l'instance du load balancer. Seul `unhealthy`
 dégrade la readiness — ce qui, sur Render, redémarre le service et déclenche un
 `warm_up` qui reconstruit files et échéances. La panne silencieuse devient une
 panne bruyante, puis une panne réparée.
+
+**Preuve en production** (après déploiement, `GET /health/ready`) :
+
+```json
+{"status": "ready",
+ "checks": {"database": {"status": "healthy", "latency_ms": 16.5},
+            "redis":    {"status": "healthy", "latency_ms": 0.7},
+            "scheduler":{"status": "healthy", "last_run_age_seconds": 3.7,
+                         "stale_after_seconds": 120}}}
+```
+
+**Observation hors constat — 401 vs 403.** Une requête sans jeton sur une route
+protégée reçoit `403`, pas `401` : c'est le comportement de `HTTPBearer()` avec
+`auto_error=True` (FastAPI renvoie « Not authenticated » en 403). C'est cohérent
+sur toutes les routes et aucun client ne s'en plaint, mais un audit de sécurité
+bancaire le relèvera : « pas de jeton » devrait être `401`, « jeton valide mais
+rôle insuffisant » `403`. Le corriger touche toutes les routes à la fois
+(`auto_error=False` + 401 explicite) — à planifier, pas à glisser dans un lot.
 
 ---
 
