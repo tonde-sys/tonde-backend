@@ -90,11 +90,11 @@ tests ; ⬜ = rien n'a été fait, le constat reste vrai.
 | 17 | Aucune trace d'audit des connexions | ⬜ | voir note ci-dessous |
 | 18 | `/health/ready` n'inspecte pas le scheduler | ⬜ | — |
 | 19 | Aucun endpoint de changement de mot de passe | ✅ | `tests/test_change_password.py` (11) + `tests/test_cli_reset_password.py` (5) |
-| 20 | Mot de passe partagé par 4 comptes, écrit en clair | ⚠️ outillage prêt, rotation à lancer | `python -m app.cli reset-password` |
+| 20 | Mot de passe partagé par 4 comptes, écrit en clair | ✅ | rotation exécutée le 15/11 15:03, 4 mots de passe distincts |
 
-**5 constats corrigés, 1 outillé, 14 intacts.** Les 14 restants sont documentés
-ci-dessous avec leur correctif ; aucun n'est bloquant pour le test partenaire,
-sauf le n° 20 dont la partie « exécution » dépend d'une action d'exploitation.
+**6 constats sur 20 sont traités, 14 restent ouverts.** Les 14 restants sont
+documentés ci-dessous avec leur correctif ; aucun n'est bloquant pour le test
+partenaire. La séquence d'exécution est dans `docs/PLAN-DEV.md`.
 
 Deux remarques sur ce tableau :
 
@@ -443,10 +443,29 @@ python -m app.cli reset-password --email agent2@ulbu.bi
 ```
 
 Sans `--password`, un mot de passe aléatoire est généré et affiché une seule
-fois. **Ce qui reste à faire, et qui n'est pas du code :** exécuter ces quatre
-commandes sur l'environnement de production, supprimer `docs/oganisation-ulbu.txt`,
-et retirer `BOOTSTRAP_PASSWORDS_JSON` de la configuration Render une fois le
-pilote stabilisé.
+fois.
+
+**Rotation exécutée le 15/11/2026 à 15:03**, contre la base de production Neon
+(`ep-broad-surf-bahgqsgk-pooler`, eu-central-1), depuis le poste d'exploitation
+avec le `DATABASE_URL` lu sur Render :
+
+```
+superadmin@ulbu.bi   OK   19 sessions fermées
+admin@ulbu.bi        OK   15 sessions fermées
+agent1@ulbu.bi       OK   16 sessions fermées
+agent2@ulbu.bi       OK    0 session fermée
+```
+
+Vérifié dans la foulée par une connexion réelle sur chacun des quatre comptes :
+`HTTP 200`, rôles et `memberships` intacts. `BOOTSTRAP_PASSWORDS_JSON` a été mis
+à jour sur Render avec les quatre nouvelles valeurs (sinon un futur bootstrap
+aurait rétabli l'ancien mot de passe fuité). Les valeurs ne figurent pas ici :
+elles sont dans `docs/oganisation-ulbu.txt` (non versionné, couvert par
+`.gitignore`).
+
+**Reste à faire côté exploitation :** copier les quatre mots de passe dans un
+gestionnaire, puis supprimer `docs/oganisation-ulbu.txt`, et retirer
+`BOOTSTRAP_PASSWORDS_JSON` de Render une fois le pilote stabilisé.
 
 ---
 
@@ -533,3 +552,7 @@ pas la sonde interrogée par UptimeRobot.
 4. **P0-4, P0-5** — paramétrage et une requête de comptage. Toujours ouverts.
 5. **P1-8 (liste de la file)** — la fonction qui manque le plus au quotidien.
 6. Le reste en dette assumée, documenté dans `DEPLOYMENT.md`.
+
+Le détail séquencé, avec les décisions à prendre et les dépendances, est dans
+**`docs/PLAN-DEV.md`** — ce document-ci reste le constat, l'autre est le
+plan d'exécution.
