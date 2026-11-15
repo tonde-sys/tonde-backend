@@ -13,6 +13,7 @@ from app.schemas.auth import (
     RegisterEmailRequest, LoginEmailRequest,
     RefreshTokenRequest, LogoutRequest,
     UpdateProfileRequest, FcmTokenRequest,
+    ChangePasswordRequest,
 )
 from app.services.auth_service import AuthService
 
@@ -133,8 +134,32 @@ async def logout_all(
     return await service.logout_all(current_user.id)
 
 
-# ── Profil de l'utilisateur connecté ──────────────────────────────────────────
+@router.post("/change-password", summary="Changer mon mot de passe")
+@limiter.limit("5/minute")
+async def change_password(
+    request: Request,
+    body: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Change le mot de passe du compte connecté.
 
+    Exige l'ancien mot de passe. En cas de succès, **toutes les sessions sont
+    révoquées** (y compris l'appareil courant) : le refresh token déjà émis
+    reste valide sinon, et un mot de passe changé après un vol de token ne
+    protégerait rien. L'access token courant reste utilisable jusqu'à son
+    expiration, le temps de terminer l'action en cours.
+
+    Limité à 5 requêtes/minute par IP.
+    """
+    service = AuthService(db)
+    return await service.change_password(
+        current_user, body.current_password, body.new_password
+    )
+
+
+# ── Profil de l'utilisateur connecté ──────────────────────────────────────────
 @router.get("/me", summary="Mon profil")
 async def get_me(
     current_user: User = Depends(get_current_user),

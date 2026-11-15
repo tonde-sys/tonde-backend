@@ -8,11 +8,18 @@ Méthode : lecture intégrale des 3 fichiers critiques (`ticket_service.py` 1971
 Chaque constat ci-dessous cite le fichier et la ligne. Rien n'est déduit d'une
 impression de lecture.
 
-État mesuré le 15/11/2026 :
+État mesuré le 15/11/2026, à l'ouverture de l'audit :
 
 ```
 pytest -q  →  261 passed, 129 skipped, 0 failed  (9 min 02 s)
 migrations →  14 révisions, 1 seule tête (008_unique_ticket_number)
+```
+
+État au 15/11/2026 14:45, après les deux lots de correctifs :
+
+```
+pytest -q  →  307 passed, 129 skipped, 0 failed  (5 min 47 s)
+migrations →  inchangé (aucune migration ajoutée par les correctifs)
 ```
 
 (La commande `alembic` n'est pas installée dans le Python par défaut : le graphe
@@ -48,8 +55,59 @@ Redis dans le workflow), pas un échec.
 | 16 | P2 | `queue_score` : marge de priorité de 104 jours, constante trompeuse | `redis.py:193` |
 | 17 | P2 | Aucune trace d'audit des connexions (succès/échec) | `auth_service.py` |
 | 18 | P2 | `/health/ready` n'inspecte pas le scheduler | `health_service.py:64` |
+| 19 | P1 | Aucun endpoint de changement de mot de passe : seul un shell Render le permet | `routers/auth.py` |
+| 20 | P1 | Les 4 comptes ULBU partagent le même mot de passe, écrit en clair dans un fichier local | `docs/oganisation-ulbu.txt` |
 
-### État au 15/11 au soir
+Les constats 19 et 20 ont été ajoutés en cours de route : ils ne viennent pas de
+la lecture du code mais d'une question d'exploitation (« c'est quoi le mot de
+passe de l'agent du guichet 1 ? »), et la réponse a exposé les deux problèmes
+d'un coup — un mot de passe unique pour quatre comptes de niveaux différents,
+qu'aucun utilisateur ne peut changer lui-même.
+
+### État d'avancement
+
+Vue unique, à jour au 15/11/2026 14:45. ✅ = corrigé **et** couvert par des
+tests ; ⬜ = rien n'a été fait, le constat reste vrai.
+
+| # | Constat | État | Preuve |
+|---|---|---|---|
+| 1 | Un 2ᵉ appel au même guichet abandonne le client en cours | ✅ | `tests/test_counter_busy.py` (3) |
+| 2 | `is_branch_open_now` ignore `opens_at`/`closes_at` | ✅ | `tests/test_branch_hours.py` (12) |
+| 3 | Redis indisponible → 500 sur la lecture d'un ticket | ✅ | `tests/test_queue_degradation.py` (3) |
+| 4 | Expiration 12 h : annule des tickets encore en file | ⬜ | — |
+| 5 | `deactivate` retire rôle + `org_id` sans vérifier les autres rattachements | ⬜ | — |
+| 6 | Aucun verrouillage par compte sur `POST /auth/login` | ✅ | `tests/test_login_lockout.py` (11) |
+| 7 | Fermer un guichet laisse le ticket CALLED orphelin | ⬜ | — |
+| 8 | Aucun endpoint pour lister la file côté staff | ⬜ | — |
+| 9 | Un seul WebSocket par ticket | ⬜ | — |
+| 10 | `websocket_counter` : aucun contrôle d'affectation | ⬜ | — |
+| 11 | `return_to_queue` sans repli si Redis échoue | ⬜ | — |
+| 12 | `GET /tickets/history` renvoie `position: 0` | ⬜ | — |
+| 13 | Préfixe de service unique seulement entre services actifs | ⬜ | — |
+| 14 | `get_branch_display` : N+1 requêtes | ⬜ | — |
+| 15 | Création : `get_queue_size` dans le même `try` que `add_to_queue` | ⬜ | — |
+| 16 | `queue_score` : marge de priorité de 104 jours | ⬜ | — |
+| 17 | Aucune trace d'audit des connexions | ⬜ | voir note ci-dessous |
+| 18 | `/health/ready` n'inspecte pas le scheduler | ⬜ | — |
+| 19 | Aucun endpoint de changement de mot de passe | ✅ | `tests/test_change_password.py` (11) + `tests/test_cli_reset_password.py` (5) |
+| 20 | Mot de passe partagé par 4 comptes, écrit en clair | ⚠️ outillage prêt, rotation à lancer | `python -m app.cli reset-password` |
+
+**5 constats corrigés, 1 outillé, 14 intacts.** Les 14 restants sont documentés
+ci-dessous avec leur correctif ; aucun n'est bloquant pour le test partenaire,
+sauf le n° 20 dont la partie « exécution » dépend d'une action d'exploitation.
+
+Deux remarques sur ce tableau :
+
+- **#17 n'est pas un oubli, c'est un blocage structurel.** `AuditLog.org_id` est
+  `NOT NULL` avec clé étrangère vers `organizations`. Or un `super_admin` et un
+  client OTP ont `org_id = NULL` : leurs connexions ne peuvent pas être
+  journalisées dans cette table. Tracer les connexions demande donc une
+  migration (`org_id` nullable) — ce n'est pas un correctif de trois lignes.
+- **#20 n'est pas un correctif de code.** L'outil existe désormais
+  (`reset-password`), mais la rotation elle-même doit être exécutée sur
+  l'environnement de production.
+
+### Détail des P0 corrigés
 
 Les trois P0 annoncés comme « courts, sans migration » sont corrigés et testés :
 
@@ -59,7 +117,7 @@ Les trois P0 annoncés comme « courts, sans migration » sont corrigés et test
 | 2. Horaires ignorés | `is_branch_open_now` applique `opens_at`/`closes_at` quand `operating_hours` est NULL, gère les créneaux de nuit | `tests/test_branch_hours.py` (12) |
 | 3. Redis = 500 | lecture d'un ticket : repli base (position inconnue, total compté en SQL) ; création : `503 QUEUE_UNAVAILABLE` au lieu de 500 | `tests/test_queue_degradation.py` (3) |
 
-Suite complète après correction : **280 passés, 129 ignorés, 0 échec**.
+Suite complète après les deux lots : **307 passés, 129 ignorés, 0 échec**.
 
 Effet de bord à connaître : les agences dont `operating_hours` est NULL voient
 désormais leur fenêtre `opens_at`/`closes_at` réellement appliquée. ULBU
@@ -71,7 +129,7 @@ si la valeur était un simple gabarit.
 
 ## P0 — à traiter avant le test partenaire
 
-### 1. Un second appel au même guichet abandonne le client en cours
+### 1. Un second appel au même guichet abandonne le client en cours — ✅ corrigé
 
 `call_next` ne vérifie jamais si le guichet a déjà un ticket `CALLED` ou
 `SERVING`. `_pop_and_call` écrase directement `Counter.current_ticket_id`
@@ -90,7 +148,7 @@ Correctif : refuser l'appel (409 `COUNTER_BUSY`) tant que
 `counter.current_ticket_id` pointe sur un ticket `CALLED`/`SERVING`, ou demander
 une confirmation explicite. Aucune migration nécessaire.
 
-### 2. L'horaire de repli n'est jamais appliqué
+### 2. L'horaire de repli n'est jamais appliqué — ✅ corrigé
 
 Le modèle documente l'intention (`models/branch.py:73`) :
 
@@ -138,7 +196,7 @@ Attention : la validation actuelle interdit `close < open`
 (`schemas/branch_config.py:102`), donc pas de créneau de nuit — à décider
 explicitement.
 
-### 3. Redis indisponible → 500 sur la lecture d'un ticket
+### 3. Redis indisponible → 500 sur la lecture d'un ticket — ✅ corrigé
 
 `_build_response` appelle `get_queue_position` puis `get_queue_size` sans
 protection (`ticket_service.py:1575-1586`). Toute exception Redis remonte
@@ -155,7 +213,7 @@ Correctif : envelopper les lectures de position dans un `try/except`, retourner
 `position=0` et `total=0` (l'information est cosmétique), et déplacer l'acquisition
 du verrou dans le `try` pour retomber sur le 503.
 
-### 4. L'expiration à 12 h annule des tickets encore en file
+### 4. L'expiration à 12 h annule des tickets encore en file — ⬜ non traité
 
 `expire_stale_tickets` (`ticket_service.py:1112-1121`) applique :
 
@@ -177,7 +235,7 @@ Correctif minimal : ne jamais expirer un ticket dont la position est ≤ N, et
 notifier avant annulation. Correctif propre : expirer à la fermeture de
 l'agence, pas sur une durée fixe.
 
-### 5. `deactivate` casse les rattachements multiples
+### 5. `deactivate` casse les rattachements multiples — ⬜ non traité
 
 `employee_service.py:344-351` :
 
@@ -199,7 +257,7 @@ produire, et la correction est de trois lignes : ne rétrograder le `User` que s
 
 ## P1 — sérieux, à planifier
 
-### 6. `POST /auth/login` : pas de limite par compte
+### 6. `POST /auth/login` : pas de limite par compte — ✅ corrigé
 
 `routers/auth.py:80` → `@limiter.limit("10/minute")`, clé = IP
 (`middlewares.py:32-35`). Un attaquant avec 100 IP obtient 1 000 tentatives par
@@ -210,6 +268,24 @@ Recommandation : compteur Redis par email (`tonde:login_fail:{email}`), blocage
 progressif après 5 échecs (1 min, 5 min, 15 min), et journalisation dans
 `AuditLog`. Le mécanisme existe déjà pour l'OTP (`block_phone`), il suffit de le
 transposer.
+
+**Correctif livré** (`core/redis.py` : `get_login_block`,
+`register_login_failure`, `clear_login_failures`) :
+
+| Comportement | Détail |
+|---|---|
+| Clé | `tonde:login_fail:{email}` — email normalisé en minuscules |
+| Seuil | 5 échecs consécutifs sur une fenêtre de 15 min |
+| Paliers | 1 min, puis 5 min, puis 15 min (plafond), cumulés sur 24 h |
+| Vérification | **avant** le hachage : un compte bloqué répond `429 ACCOUNT_LOCKED` avec `Retry-After`, même si le mot de passe est bon |
+| Succès | compteur, paliers et blocage effacés |
+| Email inconnu | compté aussi, sinon le compteur ne protégerait que les comptes existants et l'énumération resterait possible |
+| Redis en panne | **fail-open** : pas de verrouillage, connexion possible, panne journalisée |
+
+Le dernier point est un arbitrage assumé : couper l'accès de toute une agence
+parce que le cache est tombé serait pire que le risque couvert. Il est testé
+explicitement (`test_redis_en_panne_ne_bloque_pas_la_connexion`), pas laissé
+implicite.
 
 ### 7. Fermer un guichet laisse le client appelé en plan
 
@@ -261,6 +337,99 @@ Un ticket encore `WAITING` apparaît donc « position 0 » dans l'historique, ce
 est faux et trompeur côté mobile. Soit calculer la position réelle pour les
 tickets actifs, soit exposer `null` pour dire « non applicable ».
 
+### 19. Aucun endpoint de changement de mot de passe — ✅ corrigé
+
+Constat d'origine, formulé autrement : `routers/auth.py` n'exposait que
+`login`, `refresh`, `logout`, `logout/all`, `me`. Aucune route ne permettait à un
+utilisateur de changer son propre mot de passe. Le seul chemin existant était :
+
+```
+python -m app.cli bootstrap --config … --reset-passwords
+```
+
+depuis un shell Render, avec un `BOOTSTRAP_PASSWORDS_JSON` complet. Concrètement,
+un agent qui soupçonnait une fuite de son mot de passe devait demander à
+l'exploitant de rejouer un bootstrap sur toute l'organisation.
+
+**Correctif livré :**
+
+| Élément | Fichier |
+|---|---|
+| `POST /api/v1/auth/change-password` (Bearer, `5/minute`) | `routers/auth.py` |
+| `AuthService.change_password` + `_revoke_all_sessions` | `services/auth_service.py` |
+| `ChangePasswordRequest` (8 caractères min, 72 octets max) | `schemas/auth.py` |
+| `python -m app.cli reset-password --email …` | `app/cli.py` |
+
+Trois décisions à connaître :
+
+1. **L'ancien mot de passe est exigé.** Un access token volé ne doit pas
+   permettre de verrouiller le propriétaire hors de son compte.
+2. **Toutes les sessions sont révoquées**, y compris l'appareil courant. Un
+   refresh token émis avant le changement resterait valide sinon, et changer le
+   mot de passe après un vol de token ne protégerait de rien. L'access token
+   courant survit jusqu'à son expiration, le temps de finir l'action en cours.
+3. **72 octets maximum.** bcrypt tronque silencieusement au-delà : deux mots de
+   passe partageant les 72 premiers octets sont équivalents. Le schéma refuse
+   désormais la saisie plutôt que de laisser croire que la fin compte.
+
+### 20. Un mot de passe unique pour quatre comptes, écrit en clair — ⚠️ outillage livré, rotation à exécuter
+
+`docs/oganisation-ulbu.txt` contient quatre `password_env` identiques, tous
+pointant vers la même valeur :
+
+```
+superadmin@ulbu.bi   → <même mot de passe>   (super_admin)
+admin@ulbu.bi        → <même mot de passe>   (admin_org)
+agent1@ulbu.bi       → <même mot de passe>   (agent, Guichet 1)
+agent2@ulbu.bi       → <même mot de passe>   (agent, Guichet 2)
+```
+
+La valeur elle-même n'est pas recopiée ici : un audit versionné n'est pas
+l'endroit où conserver un mot de passe. Elle est dans le fichier de provisioning
+(non versionné, désormais couvert par `.gitignore`) et dans
+`BOOTSTRAP_PASSWORDS_JSON` sur Render.
+
+Ce n'est pas un détail cosmétique : **un agent de guichet connaît le mot de passe
+du super-admin**. Il peut se connecter en `superadmin@ulbu.bi` et contourner
+toute la hiérarchie `CLIENT < AGENT < SUPERVISOR < ADMIN_AGENCY < ADMIN_ORG <
+SUPER_ADMIN`. La séparation des rôles n'existe alors que dans le code.
+
+Le fichier est en clair sur le disque et n'est pas versionné (vérifié : aucun
+secret dans le commit `0b3a182`), mais il reste la source qui a produit le bug.
+
+**Aggravant découvert en rédigeant ce constat : le mot de passe est déjà dans
+l'historique Git.** Il apparaît dans `docs/CREER-UNE-ORGANISATION.md` (commit
+`c9a731e`, « docs: exemple réel ULBU et pièges du fichier de bootstrap »), cité
+comme exemple d'usage erroné de `password_env`. Vérification :
+
+```bash
+git log --all --oneline -S "<le mot de passe>"   →  c9a731e
+```
+
+Ce n'est donc plus « un fichier local à supprimer » : la valeur est publiée dans
+le dépôt. Réécrire l'historique est possible (`git filter-repo`) mais ne sert à
+rien si le dépôt a déjà été cloné — **la rotation n'est pas une recommandation,
+c'est la seule remédiation efficace.** Les deux fichiers concernés ont été
+nettoyés dans ce lot (l'exemple de `CREER-UNE-ORGANISATION.md` et les fixtures
+de tests utilisaient la vraie valeur), et `.gitignore` couvre désormais
+`docs/oganisation-*.txt`.
+
+**Ce qui est livré :** la commande de rotation, une ligne par compte, qui change
+le mot de passe, ferme les sessions et lève un éventuel blocage de connexion.
+
+```bash
+python -m app.cli reset-password --email superadmin@ulbu.bi
+python -m app.cli reset-password --email admin@ulbu.bi
+python -m app.cli reset-password --email agent1@ulbu.bi
+python -m app.cli reset-password --email agent2@ulbu.bi
+```
+
+Sans `--password`, un mot de passe aléatoire est généré et affiché une seule
+fois. **Ce qui reste à faire, et qui n'est pas du code :** exécuter ces quatre
+commandes sur l'environnement de production, supprimer `docs/oganisation-ulbu.txt`,
+et retirer `BOOTSTRAP_PASSWORDS_JSON` de la configuration Render une fois le
+pilote stabilisé.
+
 ---
 
 ## P2 — dette technique
@@ -307,8 +476,11 @@ pas la sonde interrogée par UptimeRobot.
    seule réponse structurelle au problème des tickets pris depuis chez soi.
 2. **Back-office admin** — `tonde-web` reste une maquette sur données en dur ;
    l'`admin_org` d'une banque n'a aucune interface.
-3. **Email sortant / mot de passe oublié** — aucun SMTP configuré. Un compte
-   staff créé avec un mot de passe transmis à la main ne peut pas le changer.
+3. **Email sortant / mot de passe oublié** — aucun SMTP configuré. Un
+   utilisateur peut désormais changer son mot de passe s'il connaît l'ancien
+   (voir P1-19), mais il n'existe aucun moyen de le **récupérer** : pas de
+   « mot de passe oublié », pas d'envoi de lien. Un agent qui perd son mot de
+   passe passe encore par l'exploitant (`reset-password`).
 4. **Liste de la file** (voir P1-8).
 5. **Facturation / plan** — aucun modèle d'abonnement ; le seul plafond est
    `max_daily_tickets`.
@@ -334,8 +506,12 @@ pas la sonde interrogée par UptimeRobot.
 
 ## Ordre proposé
 
-1. **P0-1, P0-2, P0-3** — trois correctifs courts, sans migration, qui évitent
-   les pannes les plus visibles pendant le test partenaire.
-2. **P0-4, P0-5** — paramétrage et une requête de comptage.
-3. **P1-8 (liste de la file)** — la fonction qui manque le plus au quotidien.
-4. Le reste en dette assumée, documenté dans `DEPLOYMENT.md`.
+1. ~~**P0-1, P0-2, P0-3**~~ — **fait.** Trois correctifs courts, sans migration,
+   qui évitaient les pannes les plus visibles pendant le test partenaire.
+2. ~~**P1-6, P1-19**~~ — **fait.** Verrouillage par compte et changement de mot
+   de passe : les deux touchent le même fichier et la même surface d'attaque.
+3. **P1-20 (rotation des comptes ULBU)** — ce n'est pas du code, c'est une
+   commande à lancer avant de transmettre les accès au partenaire.
+4. **P0-4, P0-5** — paramétrage et une requête de comptage. Toujours ouverts.
+5. **P1-8 (liste de la file)** — la fonction qui manque le plus au quotidien.
+6. Le reste en dette assumée, documenté dans `DEPLOYMENT.md`.

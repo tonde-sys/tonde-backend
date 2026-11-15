@@ -10,6 +10,9 @@ Conventions de nommage des clés :
   tonde:lock:ticket_create:{user_id}              → Verrou court anti double création (SET NX)
   tonde:deadlines:{absent|warning}                → ZSET des échéances (score = timestamp limite)
   tonde:once:{name}                               → Marqueur « déjà fait » (SET NX + TTL)
+  tonde:login_fail:{email}                        → Compteur d'échecs de connexion (verrouillage par compte)
+  tonde:login_strikes:{email}                     → Paliers de blocage déjà atteints
+  tonde:login_blocked:{email}                     → Drapeau de blocage temporaire du compte
 
 Le préfixe 'tonde:' isole les clés TONDE des autres apps
 sur le même Redis. L'org_id garantit l'isolation multi-tenant.
@@ -160,6 +163,102 @@ async def get_register_attempts(phone: str) -> int:
     r = await get_redis()
     val = await r.get(f"tonde:sms_attempts:{phone}")
     return int(val) if val else 0
+
+
+# ── Verrouillage par compte (connexion email) ────────────────────────────────
+#
+# Le rate limit du routeur (`10/minute`) est indexé sur l'IP : un attaquant qui
+# dispose de 100 IP obtient 1 000 tentatives par minute sur le même compte.
+# Ces helpers ajoutent la dimension qui manque : le COMPTE.
+#
+# Clés :
+#   tonde:login_fail:{email}     → compteur d'échecs consécutifs (TTL 15 min)
+#   tonde:login_strikes:{email}  → nombre de paliers déjà atteints (TTL 24 h)
+#   tonde:login_blocked:{email}  → drapeau de blocage (TTL = durée du palier)
+#
+LOGIN_MAX_ATTEMPTS = 5                  # Échecs avant le premier blocage
+LOGIN_FAILURE_WINDOW = 15 * 60          # Les échecs se cumulent sur 15 minutes
+LOGIN_STRIKE_TTL = 24 * 60 * 60         # Les paliers se cumulent sur 24 heures
+LOGIN_BACKOFF_LADDER = (60, 300, 900)   # 1 min, puis 5 min, puis 15 min
+
+
+def _login_email(email: str) -> str:
+    """Normalise l'email pour qu'une clé Redis ne dépende pas de la casse."""
+    return email.strip().lower()
+
+
+def _login_fail_key(email: str) -> str:
+    return f"tonde:login_fail:{_login_email(email)}"
+
+
+def _login_block_key(email: str) -> str:
+    return f"tonde:login_blocked:{_login_email(email)}"
+
+
+def _login_strikes_key(email: str) -> str:
+    return f"tonde:login_strikes:{_login_email(email)}"
+
+
+async def get_login_block(email: str) -> int:
+    """
+    Secondes de blocage restantes pour ce compte.
+
+    Returns:
+        > 0 si le compte est bloqué, 0 sinon.
+    """
+    r = await get_redis()
+    ttl = await r.ttl(_login_block_key(email))
+    return ttl if ttl > 0 else 0
+
+
+async def register_login_failure(email: str) -> tuple[int, int]:
+    """
+    Enregistre un échec de connexion et bloque le compte si le seuil est atteint.
+
+    Paliers progressifs : 5 échecs → 1 min, puis 5 de plus → 5 min, puis 15 min.
+    Le palier redescend tout seul après LOGIN_STRIKE_TTL sans nouvel échec.
+
+    Returns:
+        (échecs_dans_la_fenêtre, secondes_de_blocage) — le second vaut 0
+        tant que le seuil n'est pas atteint.
+    """
+    r = await get_redis()
+    key = _login_fail_key(email)
+    count = await r.incr(key)
+    if count == 1:
+        await r.expire(key, LOGIN_FAILURE_WINDOW)
+
+    if count < LOGIN_MAX_ATTEMPTS:
+        return count, 0
+
+    strikes_key = _login_strikes_key(email)
+    strikes = await r.incr(strikes_key)
+    if strikes == 1:
+        await r.expire(strikes_key, LOGIN_STRIKE_TTL)
+
+    delay = LOGIN_BACKOFF_LADDER[min(strikes - 1, len(LOGIN_BACKOFF_LADDER) - 1)]
+    await r.setex(_login_block_key(email), delay, "1")
+    # Le compteur repart de zéro : le blocage lui-même fait office de sanction.
+    await r.delete(key)
+    logger.warning(
+        f"[SECURITY] Compte bloqué {delay}s après {count} échecs de connexion : {_login_email(email)}"
+    )
+    return count, delay
+
+
+async def clear_login_failures(email: str) -> None:
+    """
+    Remet le compte à zéro après une connexion réussie.
+
+    Supprime aussi le compteur de paliers : un utilisateur légitime qui se
+    trompe cinq fois puis réussit ne doit pas conserver de pénalité.
+    """
+    r = await get_redis()
+    await r.delete(
+        _login_fail_key(email),
+        _login_block_key(email),
+        _login_strikes_key(email),
+    )
 
 
 # ── Helpers File d'attente ────────────────────────────────────────────────────

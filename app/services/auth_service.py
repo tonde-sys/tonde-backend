@@ -29,6 +29,8 @@ from app.core.redis import (
     increment_otp_attempts, _hash_otp,
     is_phone_blocked, block_phone,
     increment_register_attempts, PHONE_REGISTER_MAX, PHONE_BLOCK_SECONDS,
+    get_login_block, register_login_failure, clear_login_failures,
+    LOGIN_MAX_ATTEMPTS,
 )
 from app.core.config import settings
 from app.services.sms_gateway import SmsDeliveryError, send_sms
@@ -291,16 +293,33 @@ class AuthService:
         """
         Connexion email + mot de passe.
 
+        Deux protections distinctes s'appliquent :
+          - le rate limit du routeur, indexé sur l'IP (10/minute) ;
+          - le verrouillage par COMPTE ci-dessous, indexé sur l'email.
+
+        Sans la seconde, un attaquant disposant de plusieurs IP contourne la
+        première : 100 IP × 10 tentatives = 1 000 essais par minute sur le même
+        compte. Les comptes staff (agent, admin_org) sont précisément la cible.
+
+        Redis indisponible = pas de verrouillage, mais la connexion reste
+        possible : couper l'accès de toute une agence parce que le cache est
+        tombé serait pire que le risque couvert.
+
         Raises:
+            HTTPException 429: Compte temporairement bloqué
             HTTPException 401: Credentials invalides
             HTTPException 403: Compte désactivé
         """
+        email = str(data.email)
+        await self._assert_login_not_blocked(email)
+
         result = await self.db.execute(
             select(User).where(User.email == data.email)
         )
         user = result.scalar_one_or_none()
 
         if not user or not verify_password(data.password, user.hashed_password or ""):
+            await self._record_login_failure(email)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={"code": "INVALID_CREDENTIALS", "message": "Email ou mot de passe incorrect"},
@@ -311,6 +330,8 @@ class AuthService:
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"code": "ACCOUNT_DISABLED", "message": "Ce compte est désactivé"},
             )
+
+        await self._clear_login_failures(email)
 
         user.last_login = datetime.now(timezone.utc)
         await self.db.flush()
@@ -323,6 +344,142 @@ class AuthService:
         logger.info(f"Connexion email: {data.email} | user_id={user.id}")
 
         return auth_response
+
+    # ── Verrouillage par compte — helpers ─────────────────────────────────────
+    async def _assert_login_not_blocked(self, email: str) -> None:
+        """
+        Refuse la tentative avant même de vérifier le mot de passe.
+
+        Vérifier d'abord évite de payer le coût du bcrypt sur une tentative
+        vouée à l'échec, et empêche l'attaquant de distinguer « mot de passe
+        faux » de « compte bloqué » par le temps de réponse.
+        """
+        try:
+            remaining = await get_login_block(email)
+        except Exception as exc:
+            logger.warning(f"Verrouillage de connexion indisponible (Redis) pour {email} : {exc}")
+            return
+        if remaining > 0:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={
+                    "code": "ACCOUNT_LOCKED",
+                    "message": (
+                        f"Trop de tentatives échouées. Réessayez dans {remaining} seconde(s)."
+                    ),
+                    "retry_after_seconds": remaining,
+                },
+                headers={"Retry-After": str(remaining)},
+            )
+
+    async def _record_login_failure(self, email: str) -> None:
+        """Comptabilise l'échec et signale au client combien d'essais restent."""
+        try:
+            attempts, blocked_for = await register_login_failure(email)
+        except Exception as exc:
+            logger.warning(f"Compteur d'échecs de connexion indisponible (Redis) pour {email} : {exc}")
+            return
+        if blocked_for > 0:
+            logger.warning(f"[SECURITY] Blocage de {blocked_for}s activé pour {email}")
+        elif attempts == LOGIN_MAX_ATTEMPTS - 1:
+            logger.info(f"[SECURITY] Dernier essai avant blocage pour {email}")
+
+    async def _clear_login_failures(self, email: str) -> None:
+        try:
+            await clear_login_failures(email)
+        except Exception as exc:
+            logger.warning(f"Compteur d'échecs de connexion non remis à zéro (Redis) pour {email} : {exc}")
+
+    # ── Changement de mot de passe ────────────────────────────────────────────
+    async def change_password(
+        self,
+        user: User,
+        current_password: str,
+        new_password: str,
+    ) -> dict:
+        """
+        Change le mot de passe de l'utilisateur connecté.
+
+        Pourquoi cette méthode existe : avant elle, le seul moyen de changer un
+        mot de passe était de relancer le bootstrap avec `--reset-passwords`
+        depuis un shell Render. Un agent ne pouvait donc pas changer le mot de
+        passe transmis à la main par son administrateur — inacceptable dès lors
+        qu'une organisation tierce reçoit des comptes.
+
+        Sécurité :
+          - l'ancien mot de passe est exigé (un access token volé ne suffit pas) ;
+          - toutes les sessions sont révoquées (un mot de passe changé doit
+            invalider les refresh tokens émis avant le changement) ;
+          - le compteur d'échecs de connexion est remis à zéro.
+
+        Raises:
+            HTTPException 400: Ancien mot de passe faux, ou nouveau identique
+            HTTPException 409: Compte sans mot de passe (inscription par OTP)
+        """
+        if not user.hashed_password:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "PASSWORD_NOT_SET",
+                    "message": (
+                        "Ce compte n'a pas de mot de passe (inscription par SMS). "
+                        "Aucun mot de passe à modifier."
+                    ),
+                },
+            )
+
+        if not verify_password(current_password, user.hashed_password):
+            logger.warning(f"Changement de mot de passe refusé (ancien incorrect) : user_id={user.id}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "INVALID_CURRENT_PASSWORD",
+                    "message": "Le mot de passe actuel est incorrect",
+                },
+            )
+
+        if verify_password(new_password, user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "PASSWORD_UNCHANGED",
+                    "message": "Le nouveau mot de passe doit être différent de l'actuel",
+                },
+            )
+
+        user.hashed_password = hash_password(new_password)
+        await self.db.flush()
+
+        revoked = await self._revoke_all_sessions(user.id)
+        await self.db.commit()
+
+        if user.email:
+            await self._clear_login_failures(str(user.email))
+
+        logger.info(f"Mot de passe changé : user_id={user.id} | {revoked} session(s) révoquée(s)")
+
+        return {
+            "success": True,
+            "message": (
+                "Mot de passe modifié. Toutes vos sessions ont été fermées, "
+                "reconnectez-vous avec le nouveau mot de passe."
+            ),
+            "revoked_sessions": revoked,
+        }
+
+    async def _revoke_all_sessions(self, user_id: str) -> int:
+        """Révoque les refresh tokens actifs sans committer (l'appelant décide)."""
+        result = await self.db.execute(
+            select(RefreshToken).where(
+                RefreshToken.user_id == user_id,
+                RefreshToken.revoked_at.is_(None),
+            )
+        )
+        tokens = result.scalars().all()
+        now = datetime.now(timezone.utc)
+        for token in tokens:
+            token.revoked_at = now
+        return len(tokens)
 
     # ── Refresh Token avec rotation ───────────────────────────────────────────
     async def refresh_token(self, refresh_token_str: str) -> RefreshResponse:

@@ -6,6 +6,21 @@ from pydantic import BaseModel, EmailStr, field_validator, ConfigDict
 import re
 
 
+# ── Contrainte commune sur les mots de passe ─────────────────────────────────
+# bcrypt tronque silencieusement au-delà de 72 octets : deux mots de passe qui
+# partagent les 72 premiers octets sont équivalents. On refuse donc la saisie
+# plutôt que de laisser croire que les caractères suivants comptent.
+PASSWORD_MAX_BYTES = 72
+
+
+def _check_password_bytes(v: str) -> str:
+    if len(v.encode("utf-8")) > PASSWORD_MAX_BYTES:
+        raise ValueError(
+            f"Le mot de passe ne doit pas dépasser {PASSWORD_MAX_BYTES} octets"
+        )
+    return v
+
+
 # ── Inscription par téléphone ─────────────────────────────────────────────────
 class RegisterPhoneRequest(BaseModel):
     phone: str
@@ -55,7 +70,7 @@ class RegisterEmailRequest(BaseModel):
     def validate_password(cls, v):
         if len(v) < 8:
             raise ValueError("Le mot de passe doit contenir au moins 8 caractères")
-        return v
+        return _check_password_bytes(v)
 
     @field_validator("name")
     @classmethod
@@ -80,6 +95,25 @@ class RefreshTokenRequest(BaseModel):
 class LogoutRequest(BaseModel):
     """Body pour POST /auth/logout — révocation d'une session."""
     refresh_token: str
+
+
+# ── Changement de mot de passe ────────────────────────────────────────────────
+class ChangePasswordRequest(BaseModel):
+    """
+    Changement de mot de passe par l'utilisateur connecté.
+
+    L'ancien mot de passe est exigé : un access token volé ne doit pas suffire
+    à verrouiller le propriétaire hors de son compte.
+    """
+    current_password: str
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Le nouveau mot de passe doit contenir au moins 8 caractères")
+        return _check_password_bytes(v)
 
 
 # ── Réponse après connexion réussie ──────────────────────────────────────────

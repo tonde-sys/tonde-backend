@@ -286,7 +286,7 @@ préparer le fichier d'une nouvelle organisation :
 | Symptôme | Cause | Correction |
 |---|---|---|
 | Le logo n'apparaît jamais | Le champ s'appelle `logo_url`, pas `logo`. Un champ inconnu est ignoré sans erreur. | `"logo_url": "https://…"` |
-| Mot de passe ignoré, un mot de passe aléatoire est généré | `password_env` attend le **nom d'une variable d'environnement**, pas le mot de passe lui-même. `os.getenv("ULBU_Admin@156")` renvoie `None`. | `"password_env": "ULBU_ADMIN_PASSWORD"` puis `export ULBU_ADMIN_PASSWORD='…'` |
+| Mot de passe ignoré, un mot de passe aléatoire est généré | `password_env` attend le **nom d'une variable d'environnement**, pas le mot de passe lui-même. `os.getenv("MonMotDePasse@2026")` renvoie `None`. | `"password_env": "ULBU_ADMIN_PASSWORD"` puis `export ULBU_ADMIN_PASSWORD='…'` |
 
 ### Création sur une base existante
 

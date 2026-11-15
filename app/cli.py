@@ -8,6 +8,7 @@ Usage :
         --branch-name "..." --branch-slug ... \
         --admin-email ... --super-admin-email ... \
         --service "Caisse|A|5" --counter "Guichet 1"
+    python -m app.cli reset-password --email agent1@ulbu.bi
 
 Les mots de passe peuvent être fournis par :
   - le champ `password` du fichier (déconseillé) ;
@@ -31,6 +32,7 @@ from app.services.bootstrap_service import (
     BootstrapError,
     BootstrapResult,
     bootstrap_pilot,
+    _generate_password,
 )
 
 
@@ -204,6 +206,91 @@ async def _run_bootstrap(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_reset_password(args: argparse.Namespace) -> int:
+    """
+    Réinitialise le mot de passe d'un compte existant, sans passer par un
+    bootstrap complet.
+
+    Pourquoi : jusqu'ici, changer un mot de passe obligeait à rejouer tout le
+    bootstrap avec `--reset-passwords` et un `BOOTSTRAP_PASSWORDS_JSON` complet.
+    Pour une rotation de quatre comptes, c'est quatre occasions de se tromper
+    d'organisation. Cette commande ne touche qu'un compte, révoque ses sessions
+    et lève son éventuel blocage de connexion.
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select
+
+    from app.core.security import hash_password
+    from app.models.refresh_token import RefreshToken
+    from app.models.user import User
+
+    password = args.password or _generate_password()
+    if len(password) < 8:
+        raise BootstrapError("Le mot de passe doit contenir au moins 8 caractères")
+    if len(password.encode("utf-8")) > 72:
+        raise BootstrapError("Le mot de passe ne doit pas dépasser 72 octets (limite bcrypt)")
+
+    revoked = 0
+    async with AsyncSessionLocal() as db:
+        try:
+            user = (
+                await db.execute(select(User).where(User.email == args.email))
+            ).scalar_one_or_none()
+            if user is None:
+                raise BootstrapError(f"Aucun compte avec l'email {args.email}")
+
+            user.hashed_password = hash_password(password)
+            tokens = (
+                await db.execute(
+                    select(RefreshToken).where(
+                        RefreshToken.user_id == user.id,
+                        RefreshToken.revoked_at.is_(None),
+                    )
+                )
+            ).scalars().all()
+            now = datetime.now(timezone.utc)
+            for token in tokens:
+                token.revoked_at = now
+            revoked = len(tokens)
+            await db.commit()
+        finally:
+            await engine.dispose()
+
+    # Le blocage de connexion vit dans Redis : sans cette levée, un compte
+    # réinitialisé resterait inutilisable jusqu'à expiration du palier.
+    lockout_cleared = True
+    try:
+        from app.core.redis import clear_login_failures, close_redis
+
+        await clear_login_failures(args.email)
+        await close_redis()
+    except Exception as exc:  # pragma: no cover - Redis optionnel en CLI
+        lockout_cleared = False
+        print(f"Attention : blocage Redis non levé ({exc})", file=sys.stderr)
+
+    payload = {
+        "email": args.email,
+        "password": password,
+        "password_generated": args.password is None,
+        "revoked_sessions": revoked,
+        "lockout_cleared": lockout_cleared,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print("=" * 62)
+        print("TONDE — Réinitialisation de mot de passe")
+        print("=" * 62)
+        print(f"  Compte           : {args.email}")
+        print(f"  Mot de passe     : {password}")
+        print(f"  Sessions fermées : {revoked}")
+        print(f"  Blocage levé     : {'oui' if lockout_cleared else 'non (Redis injoignable)'}")
+        print("=" * 62)
+        print("Notez ce mot de passe : il n'est plus affiché ensuite.")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m app.cli",
@@ -261,6 +348,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Valide et simule sans conserver les écritures",
     )
     bootstrap.add_argument("--json", action="store_true", help="Sortie JSON")
+
+    reset = subparsers.add_parser(
+        "reset-password",
+        help="Réinitialise le mot de passe d'un compte (rotation)",
+    )
+    reset.add_argument("--email", required=True, help="Email du compte à modifier")
+    reset.add_argument(
+        "--password",
+        help="Nouveau mot de passe. Omis → un mot de passe aléatoire est généré et affiché",
+    )
+    reset.add_argument("--json", action="store_true", help="Sortie JSON")
     return parser
 
 
@@ -270,6 +368,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "bootstrap":
             return asyncio.run(_run_bootstrap(args))
+        if args.command == "reset-password":
+            return asyncio.run(_run_reset_password(args))
     except BootstrapError as exc:
         print(f"Erreur de bootstrap : {exc}", file=sys.stderr)
         return 1

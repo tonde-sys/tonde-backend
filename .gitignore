@@ -51,3 +51,10 @@ Thumbs.db
 # Outils de developpement locaux
 .workbuddy-ai/
 .kiro/
+
+# ── Fichiers de provisioning contenant des mots de passe en clair ────────
+# Ces gabarits d'organisation portent des `password_env` avec le mot de passe
+# réel : ils ne doivent jamais entrer dans l'historique Git.
+docs/oganisation-*.txt
+docs/organisation-*.txt
+bootstrap/*secret*.json
