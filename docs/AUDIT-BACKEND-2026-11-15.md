@@ -66,8 +66,12 @@ qu'aucun utilisateur ne peut changer lui-même.
 
 ### État d'avancement
 
-Vue unique, à jour au 15/11/2026 16:05. ✅ = corrigé **et** couvert par des
+Vue unique, à jour au 15/11/2026 17:30. ✅ = corrigé **et** couvert par des
 tests ; ⬜ = rien n'a été fait, le constat reste vrai.
+
+**14 constats sur 20 sont traités.** Restent P1-9, P1-10, P2-13, P2-14 et
+P2-17 — ce dernier étant le seul à demander une migration
+(`AuditLog.org_id` doit devenir nullable).
 
 | # | Constat | État | Preuve |
 |---|---|---|---|
@@ -120,6 +124,15 @@ Les trois P0 annoncés comme « courts, sans migration » sont corrigés et test
 Suite locale après les trois lots : **318 passés, 129 ignorés, 0 échec**.
 CI (avec Redis, donc les 129 tests inclus) : **447 passés, 0 ignoré, 0 échec**
 — run 26, commit `eaa4a3c`.
+
+Après les phases 1 et 2 (commit `790a01a`) : **357 passés, 131 ignorés, 0 échec**
+en local, et **489 passés, 0 ignoré, 0 échec** en CI (run 43729823352) — soit
+42 tests de plus, tous verts avec PostgreSQL et Redis réels.
+
+La CI a d'ailleurs attrapé ce que la suite locale ne pouvait pas voir :
+`/health/status` était comparé par égalité exacte dans un test, et la clé
+`scheduler` ajoutée par P2-18 faisait échouer l'assertion. Les 131 tests ignorés
+en local restent un angle mort : **« vert en local » ne veut pas dire « vert »**.
 
 Effet de bord à connaître : les agences dont `operating_hours` est NULL voient
 désormais leur fenêtre `opens_at`/`closes_at` réellement appliquée. ULBU
