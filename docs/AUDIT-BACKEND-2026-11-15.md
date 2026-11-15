@@ -66,12 +66,11 @@ qu'aucun utilisateur ne peut changer lui-même.
 
 ### État d'avancement
 
-Vue unique, à jour au 15/11/2026 17:30. ✅ = corrigé **et** couvert par des
+Vue unique, à jour au 15/11/2026 18:40. ✅ = corrigé **et** couvert par des
 tests ; ⬜ = rien n'a été fait, le constat reste vrai.
 
-**14 constats sur 20 sont traités.** Restent P1-9, P1-10, P2-13, P2-14 et
-P2-17 — ce dernier étant le seul à demander une migration
-(`AuditLog.org_id` doit devenir nullable).
+**17 constats sur 20 sont traités.** Restent P2-13 et P2-14 ; l'observation
+401/403, hors constat numéroté, reste également ouverte.
 
 | # | Constat | État | Preuve |
 |---|---|---|---|
@@ -83,33 +82,33 @@ P2-17 — ce dernier étant le seul à demander une migration
 | 6 | Aucun verrouillage par compte sur `POST /auth/login` | ✅ | `tests/test_login_lockout.py` (11) |
 | 7 | Fermer un guichet laisse le ticket CALLED orphelin | ✅ | `tests/test_phase0_corrections.py` (3) |
 | 8 | Aucun endpoint pour lister la file côté staff | ✅ | `tests/test_queue_listing.py` (15) |
-| 9 | Un seul WebSocket par ticket | ⬜ | — |
-| 10 | `websocket_counter` : aucun contrôle d'affectation | ⬜ | — |
+| 9 | Un seul WebSocket par ticket | ✅ | `tests/test_phase3_security.py` (6) |
+| 10 | `websocket_counter` : aucun contrôle d'affectation | ✅ | `tests/test_phase3_security.py` (5) |
 | 11 | `return_to_queue` sans repli si Redis échoue | ✅ | `tests/test_phase1_corrections.py` (3) |
 | 12 | `GET /tickets/history` renvoie `position: 0` | ✅ | `tests/test_phase0_corrections.py` (2) |
 | 13 | Préfixe de service unique seulement entre services actifs | ⬜ | — |
 | 14 | `get_branch_display` : N+1 requêtes | ⬜ | — |
 | 15 | Création : `get_queue_size` dans le même `try` que `add_to_queue` | ✅ | `tests/test_phase1_corrections.py` (2) |
 | 16 | `queue_score` : marge de priorité de 104 jours | ✅ | `tests/test_queue_score_geometry.py` (9) |
-| 17 | Aucune trace d'audit des connexions | ⬜ | voir note ci-dessous |
+| 17 | Aucune trace d'audit des connexions | ✅ | `tests/test_phase3_security.py` (8) + migration `009` |
 | 18 | `/health/ready` n'inspecte pas le scheduler | ✅ | `tests/test_phase1_corrections.py` (9) |
 | 19 | Aucun endpoint de changement de mot de passe | ✅ | `tests/test_change_password.py` (11) + `tests/test_cli_reset_password.py` (5) |
 | 20 | Mot de passe partagé par 4 comptes, écrit en clair | ✅ | rotation exécutée le 15/11 15:03, 4 mots de passe distincts |
 
-**10 constats sur 20 sont traités, 10 restent ouverts.** Les 10 restants sont
-documentés ci-dessous avec leur correctif ; aucun n'est bloquant pour le test
-partenaire. La séquence d'exécution est dans `docs/PLAN-DEV.md`.
+**17 constats sur 20 sont traités, 3 restent ouverts.** Les trois derniers —
+P2-13, P2-14 et l'observation 401/403 — sont de la dette assumée : aucun ne
+bloque le test partenaire, tous sont documentés avec leur correctif. La séquence
+d'exécution est dans `docs/PLAN-DEV.md`.
 
 Deux remarques sur ce tableau :
 
-- **#17 n'est pas un oubli, c'est un blocage structurel.** `AuditLog.org_id` est
-  `NOT NULL` avec clé étrangère vers `organizations`. Or un `super_admin` et un
-  client OTP ont `org_id = NULL` : leurs connexions ne peuvent pas être
-  journalisées dans cette table. Tracer les connexions demande donc une
-  migration (`org_id` nullable) — ce n'est pas un correctif de trois lignes.
-- **#20 n'est pas un correctif de code.** L'outil existe désormais
-  (`reset-password`), mais la rotation elle-même doit être exécutée sur
-  l'environnement de production.
+- **#17 a demandé une migration**, la seule de tout le lot :
+  `009_audit_org_nullable`. `AuditLog.org_id` était `NOT NULL` avec clé
+  étrangère vers `organizations`, alors qu'un `super_admin` et un client OTP ont
+  `org_id = NULL` — leurs connexions, les deux comptes les plus sensibles,
+  étaient donc impossibles à journaliser.
+- **#20 n'était pas un correctif de code.** L'outil a été livré
+  (`reset-password`), la rotation elle-même a été exécutée sur la production.
 
 ### Détail des P0 corrigés
 
@@ -425,7 +424,7 @@ GET (agence inconnue)                                        -> 404 BRANCH_NOT_F
 La file est vide parce que l'agence a fermé à 17:00 — c'est la décision 1 qui
 s'applique, et elle se vérifie aussi par cette route.
 
-### 9. Un seul WebSocket par ticket
+### 9. Un seul WebSocket par ticket — ✅ corrigé
 
 `connections_by_ticket` est un `dict[str, WebSocket]` (`queue_ws.py:71`). Une
 deuxième connexion sur le même ticket remplace la première sans la fermer
@@ -433,12 +432,41 @@ deuxième connexion sur le même ticket remplace la première sans la fermer
 second (`:107-115`). Un client qui ouvre l'app sur téléphone puis sur tablette
 perd le suivi sur l'un des deux, silencieusement.
 
-### 10. `websocket_counter` : pas de contrôle d'affectation
+**Correctif livré.** Les deux registres (`connections_by_ticket`,
+`counter_connections`) contiennent désormais des **ensembles** de sockets, et
+les méthodes de déconnexion reçoivent le socket concerné
+(`disconnect_client(ticket_id, agency_id, websocket=None)`). Trois
+conséquences :
+
+1. Deux appareils suivent le même ticket ; fermer l'un ne touche pas l'autre.
+2. Un socket mort est retiré **individuellement** au moment de l'envoi, sans
+   emporter ses voisins — l'ancien code supprimait l'entrée entière.
+3. `/ws/stats` distingue désormais `tickets` (clés) de `ticket_devices`
+   (connexions) : le tableau de bord de supervision ne peut plus confondre
+   « 3 tickets suivis » et « 7 appareils connectés ».
+
+Le même traitement s'applique au guichet (`disconnect_counter`) : deux écrans
+par guichet — un poste agent et un écran de salle — sont un besoin courant, pas
+un cas limite.
+
+### 10. `websocket_counter` : pas de contrôle d'affectation — ✅ corrigé
 
 `routers/tickets.py:391-397` vérifie seulement que le guichet appartient à
 l'organisation de l'utilisateur. Un agent du guichet 1 peut donc s'abonner au
 WebSocket du guichet 7 et recevoir ses événements. Le contrôle existe déjà pour
 le REST (`_verify_agent_assignment`) ; il manque ici.
+
+**Correctif livré.** Après le contrôle d'organisation, un agent qui n'est pas
+dans `ANY_COUNTER_ROLES` doit être rattaché au guichet (`employees.counter_id`,
+statut `ACTIVE`) ; sinon la connexion est fermée avec le code **4003** et un
+motif explicite (« Vous n'êtes pas affecté à ce guichet »). Les rôles larges
+(`supervisor`, `admin_org`, `super_admin`) gardent l'accès : la supervision d'un
+guichet n'est pas la même chose que son usage.
+
+Le code 4003 est distinct du 4004 déjà utilisé pour « guichet d'une autre
+organisation » : côté client, « pas votre guichet » (réaffectation à demander) et
+« pas votre organisation » (erreur de configuration) demandent deux réactions
+différentes.
 
 ### 11. `return_to_queue` sans repli Redis — ✅ corrigé
 
@@ -627,9 +655,35 @@ ancien pourrait être doublé par une priorité supérieure. Relever le TTL au-d
 de 11,57 jours fait échouer `tests/test_queue_score_geometry.py` avec le chiffre
 exact à corriger — c'est le seul garde-fou qui empêche une régression silencieuse.
 
-**17. Aucun audit des connexions** — `AuditLog` existe et est utilisé pour les
-tickets et les priorités, mais ni les connexions réussies ni les échecs n'y sont
-tracés. Une banque demandera « qui s'est connecté, quand, depuis où ».
+**17. Aucun audit des connexions** — ✅ corrigé.
+`AuditLog` existait et servait aux tickets et aux priorités, mais ni les
+connexions réussies ni les échecs n'y étaient tracés. Une banque demandera « qui
+s'est connecté, quand, depuis où ».
+
+**Correctif livré — trois morceaux, dont une migration :**
+
+1. **Migration `009_audit_org_nullable`.** `audit_logs.org_id` devient nullable.
+   C'était le blocage réel : un `super_admin` et un client OTP n'ont aucune
+   organisation, donc leurs connexions — les deux comptes les plus sensibles —
+   ne pouvaient pas être écrites du tout. Le downgrade refuse de s'exécuter s'il
+   reste des lignes à `org_id` NULL : effacer une preuve d'audit pour revenir en
+   arrière n'est pas une option.
+2. **Six actions** : `login_succeeded`, `login_failed` (avec
+   `reason ∈ {unknown_account, bad_password, account_disabled}`),
+   `login_blocked`, `password_changed`, `password_reset_requested`,
+   `password_reset`. Chaque ligne porte l'IP (première entrée de
+   `X-Forwarded-For`, sinon l'adresse du pair) et le User-Agent tronqué à 255
+   caractères.
+3. **`GET /api/v1/audit/logs`** — lecture paginée avec filtres `action`,
+   `actor_id`, `date_from`, `date_to`. Un `admin_org` ne voit que son
+   organisation ; `org_id` n'est libre que pour un `super_admin`.
+
+**Décision : l'audit ne bloque jamais une connexion.** `_audit_login` avale ses
+propres erreurs (rollback + `ERROR` dans les logs). Une panne du journal ne doit
+pas empêcher un agent de servir des clients : le journal est une exigence de
+conformité, pas une dépendance du chemin critique. La contrepartie — une panne
+d'audit passe inaperçue côté utilisateur — est assumée et surveillée par le
+niveau `ERROR`.
 
 **18. `/health/ready` n'inspecte pas le scheduler** — ✅ corrigé.
 `health_service.py` vérifiait la base et Redis. Si la boucle de fond mourait, les
@@ -673,22 +727,99 @@ rôle insuffisant » `403`. Le corriger touche toutes les routes à la fois
 
 ---
 
+## Livraison des phases 3 et 4
+
+Les deux derniers lots du plan, livrés le 15/11 en fin de journée.
+
+| Lot | Livré | Tests |
+|---|---|---|
+| P3-10 | Affectation au guichet vérifiée sur le WebSocket (code 4003) | `test_phase3_security.py` (5) |
+| P3-9 | N appareils par ticket, N écrans par guichet | `test_phase3_security.py` (6) |
+| P3-17 | Audit des connexions + migration `009` + `GET /audit/logs` | `test_phase3_security.py` (8) |
+| P4 | Mot de passe oublié (SMTP, jeton usage unique) | `test_phase4_password_reset.py` (29) |
+| P4 | Rapport quotidien (`python -m app.cli daily-report`) | `test_phase4_daily_report.py` (24) |
+
+### Deux défauts trouvés par les tests, pas par la relecture
+
+Les tests du mot de passe oublié ont été écrits pour vérifier trois propriétés
+(réponse neutre, usage unique, sessions révoquées). Ils en ont révélé deux
+autres, que la lecture du code n'avait pas vues :
+
+1. **Le jeton était stocké en clair dans l'index inverse.**
+   `tonde:pwdreset_user:{user_id}` contenait le jeton brut, alors que la clé
+   principale n'en stockait que le SHA-256. Un dump Redis livrait donc
+   directement les liens de réinitialisation — le hachage ne protégeait rien.
+   Corrigé : l'index contient désormais le hash, et c'est lui qui construit la
+   clé.
+2. **Demander un nouveau lien n'invalidait pas l'ancien.** Le docstring
+   l'affirmait, le code ne le faisait pas : `save_password_reset_token`
+   écrasait l'index sans supprimer le jeton précédent, qui restait valable
+   jusqu'à son expiration. Deux liens actifs au lieu d'un, donc deux fois la
+   surface d'interception. Corrigé : l'ancien jeton est supprimé **avant**
+   l'écriture du nouveau.
+
+La leçon est la même que pour la CI en phase 1 : ce qui n'est pas vérifié par un
+test n'est pas vérifié du tout, y compris quand le commentaire affirme le
+contraire.
+
+### Preuves d'exécution
+
+Le rapport quotidien a été exécuté de bout en bout sur une base SQLite amorcée
+avec une journée type (5 tickets, 2 guichets, 2 services) :
+
+```
+TONDE — Rapport quotidien
+ULBU Mutanga-Nord — Bujumbura
+samedi 14 novembre 2026
+==============================================
+
+Activité
+  Tickets créés            5
+  Clients servis           2
+  Annulés                  1
+  Absents                  1
+  Temps d'attente moyen    17,5 min
+  Taux d'absence           50,0 %
+  Heure de pointe          10h00 (heure locale)
+
+Par service
+  Caisse : 3 ticket(s), attente 10,0 min, absence 100,0 %
+  Crédit : 2 ticket(s), attente 25,0 min, absence 0,0 %
+
+Par guichet
+  Guichet 1 : 1 client(s) servi(s)
+  Guichet 2 : 1 client(s) servi(s)
+```
+
+Deux points à vérifier dans cette sortie, et ils le sont : le ticket créé le 13
+à 20:00 UTC (22:00 locales) **n'est pas** compté dans le 14, et le pic de 08:00
+UTC est bien affiché « 10h00 (heure locale) ».
+
+---
+
 ## Fonctions manquantes (produit)
 
 1. **Confirmation de présence** (`PENDING_ARRIVAL` + scan du QR d'agence) — la
    seule réponse structurelle au problème des tickets pris depuis chez soi.
 2. **Back-office admin** — `tonde-web` reste une maquette sur données en dur ;
    l'`admin_org` d'une banque n'a aucune interface.
-3. **Email sortant / mot de passe oublié** — aucun SMTP configuré. Un
-   utilisateur peut désormais changer son mot de passe s'il connaît l'ancien
-   (voir P1-19), mais il n'existe aucun moyen de le **récupérer** : pas de
-   « mot de passe oublié », pas d'envoi de lien. Un agent qui perd son mot de
-   passe passe encore par l'exploitant (`reset-password`).
-4. **Liste de la file** (voir P1-8).
+3. ~~**Email sortant / mot de passe oublié**~~ — **livré (phase 4).** Passerelle
+   SMTP (`app/services/email_gateway.py`, `smtplib` + `asyncio.to_thread`, aucune
+   dépendance ajoutée), `POST /auth/forgot-password` et
+   `POST /auth/reset-password`. Le jeton est à usage unique, expirant
+   (`PASSWORD_RESET_TTL_MINUTES`, 30 min par défaut), stocké **haché** dans
+   Redis, et sa consommation ferme toutes les sessions. La réponse de
+   `forgot-password` est identique que le compte existe ou non — sans quoi le
+   formulaire deviendrait un annuaire des agents d'une banque
+   (`prenom.nom@banque.bi` se devine).
+4. ~~**Liste de la file**~~ — **livré** (`GET /tickets/queue`, phase 2).
 5. **Facturation / plan** — aucun modèle d'abonnement ; le seul plafond est
    `max_daily_tickets`.
-6. **Rapport quotidien** — les données existent (`queue_logs`), aucun envoi
-   automatique au responsable d'agence.
+6. ~~**Rapport quotidien**~~ — **livré (phase 4).** `python -m app.cli
+   daily-report` construit le rapport d'une agence depuis `queue_logs` et
+   l'envoie par email (`--send`) au responsable. La journée est **locale**
+   (UTC+2), pas UTC : un rapport « du 14 » couvre 22:00 UTC le 13 → 22:00 UTC le
+   14, et l'heure de pointe est exprimée en heure locale.
 
 ---
 
@@ -712,12 +843,18 @@ rôle insuffisant » `403`. Le corriger touche toutes les routes à la fois
 1. ~~**P0-1, P0-2, P0-3**~~ — **fait.** Trois correctifs courts, sans migration,
    qui évitaient les pannes les plus visibles pendant le test partenaire.
 2. ~~**P1-6, P1-19**~~ — **fait.** Verrouillage par compte et changement de mot
-   de passe : les deux touchent le même fichier et la même surface d'attaque.
-3. **P1-20 (rotation des comptes ULBU)** — ce n'est pas du code, c'est une
-   commande à lancer avant de transmettre les accès au partenaire.
-4. **P0-4, P0-5** — paramétrage et une requête de comptage. Toujours ouverts.
-5. **P1-8 (liste de la file)** — la fonction qui manque le plus au quotidien.
-6. Le reste en dette assumée, documenté dans `DEPLOYMENT.md`.
+   de passe : les deux touchent la même surface d'attaque.
+3. ~~**P0-4, P0-5, P1-7, P1-12**~~ — **fait** (phase 0).
+4. ~~**P1-11, P2-15, P2-16, P2-18**~~ — **fait** (phase 1) : fiabilité du moteur
+   et supervision.
+5. ~~**P1-8**~~ — **fait** (phase 2) : `GET /tickets/queue`.
+6. ~~**P1-9, P1-10, P2-17**~~ — **fait** (phase 3) : multi-appareils,
+   affectation guichet, audit des connexions.
+7. ~~**Email sortant, mot de passe oublié, rapport quotidien**~~ — **fait**
+   (phase 4).
+8. **P2-13, P2-14** — dette assumée, mesurable avant d'être optimisée.
+9. **401 vs 403** — à traiter comme un lot à part : la correction touche toutes
+   les routes protégées à la fois.
 
 Le détail séquencé, avec les décisions à prendre et les dépendances, est dans
 **`docs/PLAN-DEV.md`** — ce document-ci reste le constat, l'autre est le

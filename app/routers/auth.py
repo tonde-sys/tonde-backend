@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
-from app.core.middlewares import limiter
+from app.core.middlewares import client_ip, limiter, user_agent
 from app.models.user import User
 from app.schemas.auth import (
     RegisterPhoneRequest, VerifyOtpRequest,
@@ -14,6 +14,7 @@ from app.schemas.auth import (
     RefreshTokenRequest, LogoutRequest,
     UpdateProfileRequest, FcmTokenRequest,
     ChangePasswordRequest,
+    ForgotPasswordRequest, ResetPasswordRequest,
 )
 from app.services.auth_service import AuthService
 
@@ -87,9 +88,68 @@ async def login_email(
     """
     Connexion email + mot de passe.
     Limité à 10 requêtes/minute par IP contre le brute force password.
+
+    Chaque tentative — réussie, échouée ou bloquée — est journalisée dans
+    `audit_logs` avec l'IP et le User-Agent (constat P3-17).
     """
     service = AuthService(db)
-    return await service.login_email(body)
+    return await service.login_email(
+        body,
+        ip=client_ip(request),
+        user_agent=user_agent(request),
+    )
+
+
+@router.post("/forgot-password", summary="Mot de passe oublié — envoi d'un lien par email")
+@limiter.limit("5/minute")
+async def forgot_password(
+    request: Request,
+    body: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Envoie un lien de réinitialisation **si** le compte existe.
+
+    La réponse est toujours la même, compte existant ou non : sans cela, le
+    formulaire deviendrait un outil d'énumération des comptes d'une banque
+    (`prenom.nom@banque.bi` se devine). Le lien expire après
+    `PASSWORD_RESET_TTL_MINUTES` (30 min) et ne sert qu'une fois.
+
+    Limité à 5 requêtes/minute par IP : un envoi d'email coûte de l'argent et
+    permet de saturer la boîte d'un agent.
+    """
+    service = AuthService(db)
+    return await service.request_password_reset(
+        str(body.email),
+        ip=client_ip(request),
+        user_agent=user_agent(request),
+    )
+
+
+@router.post("/reset-password", summary="Réinitialiser le mot de passe avec le jeton reçu")
+@limiter.limit("5/minute")
+async def reset_password(
+    request: Request,
+    body: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Réinitialise le mot de passe à partir du lien reçu par email.
+
+    Le jeton est à usage unique et expirant. Après succès, **toutes les sessions
+    sont fermées** : si le lien avait été intercepté, l'attaquant perd l'accès
+    au moment où la victime reprend la main.
+
+    Limité à 5 requêtes/minute par IP : un jeton fait 43 caractères aléatoires,
+    mais autant ne pas laisser de surface de force brute.
+    """
+    service = AuthService(db)
+    return await service.reset_password(
+        body.token,
+        body.new_password,
+        ip=client_ip(request),
+        user_agent=user_agent(request),
+    )
 
 
 @router.post("/refresh", summary="Renouveler le token d'accès (rotation)")

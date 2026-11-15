@@ -68,6 +68,37 @@ class Settings(BaseSettings):
     OTP_EXPIRE_MINUTES: int = 5
     OTP_MAX_ATTEMPTS: int = 3
 
+    # ── Email sortant (SMTP) ──────────────────────────────────
+    # Aucun fournisseur imposé : n'importe quel SMTP (OVH, Gandi, Brevo,
+    # SendGrid en mode SMTP, serveur interne d'une banque) convient.
+    # En développement, l'envoi est SIMULÉ (journalisé) — comme le SMS.
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = "TONDE <no-reply@tonde.app>"
+    # 587 = STARTTLS (recommandé) ; 465 = TLS implicite, géré automatiquement.
+    SMTP_USE_TLS: bool = True
+    SMTP_TIMEOUT_SECONDS: float = 15.0
+    # Adresse affichée dans les emails (support, réponses).
+    SUPPORT_EMAIL: str = "support@tonde.app"
+    # Durée de vie d'un lien de réinitialisation de mot de passe.
+    PASSWORD_RESET_TTL_MINUTES: int = 30
+    # URL de base du front qui affiche le formulaire de réinitialisation.
+    PASSWORD_RESET_URL: str = "https://app.tonde.app/reset-password"
+
+    # ── Rapport quotidien ─────────────────────────────────────
+    # Décalage horaire des agences par rapport à UTC (Burundi : UTC+2, sans
+    # heure d'été). Il sert à deux choses, toutes deux visibles par le client :
+    #   - délimiter la « journée » du rapport : 14 novembre = 22:00 UTC la
+    #     veille → 22:00 UTC, et non 00:00→00:00 UTC, qui couperait la journée
+    #     de travail en deux ;
+    #   - exprimer l'heure de pointe en heure locale. Un pic à 10h locales est
+    #     stocké à 08h UTC : l'annoncer « 8h » au gérant serait faux.
+    # Offset entier uniquement : un fuseau à demi-heure demanderait un vrai
+    # fuseau (zoneinfo), pas un décalage.
+    REPORT_LOCAL_UTC_OFFSET_HOURS: int = 2
+
     # ── Firebase Cloud Messaging (API HTTP v1) ────────────────
     # L'ancienne API « legacy » (clé serveur) est arrêtée par Google.
     # FIREBASE_SERVICE_ACCOUNT_JSON : contenu JSON du compte de service,

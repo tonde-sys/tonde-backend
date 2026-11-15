@@ -29,6 +29,13 @@ class AuditAction:
     TICKET_TRANSFERRED = "ticket_transferred"
     TICKET_REQUEUED = "ticket_requeued"
     TICKET_EXPIRED = "ticket_expired"
+    # Connexions (constat P3-17) — « qui s'est connecté, quand, depuis où ».
+    LOGIN_SUCCEEDED = "login_succeeded"
+    LOGIN_FAILED = "login_failed"
+    LOGIN_BLOCKED = "login_blocked"
+    PASSWORD_CHANGED = "password_changed"
+    PASSWORD_RESET_REQUESTED = "password_reset_requested"
+    PASSWORD_RESET = "password_reset"
 
 
 class AuditLog(Base):
@@ -37,8 +44,12 @@ class AuditLog(Base):
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
-    org_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id", ondelete="CASCADE"), index=True
+    # Nullable depuis P3-17 : un `super_admin` et un client OTP n'ont aucune
+    # organisation. Sans cela, leurs connexions — les deux comptes les plus
+    # sensibles — ne pouvaient pas être journalisées du tout.
+    org_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True, index=True,
     )
     actor_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     actor_role: Mapped[str | None] = mapped_column(String(30), nullable=True)

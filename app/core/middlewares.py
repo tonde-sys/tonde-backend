@@ -19,7 +19,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Request, WebSocket
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,35 @@ limiter = Limiter(
     key_func=get_remote_address,
     default_limits=["200/minute"],
 )
+
+
+def client_ip(request: Request) -> str | None:
+    """
+    Adresse IP réelle de l'appelant, pour le journal d'audit.
+
+    Derrière un proxy (Render, Nginx), `request.client.host` est l'IP du proxy :
+    toutes les connexions sembleraient venir de la même machine, et le journal
+    d'audit ne répondrait pas à « depuis où ». On lit donc `X-Forwarded-For` en
+    premier, en prenant la PREMIÈRE entrée (celle du client d'origine) : les
+    suivantes sont les proxies traversés et sont contrôlables par eux.
+
+    Limite assumée : un client peut falsifier cet en-tête si le proxy ne le
+    réécrit pas. Render le réécrit. Sur un déploiement sans proxy de confiance,
+    il faudrait ne garder que `request.client.host` — d'où le commentaire plutôt
+    qu'une confiance implicite.
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else None
+
+
+def user_agent(request: Request) -> str | None:
+    """User-Agent tronqué — l'en-tête est libre, il ne doit pas remplir la base."""
+    value = request.headers.get("user-agent")
+    return value[:255] if value else None
 
 
 async def check_ws_rate_limit(websocket: WebSocket) -> bool:

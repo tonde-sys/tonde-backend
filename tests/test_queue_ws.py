@@ -42,7 +42,7 @@ def test_disconnect_client_removes_from_ticket_index():
     mock_ws = MagicMock()
     mock_ws.client_state.name = "CONNECTED"
 
-    manager.connections_by_ticket["ticket-1"] = mock_ws
+    manager.connections_by_ticket["ticket-1"] = {mock_ws}
     manager.connections_by_agency["agency-1"] = {mock_ws}
 
     manager.disconnect_client("ticket-1", "agency-1")
@@ -78,7 +78,7 @@ async def test_send_to_ticket_cleans_dead_connection():
     manager = QueueWebSocketManager()
     dead_ws = AsyncMock()
     dead_ws.send_text = AsyncMock(side_effect=Exception("connexion fermée"))
-    manager.connections_by_ticket["ticket-dead"] = dead_ws
+    manager.connections_by_ticket["ticket-dead"] = {dead_ws}
 
     # Ne lève pas d'exception
     await manager.send_to_ticket("ticket-dead", {"type": "test"})

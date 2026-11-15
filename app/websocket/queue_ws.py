@@ -61,18 +61,26 @@ class QueueWebSocketManager:
     Gère toutes les connexions WebSocket actives.
 
     Indexation des connexions :
-      connections_by_ticket  : ticket_id  → WebSocket  (client mobile)
+      connections_by_ticket  : ticket_id  → Set[WebSocket] (client mobile, N appareils)
       connections_by_agency  : agency_id  → Set[WebSocket] (broadcast salle)
-      counter_connections    : counter_id → WebSocket  (guichetier desktop)
+      counter_connections    : counter_id → Set[WebSocket] (guichetier desktop)
+
+    Un même ticket (ou un même guichet) peut être suivi depuis plusieurs
+    appareils : téléphone + tablette du client, ou deux écrans au guichet. Les
+    index stockent donc des ENSEMBLES et non une connexion unique — voir le
+    constat P3-9 de l'audit : avant, une deuxième connexion remplaçait la
+    première sans la fermer, et la déconnexion de l'une retirait l'entrée de
+    l'autre, si bien qu'un client perdait le suivi sur l'un de ses appareils
+    sans le moindre message.
     """
 
     def __init__(self):
-        # Mobile client → suivi de son ticket
-        self.connections_by_ticket: Dict[str, WebSocket] = {}
+        # Mobile client → suivi de son ticket (plusieurs appareils possibles)
+        self.connections_by_ticket: Dict[str, Set[WebSocket]] = {}
         # Tous les clients d'une agence → broadcast salle d'attente
         self.connections_by_agency: Dict[str, Set[WebSocket]] = {}
-        # Guichetiers desktop
-        self.counter_connections: Dict[str, WebSocket] = {}
+        # Guichetiers desktop (plusieurs écrans possibles)
+        self.counter_connections: Dict[str, Set[WebSocket]] = {}
 
     # ── Connexions ────────────────────────────────────────────────────────────
 
@@ -82,61 +90,135 @@ class QueueWebSocketManager:
         """
         Enregistre la connexion d'un client mobile qui suit son ticket.
 
+        La connexion est AJOUTÉE à l'ensemble : un deuxième appareil sur le même
+        ticket n'écrase pas le premier, il le rejoint.
+
         Args:
             websocket: La connexion WebSocket acceptée
             ticket_id: UUID du ticket suivi
             agency_id: UUID de l'agence (pour le broadcast)
         """
         await websocket.accept()
-        self.connections_by_ticket[ticket_id] = websocket
+        self.connections_by_ticket.setdefault(ticket_id, set()).add(websocket)
 
-        if agency_id not in self.connections_by_agency:
-            self.connections_by_agency[agency_id] = set()
-        self.connections_by_agency[agency_id].add(websocket)
+        self.connections_by_agency.setdefault(agency_id, set()).add(websocket)
 
-        logger.info(f"WS client connecté — ticket={ticket_id} | agency={agency_id}")
+        logger.info(
+            f"WS client connecté — ticket={ticket_id} | agency={agency_id} | "
+            f"appareils={len(self.connections_by_ticket[ticket_id])}"
+        )
 
     async def connect_counter(
         self, websocket: WebSocket, counter_id: str
     ) -> None:
-        """Enregistre la connexion d'un guichetier desktop."""
+        """Enregistre la connexion d'un guichetier desktop (ajout, pas remplacement)."""
         await websocket.accept()
-        self.counter_connections[counter_id] = websocket
-        logger.info(f"WS guichet connecté — counter={counter_id}")
+        self.counter_connections.setdefault(counter_id, set()).add(websocket)
+        logger.info(
+            f"WS guichet connecté — counter={counter_id} | "
+            f"écrans={len(self.counter_connections[counter_id])}"
+        )
 
-    def disconnect_client(self, ticket_id: str, agency_id: str) -> None:
-        """Nettoie la connexion après déconnexion d'un client."""
-        self.connections_by_ticket.pop(ticket_id, None)
+    def disconnect_client(
+        self, ticket_id: str, agency_id: str, websocket: WebSocket | None = None
+    ) -> None:
+        """
+        Retire UNE connexion (ou toutes) du suivi d'un ticket.
+
+        Args:
+            ticket_id: Ticket concerné
+            agency_id: Agence (pour l'index de broadcast)
+            websocket: La connexion qui se ferme. Si None, toutes les connexions
+                du ticket sont retirées (déconnexion globale, nettoyage).
+        """
+        if websocket is None:
+            self.connections_by_ticket.pop(ticket_id, None)
+        else:
+            connections = self.connections_by_ticket.get(ticket_id)
+            if connections is not None:
+                connections.discard(websocket)
+                if not connections:
+                    self.connections_by_ticket.pop(ticket_id, None)
+
+        # L'index de broadcast est commun à tous les tickets de l'agence : on ne
+        # retire que la connexion concernée, jamais l'ensemble.
         if agency_id in self.connections_by_agency:
-            self.connections_by_agency[agency_id] = {
-                ws for ws in self.connections_by_agency[agency_id]
-                if not self._is_disconnected(ws)
-            }
+            if websocket is None:
+                self.connections_by_agency[agency_id] = {
+                    ws for ws in self.connections_by_agency[agency_id]
+                    if not self._is_disconnected(ws)
+                }
+            else:
+                self.connections_by_agency[agency_id].discard(websocket)
+            if not self.connections_by_agency[agency_id]:
+                self.connections_by_agency.pop(agency_id, None)
+
         logger.info(f"WS client déconnecté — ticket={ticket_id}")
+
+    def disconnect_counter(self, counter_id: str, websocket: WebSocket | None = None) -> None:
+        """
+        Retire une connexion de guichet (ou toutes si `websocket` est omis).
+
+        Sans cette méthode, le routeur faisait `counter_connections.pop(...)`,
+        ce qui fermait l'index pour TOUS les écrans du guichet dès que l'un
+        d'eux se déconnectait.
+        """
+        if websocket is None:
+            self.counter_connections.pop(counter_id, None)
+        else:
+            connections = self.counter_connections.get(counter_id)
+            if connections is not None:
+                connections.discard(websocket)
+                if not connections:
+                    self.counter_connections.pop(counter_id, None)
+        logger.info(f"WS guichet déconnecté — counter={counter_id}")
 
     # ── Envoi ciblé ───────────────────────────────────────────────────────────
 
     async def send_to_ticket(self, ticket_id: str, data: dict) -> None:
         """
-        Envoie un message au mobile qui suit ce ticket précis.
-        Nettoie la connexion si elle est morte.
+        Envoie un message à TOUS les appareils qui suivent ce ticket.
+
+        Un appareil en échec est retiré sans affecter les autres : c'est la
+        différence entre « le client a fermé son téléphone » et « le client a
+        perdu le suivi partout ».
         """
-        websocket = self.connections_by_ticket.get(ticket_id)
-        if websocket:
+        connections = self.connections_by_ticket.get(ticket_id)
+        if not connections:
+            return
+
+        message = json.dumps(data)
+        dead: Set[WebSocket] = set()
+        for websocket in list(connections):
             try:
-                await websocket.send_text(json.dumps(data))
-            except Exception as e:
-                logger.warning(f"Échec envoi WS ticket={ticket_id}: {e}")
+                await websocket.send_text(message)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Échec envoi WS ticket={ticket_id} : {e}")
+                dead.add(websocket)
+
+        if dead:
+            connections -= dead
+            if not connections:
                 self.connections_by_ticket.pop(ticket_id, None)
 
     async def send_to_counter(self, counter_id: str, data: dict) -> None:
-        """Envoie un message à un guichetier spécifique."""
-        websocket = self.counter_connections.get(counter_id)
-        if websocket:
+        """Envoie un message à tous les écrans d'un guichet."""
+        connections = self.counter_connections.get(counter_id)
+        if not connections:
+            return
+
+        message = json.dumps(data)
+        dead: Set[WebSocket] = set()
+        for websocket in list(connections):
             try:
-                await websocket.send_text(json.dumps(data))
-            except Exception as e:
-                logger.warning(f"Échec envoi WS counter={counter_id}: {e}")
+                await websocket.send_text(message)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Échec envoi WS counter={counter_id} : {e}")
+                dead.add(websocket)
+
+        if dead:
+            connections -= dead
+            if not connections:
                 self.counter_connections.pop(counter_id, None)
 
     # ── Broadcast ─────────────────────────────────────────────────────────────
@@ -330,6 +412,11 @@ class QueueWebSocketManager:
             "clients_by_ticket": len(self.connections_by_ticket),
             "agencies_tracked": len(self.connections_by_agency),
             "counter_connections": len(self.counter_connections),
+            # Nombre d'APPAREILS (pas de tickets) : un client sur téléphone +
+            # tablette compte pour deux. C'est la mesure utile pour dimensionner
+            # le fan-out des messages.
+            "ticket_devices": sum(len(ws_set) for ws_set in self.connections_by_ticket.values()),
+            "counter_devices": sum(len(ws_set) for ws_set in self.counter_connections.values()),
             "total_clients": sum(
                 len(ws_set) for ws_set in self.connections_by_agency.values()
             ),

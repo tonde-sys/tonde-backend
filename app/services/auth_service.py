@@ -11,14 +11,18 @@ Flux secondaire :
 """
 import hashlib
 import logging
+import secrets
 from datetime import datetime, timezone, timedelta
+from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from fastapi import HTTPException, status
 
+from app.models.audit_log import AuditAction
 from app.models.user import User
 from app.models.employee import Employee, EmployeeStatus
 from app.models.refresh_token import RefreshToken
+from app.services.audit_service import AuditService
 from app.core.security import (
     hash_password, verify_password,
     create_access_token, create_refresh_token,
@@ -31,8 +35,11 @@ from app.core.redis import (
     increment_register_attempts, PHONE_REGISTER_MAX, PHONE_BLOCK_SECONDS,
     get_login_block, register_login_failure, clear_login_failures,
     LOGIN_MAX_ATTEMPTS,
+    save_password_reset_token, get_password_reset_user,
+    consume_password_reset_token, invalidate_password_reset_tokens,
 )
 from app.core.config import settings
+from app.services.email_gateway import EmailDeliveryError, send_password_reset_email
 from app.services.sms_gateway import SmsDeliveryError, send_sms
 from app.schemas.auth import (
     RegisterPhoneRequest, VerifyOtpRequest,
@@ -289,7 +296,13 @@ class AuthService:
         return auth_response
 
     # ── Connexion par email ───────────────────────────────────────────────────
-    async def login_email(self, data: LoginEmailRequest) -> AuthResponse:
+    async def login_email(
+        self,
+        data: LoginEmailRequest,
+        *,
+        ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> AuthResponse:
         """
         Connexion email + mot de passe.
 
@@ -305,13 +318,31 @@ class AuthService:
         possible : couper l'accès de toute une agence parce que le cache est
         tombé serait pire que le risque couvert.
 
+        Chaque tentative est journalisée dans `audit_logs` (constat P3-17) :
+        « qui s'est connecté, quand, depuis où » doit être une requête, pas une
+        reconstitution à partir des logs applicatifs — qui ne sont ni immuables
+        ni interrogeables.
+
+        Args:
+            data: Email + mot de passe
+            ip: Adresse IP de l'appelant (X-Forwarded-For compris)
+            user_agent: En-tête User-Agent, tronqué
+
         Raises:
             HTTPException 429: Compte temporairement bloqué
             HTTPException 401: Credentials invalides
             HTTPException 403: Compte désactivé
         """
         email = str(data.email)
-        await self._assert_login_not_blocked(email)
+        try:
+            await self._assert_login_not_blocked(email)
+        except HTTPException:
+            await self._audit_login(
+                action=AuditAction.LOGIN_BLOCKED,
+                email=email, ip=ip, user_agent=user_agent,
+                reason="account_locked",
+            )
+            raise
 
         result = await self.db.execute(
             select(User).where(User.email == data.email)
@@ -320,12 +351,24 @@ class AuthService:
 
         if not user or not verify_password(data.password, user.hashed_password or ""):
             await self._record_login_failure(email)
+            await self._audit_login(
+                action=AuditAction.LOGIN_FAILED,
+                email=email, ip=ip, user_agent=user_agent,
+                user=user,
+                reason="unknown_account" if user is None else "bad_password",
+            )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={"code": "INVALID_CREDENTIALS", "message": "Email ou mot de passe incorrect"},
             )
 
         if not user.is_active:
+            await self._audit_login(
+                action=AuditAction.LOGIN_FAILED,
+                email=email, ip=ip, user_agent=user_agent,
+                user=user,
+                reason="account_disabled",
+            )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"code": "ACCOUNT_DISABLED", "message": "Ce compte est désactivé"},
@@ -339,11 +382,63 @@ class AuthService:
         # Persister le refresh token
         auth_response = await self._create_auth_response(user, device_id=data.device_id if hasattr(data, "device_id") else None)
         await self._persist_refresh_token(user_id=user.id, token=auth_response.refresh_token)
+
+        # commit=False : la ligne d'audit fait partie de la MÊME transaction que
+        # `last_login` et le refresh token. Une connexion réussie sans trace, ou
+        # une trace sans connexion, serait un journal faux.
+        await self._audit_login(
+            action=AuditAction.LOGIN_SUCCEEDED,
+            email=email, ip=ip, user_agent=user_agent,
+            user=user,
+            commit=False,
+        )
         await self.db.commit()
 
         logger.info(f"Connexion email: {data.email} | user_id={user.id}")
 
         return auth_response
+
+    async def _audit_login(
+        self,
+        *,
+        action: str,
+        email: str,
+        ip: str | None,
+        user_agent: str | None,
+        user: User | None = None,
+        reason: str | None = None,
+        commit: bool = True,
+    ) -> None:
+        """
+        Journalise une tentative de connexion. **Ne lève jamais.**
+
+        Une panne du journal d'audit ne doit pas empêcher un agent de se
+        connecter et donc de servir des clients : le journal est une exigence de
+        conformité, pas une dépendance du chemin critique. L'échec est tracé dans
+        les logs applicatifs, avec le niveau ERROR pour être alertable.
+        """
+        extra: dict[str, Any] = {"email": email, "ip": ip, "user_agent": user_agent}
+        if reason:
+            extra["reason"] = reason
+        try:
+            await AuditService(self.db).log(
+                org_id=user.org_id if user else None,
+                action=action,
+                actor_id=user.id if user else None,
+                actor_role=user.role.value if user else None,
+                target_type="session",
+                extra=extra,
+                commit=commit,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Journal d'audit indisponible pour {action} ({email}) : {exc}")
+            # La session peut être inutilisable après l'échec : on la remet en
+            # état pour que la connexion puisse aboutir malgré tout.
+            if commit:
+                try:
+                    await self.db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
 
     # ── Verrouillage par compte — helpers ─────────────────────────────────────
     async def _assert_login_not_blocked(self, email: str) -> None:
@@ -464,6 +559,176 @@ class AuthService:
                 "Mot de passe modifié. Toutes vos sessions ont été fermées, "
                 "reconnectez-vous avec le nouveau mot de passe."
             ),
+            "revoked_sessions": revoked,
+        }
+
+    # ── Mot de passe oublié ───────────────────────────────────────────────────
+
+    async def request_password_reset(
+        self,
+        email: str,
+        *,
+        ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> dict:
+        """
+        Envoie un lien de réinitialisation si le compte existe.
+
+        **Réponse identique dans tous les cas.** Un endpoint qui répondrait
+        « compte inconnu » transformerait le formulaire en outil d'énumération
+        des comptes d'une banque — et les emails staff suivent un motif
+        devinable (prenom.nom@banque.bi). On répond donc toujours la même chose,
+        avec un délai comparable.
+
+        Un compte sans mot de passe (inscription par OTP) reçoit lui aussi la
+        même réponse, mais aucun email : il n'y a rien à réinitialiser, et le
+        lui dire révélerait son mode d'inscription.
+
+        Args:
+            email: Adresse saisie dans le formulaire
+            ip: Adresse IP de l'appelant
+            user_agent: User-Agent, tronqué
+
+        Returns:
+            Toujours {"success": True, "message": …}
+        """
+        normalized = email.strip().lower()
+        result = await self.db.execute(select(User).where(User.email == normalized))
+        user = result.scalar_one_or_none()
+
+        if user is None or not user.is_active or not user.hashed_password:
+            logger.info(
+                f"Réinitialisation demandée pour un compte inexistant/inutilisable ({normalized}) "
+                "— réponse neutre renvoyée"
+            )
+            await self._audit_login(
+                action=AuditAction.PASSWORD_RESET_REQUESTED,
+                email=normalized, ip=ip, user_agent=user_agent,
+                user=None,
+                reason="no_deliverable_account",
+            )
+            return self._neutral_reset_response()
+
+        token = secrets.token_urlsafe(32)
+        ttl_seconds = settings.PASSWORD_RESET_TTL_MINUTES * 60
+        await save_password_reset_token(user.id, token, ttl_seconds)
+
+        link = f"{settings.PASSWORD_RESET_URL}?token={token}"
+        try:
+            await send_password_reset_email(
+                user.email, user.name or "cher utilisateur", link,
+                settings.PASSWORD_RESET_TTL_MINUTES,
+            )
+        except EmailDeliveryError as exc:
+            # L'utilisateur ne doit pas apprendre que l'envoi a échoué (cela
+            # confirmerait l'existence du compte) : on journalise et on répond
+            # la même chose. L'exploitant, lui, voit l'erreur.
+            logger.error(f"Email de réinitialisation non envoyé pour {normalized} : {exc}")
+
+        await self._audit_login(
+            action=AuditAction.PASSWORD_RESET_REQUESTED,
+            email=normalized, ip=ip, user_agent=user_agent,
+            user=user,
+        )
+        return self._neutral_reset_response()
+
+    @staticmethod
+    def _neutral_reset_response() -> dict:
+        """Réponse unique de `forgot-password` — aucune information exploitable."""
+        return {
+            "success": True,
+            "message": (
+                "Si un compte existe pour cette adresse, un lien de réinitialisation "
+                "vient d'être envoyé. Pensez à vérifier vos indésirables."
+            ),
+        }
+
+    async def reset_password(
+        self,
+        token: str,
+        new_password: str,
+        *,
+        ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> dict:
+        """
+        Réinitialise le mot de passe à partir d'un jeton reçu par email.
+
+        Le jeton est à usage unique et expirant (Redis). Après succès :
+          - toutes les sessions sont révoquées (un lien intercepté ne doit pas
+            laisser l'attaquant connecté) ;
+          - le compteur d'échecs de connexion est remis à zéro ;
+          - les autres jetons de l'utilisateur sont invalidés.
+
+        Raises:
+            HTTPException 400: Jeton invalide ou expiré
+            HTTPException 409: Compte sans mot de passe (inscription par OTP)
+        """
+        user_id = await get_password_reset_user(token)
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "INVALID_RESET_TOKEN",
+                    "message": (
+                        "Ce lien de réinitialisation est invalide ou expiré. "
+                        "Demandez-en un nouveau."
+                    ),
+                },
+            )
+
+        user = (
+            await self.db.execute(select(User).where(User.id == user_id))
+        ).scalar_one_or_none()
+        if user is None or not user.is_active:
+            # Compte supprimé ou désactivé entre-temps : le jeton ne doit pas
+            # ressusciter un accès.
+            await consume_password_reset_token(token, user_id)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "INVALID_RESET_TOKEN",
+                    "message": "Ce lien de réinitialisation n'est plus valable.",
+                },
+            )
+
+        if not user.hashed_password:
+            await consume_password_reset_token(token, user_id)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "PASSWORD_NOT_SET",
+                    "message": "Ce compte n'utilise pas de mot de passe (inscription par SMS).",
+                },
+            )
+
+        user.hashed_password = hash_password(new_password)
+        await self.db.flush()
+        revoked = await self._revoke_all_sessions(user.id)
+        await self.db.commit()
+
+        # Le jeton est consommé APRÈS le commit : si la base échoue, le lien
+        # reste utilisable et l'utilisateur peut réessayer.
+        await consume_password_reset_token(token, user_id)
+        await invalidate_password_reset_tokens(user.id)
+
+        if user.email:
+            await self._clear_login_failures(str(user.email))
+
+        await self._audit_login(
+            action=AuditAction.PASSWORD_RESET,
+            email=user.email or "",
+            ip=ip, user_agent=user_agent,
+            user=user,
+        )
+
+        logger.info(
+            f"Mot de passe réinitialisé par lien : user_id={user.id} | "
+            f"{revoked} session(s) révoquée(s)"
+        )
+        return {
+            "success": True,
+            "message": "Mot de passe réinitialisé. Connectez-vous avec le nouveau.",
             "revoked_sessions": revoked,
         }
 

@@ -497,7 +497,7 @@ async def test_personal_events_reach_only_the_ticket_owner(event_type):
     """Régression : seuls your_turn / ticket_called étaient routés ; les autres événements se perdaient."""
     manager = QueueWebSocketManager()
     owner, neighbour = fake_ws(), fake_ws()
-    manager.connections_by_ticket = {"t-owner": owner, "t-neighbour": neighbour}
+    manager.connections_by_ticket = {"t-owner": {owner}, "t-neighbour": {neighbour}}
 
     # Événement tel qu'il arrive de Redis : JSON décodé (type = chaîne simple)
     await manager._dispatch_event({"type": event_type, "ticket_id": "t-owner", "agency_id": "a-1"})
@@ -522,7 +522,7 @@ async def test_room_events_reach_every_client_of_the_branch_only(event_type):
 async def test_queue_snapshot_becomes_individual_updates_without_leaking_others():
     manager = QueueWebSocketManager()
     first, third = fake_ws(), fake_ws()
-    manager.connections_by_ticket = {"t-1": first, "t-3": third}       # t-2 n'est pas connecté ici
+    manager.connections_by_ticket = {"t-1": {first}, "t-3": {third}}       # t-2 n'est pas connecté ici
 
     await manager._dispatch_event({
         "type": "queue_snapshot", "agency_id": "a-1", "service_id": "s-1",
@@ -543,7 +543,7 @@ async def test_queue_snapshot_becomes_individual_updates_without_leaking_others(
 async def test_queue_snapshot_eta_rounds_up_and_ignores_unlisted_tickets():
     manager = QueueWebSocketManager()
     listed, unlisted = fake_ws(), fake_ws()
-    manager.connections_by_ticket = {"t-1": listed, "t-9": unlisted}
+    manager.connections_by_ticket = {"t-1": {listed}, "t-9": {unlisted}}
 
     await manager._dispatch_event({"type": "queue_snapshot", "positions": {"t-1": 2}, "total_in_queue": 2,
                                    "eta_seconds_per_position": 61, "agency_id": "a", "service_id": "s"})

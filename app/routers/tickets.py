@@ -382,8 +382,12 @@ async def websocket_queue(
                 await send_snapshot()
 
     except WebSocketDisconnect:
-        ws_manager.disconnect_client(ticket_id, agency_id)
         logger.info(f"WS déconnecté — ticket={ticket_id}")
+    finally:
+        # Constat P3-9 : on ne retire QUE cette connexion. Avant, la
+        # déconnexion d'un appareil supprimait l'entrée du ticket entier, donc
+        # le suivi du second appareil — silencieusement.
+        ws_manager.disconnect_client(ticket_id, agency_id, websocket)
 
 
 @router.websocket("/ws/counter/{counter_id}")
@@ -396,11 +400,20 @@ async def websocket_counter(
     WebSocket pour le guichetier desktop.
     Reçoit les notifications en temps réel. Nécessite un token valide avec rôle AGENT minimum.
 
-    Sécurité :
-    - Vérifie que le counter_id appartient à l'organisation de l'agent
+    Sécurité (constat P3-10 de l'audit) :
+    - le guichet doit appartenir à l'organisation de l'agent ;
+    - et l'agent doit y être **affecté** : un agent du guichet 1 ne peut pas
+      s'abonner au flux du guichet 7.
+
+    Le contrôle d'affectation existait déjà pour le REST
+    (`TicketService._verify_agent_assignment`) mais pas ici : n'importe quel
+    agent de l'organisation pouvait écouter les événements d'un autre guichet,
+    donc voir les tickets appelés et servis par un collègue.
     """
     from app.core.security import verify_token
     from app.models.counter import Counter
+    from app.models.employee import Employee, EmployeeStatus
+    from app.services.ticket_service import ANY_COUNTER_ROLES
 
     if not await check_ws_rate_limit(websocket):
         await websocket.close(code=4029, reason="Trop de connexions")
@@ -425,6 +438,23 @@ async def websocket_counter(
         if not counter:
             await websocket.close(code=4004, reason="Guichet introuvable dans votre organisation")
             return
+
+        # Affectation : même règle que le REST, appliquée ici.
+        if user.role not in ANY_COUNTER_ROLES:
+            assigned = (await session.execute(
+                select(Employee.id).where(
+                    Employee.user_id == user.id,
+                    Employee.org_id == counter.org_id,
+                    Employee.counter_id == counter.id,
+                    Employee.status == EmployeeStatus.ACTIVE,
+                )
+            )).scalar_one_or_none()
+            if assigned is None:
+                await websocket.close(code=4003, reason="Vous n'êtes pas affecté à ce guichet")
+                logger.warning(
+                    f"WS guichet refusé — agent={user_id} non affecté au counter={counter_id}"
+                )
+                return
         org_id = user.org_id
 
     await ws_manager.connect_counter(websocket, counter_id)
@@ -437,5 +467,7 @@ async def websocket_counter(
             if data == "ping":
                 await websocket.send_text('{"type": "pong"}')
     except WebSocketDisconnect:
-        ws_manager.counter_connections.pop(counter_id, None)
         logger.info(f"WS guichet déconnecté — counter={counter_id}")
+    finally:
+        # Un guichet peut avoir deux écrans : on ne retire que celui qui part.
+        ws_manager.disconnect_counter(counter_id, websocket)

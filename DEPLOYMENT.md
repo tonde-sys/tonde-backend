@@ -95,6 +95,38 @@ par `RUN_MIGRATIONS_ON_STARTUP=true` dans le `docker-entrypoint.sh`.
 6. Vérifier `https://<service>.onrender.com/health` →
    `{"status":"awake","service":"tonde-api"}` (aucune requête base/Redis).
 
+### 3.1 bis. Email sortant et rapport quotidien
+
+Deux fonctions en dépendent : la réinitialisation de mot de passe par email
+(`POST /auth/forgot-password`) et le rapport quotidien (`daily-report --send`).
+
+1. Ajouter dans **Environment** : `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`,
+   `SMTP_PASSWORD`, `SMTP_FROM`, `SUPPORT_EMAIL`, `PASSWORD_RESET_URL`.
+   Le port 465 utilise TLS implicite ; 587 et 25 utilisent STARTTLS.
+2. Sans ces variables, l'application démarre normalement et
+   `forgot-password` répond **200 avec la réponse neutre** — mais aucun email
+   ne part. C'est volontaire : la réponse ne doit pas révéler l'existence d'un
+   compte, donc elle ne peut pas non plus signaler une panne SMTP. La panne est
+   visible dans les logs (`Email de réinitialisation non envoyé pour …`) et par
+   `daily-report --send`, qui échoue avec un code de sortie non nul.
+3. Le rapport quotidien se lance depuis un **cron externe** (Render Cron Job sur
+   plan payant, ou n'importe quel planificateur qui sait lancer une commande
+   dans le conteneur) :
+
+   ```bash
+   python -m app.cli daily-report --send            # hier, toutes les agences
+   python -m app.cli daily-report --date 2026-11-14 --branch ulbu-mutanga-nord
+   python -m app.cli daily-report --send --json     # pour un collecteur de logs
+   ```
+
+   Sans `--send`, la commande affiche le rapport sans rien envoyer. Le
+   destinataire par défaut est `branches.email` ; `--to` le remplace. La journée
+   est calculée en **heure locale** (`REPORT_LOCAL_UTC_OFFSET_HOURS`, défaut 2
+   pour le Burundi), pas en UTC.
+4. Le plan gratuit Render n'offre pas de cron : sur ce plan, le rapport se lance
+   à la main. C'est une raison de plus de passer au plan payant pour le pilote
+   de longue durée (voir §2).
+
 #### Installer la GitHub App Render AVANT de compter sur l'auto-deploy
 
 C'est le piège le plus coûteux de cette mise en place : **un service peut

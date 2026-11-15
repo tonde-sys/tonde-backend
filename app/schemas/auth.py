@@ -116,6 +116,42 @@ class ChangePasswordRequest(BaseModel):
         return _check_password_bytes(v)
 
 
+class ForgotPasswordRequest(BaseModel):
+    """
+    Demande de réinitialisation.
+
+    Volontairement minimal : une adresse. Aucun champ ne permet de distinguer
+    un compte existant d'un compte inconnu, et la réponse ne le fait pas non plus.
+    """
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    """
+    Réinitialisation par jeton reçu par email.
+
+    Mêmes règles de robustesse que `ChangePasswordRequest` : 8 caractères
+    minimum et 72 octets maximum (bcrypt tronque silencieusement au-delà, ce qui
+    donnerait un mot de passe différent de celui saisi sans le dire).
+    """
+    token: str
+    new_password: str
+
+    @field_validator("token")
+    @classmethod
+    def validate_token(cls, v: str) -> str:
+        if len(v) < 20:
+            raise ValueError("Jeton de réinitialisation invalide")
+        return v
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Le nouveau mot de passe doit contenir au moins 8 caractères")
+        return _check_password_bytes(v)
+
+
 # ── Réponse après connexion réussie ──────────────────────────────────────────
 class MembershipInfo(BaseModel):
     """

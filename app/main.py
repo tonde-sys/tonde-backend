@@ -28,6 +28,7 @@ import app.models  # noqa: F401
 
 from app.routers import (
     analytics,
+    audit,
     auth,
     branches,
     counters,
@@ -193,6 +194,7 @@ app.include_router(services_router.router, prefix="/api/v1",               tags=
 app.include_router(public.router,          prefix="/api/v1",               tags=["📺 Public"])
 app.include_router(analytics.router,       prefix="/api/v1/organizations", tags=["📊 Analytics"])
 app.include_router(exports.router,         prefix="/api/v1/organizations", tags=["📤 Exports"])
+app.include_router(audit.router,           prefix="/api/v1/audit",         tags=["📜 Audit"])
 app.include_router(
     counters.router,
     prefix="/api/v1/organizations/{org_id}/branches/{branch_id}/counters",

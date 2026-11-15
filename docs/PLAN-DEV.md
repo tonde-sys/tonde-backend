@@ -128,23 +128,30 @@ couverte par 15 tests dont 2 de bout en bout (JWT + RBAC réels).
 
 ---
 
-## Phase 3 — Sécurité et conformité (ce qu'une banque demandera)
+## Phase 3 — Sécurité et conformité (ce qu'une banque demandera) — ✅ LIVRÉE
 
-| # | Action | Taille | Dépendance |
-|---|---|---|---|
-| 10 | `websocket_counter` : vérifier l'affectation au guichet | S | — |
-| 9 | Un WebSocket par ticket → plusieurs appareils par ticket | M | — |
-| 17 | Audit des connexions (succès/échec) | M | **Migration** : `AuditLog.org_id` doit devenir nullable |
-| 19 | ~~Changement de mot de passe~~ | ✅ fait | — |
-| 6 | ~~Verrouillage par compte~~ | ✅ fait | — |
+| # | Action | État |
+|---|---|---|
+| 10 | `websocket_counter` : vérifier l'affectation au guichet | ✅ code 4003 + tests (5) |
+| 9 | Un WebSocket par ticket → plusieurs appareils par ticket | ✅ ensembles de sockets + tests (6) |
+| 17 | Audit des connexions (succès/échec) | ✅ + migration `009_audit_org_nullable` + tests (8) |
+| 19 | ~~Changement de mot de passe~~ | ✅ fait |
+| 6 | ~~Verrouillage par compte~~ | ✅ fait |
 
-Le n° 17 n'est pas un oubli de l'audit : `AuditLog.org_id` est `NOT NULL` avec
-clé étrangère. Un `super_admin` et un client OTP ont `org_id = NULL`, donc leurs
-connexions ne peuvent pas y être écrites. Il faut une migration — c'est la seule
-de tout ce plan.
+Le n° 17 n'était pas un oubli de l'audit : `AuditLog.org_id` était `NOT NULL`
+avec clé étrangère. Un `super_admin` et un client OTP ont `org_id = NULL`, donc
+leurs connexions ne pouvaient pas y être écrites. La migration `009` rend la
+colonne nullable — c'est la seule migration de tout ce plan.
 
-« Qui s'est connecté, quand, depuis quelle IP » est une question qu'un service
-informatique bancaire posera pendant l'évaluation, pas après la signature.
+Livré au-delà du strict constat : `GET /api/v1/audit/logs` (lecture paginée,
+filtres `action`/`actor_id`/`date_from`/`date_to`, cloisonnée par organisation
+sauf pour un `super_admin`). Un journal qu'on ne peut pas interroger ne sert
+qu'à la case « conforme » d'un questionnaire.
+
+**Décision : l'audit ne bloque jamais une connexion.** Une panne du journal
+n'empêche pas un agent de servir des clients ; l'échec part en `ERROR` dans les
+logs applicatifs. Le journal est une exigence de conformité, pas une dépendance
+du chemin critique.
 
 ---
 
@@ -154,18 +161,47 @@ Ces points ne sont pas des bugs. Ce sont des absences.
 
 | Sujet | État | Taille |
 |---|---|---|
-| **Back-office admin** (`tonde-web`) | Maquette sur données en dur | L |
-| **Distribution desktop** (signature, SmartScreen, auto-update) | Non signé | M |
-| **Facturation / plan** | Aucun modèle d'abonnement | L |
-| **Rapport quotidien** | Données présentes (`queue_logs`), aucun envoi | M |
-| **Mot de passe oublié / email sortant** | Aucun SMTP | M |
+| **Back-office admin** (`tonde-web`) | Maquette sur données en dur — **hors dépôt** | L |
+| **Distribution desktop** (signature, SmartScreen, auto-update) | Non signé — **hors dépôt** | M |
+| **Facturation / plan** | Aucun modèle d'abonnement — **hors dépôt** | L |
+| **Rapport quotidien** | ✅ backend livré (`python -m app.cli daily-report`) | — |
+| **Mot de passe oublié / email sortant** | ✅ livré (`forgot-password`, `reset-password`) | — |
 | ~~Confirmation de présence~~ (`PENDING_ARRIVAL` + QR) | **Abandonnée** (décision 3) | — |
+
+### Ce qui a été livré, et pourquoi ces deux-là d'abord
+
+**Mot de passe oublié + email sortant.** Jusqu'ici, un agent qui perdait son mot
+de passe appelait l'administrateur, qui le régénérait depuis un shell Render.
+Pour une organisation partenaire qui gère elle-même ses guichets, cela veut dire
+qu'aucun agent ne peut se dépanner seul un samedi matin. Livré : passerelle SMTP
+(`smtplib` + `asyncio.to_thread`, aucune dépendance ajoutée), jeton à usage
+unique stocké **haché** dans Redis, consommation qui ferme toutes les sessions,
+et une réponse de `forgot-password` strictement identique que le compte existe
+ou non — sans quoi le formulaire devient un annuaire des agents.
+
+**Rapport quotidien.** `queue_logs` contenait déjà tout ; personne ne le lisait.
+Un gérant d'agence ne se connecte pas à un tableau de bord chaque matin, il lit
+ses emails. Livré : `python -m app.cli daily-report [--date] [--org] [--branch]
+[--send]`, qui construit le rapport depuis `queue_logs` et l'envoie au
+responsable. La journée est **locale** (UTC+2) et l'heure de pointe exprimée en
+heure locale : en UTC, la journée commencerait à 02:00 locales et l'heure de
+pointe serait fausse de deux heures.
+
+Reste à brancher : un cron (Render, plan payant) qui lance `daily-report --send`
+chaque matin. Sur le plan gratuit, aucun cron n'est disponible — d'où le CLI
+plutôt qu'une boucle in-process, qui serait liée à une instance et se
+déclencherait deux fois après un redémarrage.
+
+### Ce qui reste, et qui ne se fait pas ici
 
 Ordre recommandé : **back-office → distribution desktop → facturation**.
 Le back-office d'abord parce que sans lui, chaque nouvelle organisation passe
 par `scripts/create_org.py` et par toi. La distribution ensuite parce qu'un MSI
 non signé déclenche SmartScreen chez le client. La facturation en dernier : elle
 n'a de sens qu'une fois qu'une organisation peut s'inscrire seule.
+
+Les trois vivent hors de ce dépôt (`tonde-web`, chaîne de build desktop, modèle
+d'abonnement) : rien de ce qui précède ne les débloque.
 
 La **confirmation de présence** est écartée. Le problème des tickets pris depuis
 chez soi est traité autrement : appel, puis 180 s pour se présenter, puis
@@ -213,15 +249,25 @@ d'optimiser — l'audit ne l'a pas fait.
 4. **`BOOTSTRAP_PASSWORDS_JSON` sera retiré de Render** une fois le pilote
    stabilisé. En attendant il porte les quatre nouveaux mots de passe, pour
    qu'un bootstrap ne rétablisse pas l'ancien.
+5. **La journée du rapport est locale, pas UTC.** `REPORT_LOCAL_UTC_OFFSET_HOURS`
+   vaut 2 (Burundi, sans heure d'été). Un rapport « du 14 » couvre 22:00 UTC le
+   13 → 22:00 UTC le 14, et l'heure de pointe est exprimée en heure locale. En
+   UTC, la journée commencerait à 02:00 sur place et couperait la matinée.
+   Décalage entier uniquement : un fuseau à demi-heure demanderait `zoneinfo`.
+6. **Le rapport quotidien n'est pas envoyé par une boucle in-process.**
+   `daily-report --send` est prévu pour un cron externe. Une boucle dans le
+   scheduler serait liée à une instance et pourrait envoyer deux fois après un
+   redémarrage ; un CLI est idempotent par construction (on choisit la date).
 
 ## Séquence recommandée, en une ligne
 
-**~~CI Redis → P0-7/5/12 → P1-4~~ (fait) → ~~P1-11/15/16/18 → P1-8 (liste de la
-file)~~ (fait) → P3-10/9/17 → back-office → desktop signé → facturation.**
+**~~CI Redis → P0-7/5/12 → P1-4~~ (fait) → ~~P1-11/15/16/18 → P1-8~~ (fait) →
+~~P3-10/9/17 → mot de passe oublié + rapport quotidien~~ (fait) → back-office →
+desktop signé → facturation.**
 
-Les deux premiers blocs sont livrés : les P0, puis la fiabilité du moteur et la
-supervision. Il reste la sécurité/conformité (P3-10, P3-9, P3-17 — le seul point
-qui demande une migration), puis du produit, pas de la correction.
+Tout ce qui relève de ce dépôt est livré : P0, fiabilité du moteur, supervision,
+sécurité/conformité et les deux fonctions produit qui manquaient. Ce qui reste
+— back-office, distribution desktop, facturation — ne se code pas ici.
 
 ## Journal d'avancement
 
@@ -232,3 +278,19 @@ qui demande une migration), puis du produit, pas de la correction.
 | CI | Correction des tests révélés par la CI (447 passed) | `eaa4a3c` |
 | Phase 1 | P1-11, P2-15, P2-16, P2-18 | `790a01a` |
 | Phase 2 | P1-8 — `GET /tickets/queue` | `790a01a` |
+| Phase 3 | P3-10, P3-9, P3-17 + migration `009_audit_org_nullable` + `GET /audit/logs` | `PENDING` |
+| Phase 4 | Mot de passe oublié (SMTP, jeton usage unique) + `daily-report` | `PENDING` |
+
+### Ce que les phases 3 et 4 ont appris
+
+Deux défauts réels ont été trouvés par les tests, pas par la relecture :
+
+- **Le jeton de réinitialisation était stocké en clair** dans l'index inverse
+  Redis (`tonde:pwdreset_user:{user_id}`), alors que la clé principale n'en
+  gardait que le SHA-256. Un dump Redis livrait les liens directement.
+- **Demander un nouveau lien n'invalidait pas l'ancien.** Le docstring
+  l'affirmait ; le code écrasait l'index sans supprimer le jeton précédent, qui
+  restait valable jusqu'à expiration.
+
+Les deux sont corrigés et couverts. La règle qui en sort : une affirmation en
+commentaire n'est pas une garantie — seul un test l'est.

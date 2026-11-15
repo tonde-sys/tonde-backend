@@ -261,6 +261,88 @@ async def clear_login_failures(email: str) -> None:
     )
 
 
+# ── Helpers Réinitialisation de mot de passe ─────────────────────────────────
+# Un jeton à usage unique, valable PASSWORD_RESET_TTL_MINUTES.
+#
+# Pourquoi Redis et pas une colonne en base : le jeton doit EXPIRER tout seul et
+# ne jamais survivre à un redémarrage mal fait. `SETEX` donne les deux sans
+# tâche de purge à maintenir.
+#
+# On ne stocke que le HASH SHA-256 : si Redis est compromis, les jetons en clair
+# ne sont pas reconstituables — même raisonnement que pour les OTP.
+def _password_reset_key(hashed_token: str) -> str:
+    return f"tonde:pwdreset:{hashed_token}"
+
+
+def _password_reset_user_key(user_id: str) -> str:
+    """Index inverse : le hash du seul jeton actif d'un utilisateur."""
+    return f"tonde:pwdreset_user:{user_id}"
+
+
+async def save_password_reset_token(user_id: str, token: str, ttl_seconds: int) -> None:
+    """
+    Enregistre un jeton de réinitialisation pour un utilisateur.
+
+    Un seul jeton actif par utilisateur : demander un nouveau lien invalide
+    l'ancien. Sans cela, un lien intercepté resterait valable même après que la
+    victime a demandé — et cru remplacer — son lien.
+
+    L'index inverse stocke le **hash**, jamais le jeton en clair : sinon un dump
+    Redis livrerait directement le lien de réinitialisation, ce que le hachage
+    de la clé principale cherche précisément à éviter.
+    """
+    r = await get_redis()
+    hashed = _hash_otp(token)
+
+    # L'ancien jeton est supprimé AVANT l'écriture du nouveau. L'inverse
+    # laisserait deux liens valables simultanément jusqu'à expiration.
+    previous = await r.get(_password_reset_user_key(user_id))
+    if previous:
+        await r.delete(_password_reset_key(previous))
+
+    await r.setex(_password_reset_key(hashed), ttl_seconds, user_id)
+    await r.setex(_password_reset_user_key(user_id), ttl_seconds, hashed)
+
+
+async def get_password_reset_user(token: str) -> Optional[str]:
+    """Retourne l'utilisateur associé au jeton, ou None si expiré/invalide."""
+    r = await get_redis()
+    return await r.get(_password_reset_key(_hash_otp(token)))
+
+
+async def consume_password_reset_token(token: str, user_id: str) -> bool:
+    """
+    Consomme le jeton (usage unique) et nettoie l'index inverse.
+
+    L'index n'est effacé que s'il pointe encore sur CE jeton : consommer un
+    ancien lien ne doit pas effacer la trace d'un lien plus récent, qui reste
+    alors utilisable.
+
+    Returns:
+        True si le jeton était encore valide et vient d'être consommé.
+    """
+    r = await get_redis()
+    hashed = _hash_otp(token)
+    deleted = await r.delete(_password_reset_key(hashed))
+    if await r.get(_password_reset_user_key(user_id)) == hashed:
+        await r.delete(_password_reset_user_key(user_id))
+    return bool(deleted)
+
+
+async def invalidate_password_reset_tokens(user_id: str) -> None:
+    """
+    Invalide tous les jetons en cours d'un utilisateur.
+
+    Appelé après un changement de mot de passe : un lien envoyé avant ne doit
+    plus pouvoir rouvrir le compte.
+    """
+    r = await get_redis()
+    hashed = await r.get(_password_reset_user_key(user_id))
+    if hashed:
+        await r.delete(_password_reset_key(hashed))
+    await r.delete(_password_reset_user_key(user_id))
+
+
 # ── Helpers File d'attente ────────────────────────────────────────────────────
 def _queue_key(org_id: str, agency_id: str, service_id: str) -> str:
     """

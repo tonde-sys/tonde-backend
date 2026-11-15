@@ -9,6 +9,8 @@ Usage :
         --admin-email ... --super-admin-email ... \
         --service "Caisse|A|5" --counter "Guichet 1"
     python -m app.cli reset-password --email agent1@ulbu.bi
+    python -m app.cli daily-report --branch ulbu-mutanga-nord
+    python -m app.cli daily-report --branch ulbu-mutanga-nord --send
 
 Les mots de passe peuvent être fournis par :
   - le champ `password` du fichier (déconseillé) ;
@@ -291,6 +293,108 @@ async def _run_reset_password(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_daily_report(args: argparse.Namespace) -> int:
+    """
+    Construit (et éventuellement envoie) le rapport quotidien des agences.
+
+    Par défaut : la journée d'hier, heure locale, imprimée sans être envoyée.
+    L'envoi demande `--send` explicitement — la même commande sert à relire les
+    chiffres d'hier, et un email parti par accident ne se rappelle pas.
+    """
+    from datetime import date as date_type
+    from datetime import datetime, timedelta, timezone
+
+    from app.core.config import settings
+    from app.services.report_service import (
+        DailyReportService,
+        deliver_reports,
+        render_daily_report,
+    )
+
+    offset = settings.REPORT_LOCAL_UTC_OFFSET_HOURS
+
+    if args.date:
+        try:
+            day = date_type.fromisoformat(args.date)
+        except ValueError as exc:
+            raise BootstrapError(
+                f"Date invalide : '{args.date}' (format attendu AAAA-MM-JJ)"
+            ) from exc
+    else:
+        # « Hier » se calcule en heure locale : à 00h30 UTC le 15, il est 02h30
+        # le 15 à Bujumbura, et la journée à rapporter reste le 14.
+        today_local = (datetime.now(timezone.utc) + timedelta(hours=offset)).date()
+        day = today_local - timedelta(days=1)
+
+    async with AsyncSessionLocal() as db:
+        try:
+            reports = await DailyReportService(db).build_reports(
+                day=day,
+                org_slug=args.org,
+                branch_slug=args.branch,
+            )
+        finally:
+            await engine.dispose()
+
+    if not reports:
+        print(
+            f"Aucune agence active pour le {day.isoformat()}"
+            + (f" (org={args.org})" if args.org else "")
+            + (f" (agence={args.branch})" if args.branch else ""),
+            file=sys.stderr,
+        )
+        return 1
+
+    delivery = await deliver_reports(
+        reports,
+        to=args.to,
+        dry_run=not args.send,
+    )
+
+    if args.json:
+        print(json.dumps(
+            {
+                "date": day.isoformat(),
+                "timezone_offset_hours": offset,
+                "reports": reports,
+                "delivery": delivery,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ))
+    else:
+        for report in reports:
+            print(render_daily_report(report))
+            print()
+
+        if args.send:
+            print("Envoi")
+            labels = {
+                "no_recipient": "aucune adresse email sur l'agence",
+                "smtp_error": "échec SMTP",
+                "dry_run": "simulation",
+            }
+            for result in delivery:
+                if result["sent"]:
+                    if result.get("simulated"):
+                        print(
+                            f"  {result['branch']} : simulé (développement) "
+                            f"→ {result['to']}"
+                        )
+                    else:
+                        print(f"  {result['branch']} : envoyé à {result['to']}")
+                else:
+                    reason = labels.get(result["reason"], result["reason"])
+                    print(f"  {result['branch']} : non envoyé ({reason})")
+        else:
+            print("Rapport affiché seulement. Ajoutez --send pour l'envoyer par email.")
+
+    # Un échec d'envoi doit être visible du cron : code de sortie non nul.
+    if any(result.get("reason") == "smtp_error" for result in delivery):
+        return 1
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m app.cli",
@@ -359,6 +463,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Nouveau mot de passe. Omis → un mot de passe aléatoire est généré et affiché",
     )
     reset.add_argument("--json", action="store_true", help="Sortie JSON")
+
+    report = subparsers.add_parser(
+        "daily-report",
+        help="Rapport quotidien d'une agence (affiché, ou envoyé avec --send)",
+    )
+    report.add_argument(
+        "--date",
+        help="Journée locale visée (AAAA-MM-JJ). Défaut : hier",
+    )
+    report.add_argument("--org", help="Slug de l'organisation (défaut : toutes)")
+    report.add_argument("--branch", help="Slug de l'agence (défaut : toutes)")
+    report.add_argument(
+        "--to",
+        help="Destinataire imposé (défaut : l'email de l'agence)",
+    )
+    report.add_argument(
+        "--send",
+        action="store_true",
+        help="Envoie réellement le rapport (sans ce drapeau, il est seulement affiché)",
+    )
+    report.add_argument("--json", action="store_true", help="Sortie JSON")
     return parser
 
 
@@ -370,6 +495,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_run_bootstrap(args))
         if args.command == "reset-password":
             return asyncio.run(_run_reset_password(args))
+        if args.command == "daily-report":
+            return asyncio.run(_run_daily_report(args))
     except BootstrapError as exc:
         print(f"Erreur de bootstrap : {exc}", file=sys.stderr)
         return 1
