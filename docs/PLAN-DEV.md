@@ -294,3 +294,6 @@ Deux défauts réels ont été trouvés par les tests, pas par la relecture :
 
 Les deux sont corrigés et couverts. La règle qui en sort : une affirmation en
 commentaire n'est pas une garantie — seul un test l'est.
+
+Suite locale : **429 passés, 132 ignorés, 0 échec**. CI : **run #33 verte**
+(2 min 38 s, PostgreSQL 15 + Redis 7 réels), soit 72 tests de plus qu'en phase 2.

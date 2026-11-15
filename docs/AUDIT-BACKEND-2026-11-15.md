@@ -764,6 +764,12 @@ contraire.
 
 ### Preuves d'exécution
 
+Suite locale après les phases 3 et 4 : **429 passés, 132 ignorés, 0 échec**
+(les 132 ignorés sont les tests qui exigent un Redis et un PostgreSQL réels —
+c'est précisément ce que la CI apporte). CI : **run #33 verte en 2 min 38 s**,
+avec `postgres:15-alpine` et `redis:7-alpine`, soit 72 tests de plus qu'en
+phase 2 (19 + 29 + 24).
+
 Le rapport quotidien a été exécuté de bout en bout sur une base SQLite amorcée
 avec une journée type (5 tickets, 2 guichets, 2 services) :
 
