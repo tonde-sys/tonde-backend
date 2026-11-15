@@ -32,6 +32,8 @@ async def _world(db_session):
         sector="bank",
         is_active=True,
         is_open=True,
+        opens_at="00:00",
+        closes_at="23:59",
     )
     db_session.add(branch)
     await db_session.commit()
@@ -165,6 +167,8 @@ async def test_multiple_memberships_are_all_returned(db_session):
         sector="hospital",
         is_active=True,
         is_open=True,
+        opens_at="00:00",
+        closes_at="23:59",
     )
     db_session.add(branch_b)
     await db_session.commit()

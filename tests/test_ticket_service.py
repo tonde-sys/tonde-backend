@@ -54,7 +54,14 @@ async def _create_test_org(db_session) -> Organization:
 
 
 async def _create_test_agency(db_session, org_id: str, is_open: bool = True) -> Branch:
-    """Crée une branch de test."""
+    """
+    Crée une branch de test ouverte en permanence.
+
+    Les horaires sont explicites (00:00 → 23:59) : depuis que `is_branch_open_now`
+    applique réellement la fenêtre `opens_at`/`closes_at` quand `operating_hours`
+    est absent, une branch laissée aux valeurs par défaut (08:00 → 17:00) rendrait
+    les tests dépendants de l'heure à laquelle on les exécute.
+    """
     branch = Branch(
         org_id=org_id,
         name="Agence Centre-ville",
@@ -62,6 +69,8 @@ async def _create_test_agency(db_session, org_id: str, is_open: bool = True) -> 
         sector="bank",
         is_active=True,
         is_open=is_open,
+        opens_at="00:00",
+        closes_at="23:59",
     )
     db_session.add(branch)
     await db_session.commit()

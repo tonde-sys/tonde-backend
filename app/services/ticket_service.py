@@ -127,13 +127,48 @@ def to_epoch_ms(value: datetime) -> int:
     return int(as_utc(value).timestamp() * 1000)
 
 
+def is_within_window(now_hhmm: str, opens: str | None, closes: str | None) -> bool:
+    """
+    Indique si une heure HH:MM tombe dans la fenêtre [opens, closes].
+
+    Les chaînes sont zéro-complétées (HH:MM), donc la comparaison lexicographique
+    est équivalente à la comparaison chronologique.
+
+    Cas particuliers :
+      - `opens == closes` → journée entière (convention « 00:00 → 00:00 ») ;
+      - `opens > closes`  → créneau de nuit (ex. 22:00 → 02:00), qui enjambe minuit ;
+      - valeur absente    → pas de contrainte (ouvert).
+
+    Args:
+        now_hhmm: Heure à tester, format HH:MM
+        opens: Heure d'ouverture, format HH:MM
+        closes: Heure de fermeture, format HH:MM
+    """
+    if not opens or not closes:
+        return True
+    if opens == closes:
+        return True
+    if opens < closes:
+        return opens <= now_hhmm <= closes
+    # Créneau de nuit : ouvert avant minuit OU après minuit
+    return now_hhmm >= opens or now_hhmm <= closes
+
+
 def is_branch_open_now(branch: Branch, now_local: datetime | None = None) -> bool:
     """
     Indique si une branch accepte des tickets à cet instant.
 
-    Conditions : branch active ET ouverte (interrupteur manuel) ET, si des horaires
-    détaillés sont configurés (`operating_hours`), instant compris dans le créneau
-    du jour. Sans `operating_hours`, seul l'interrupteur manuel compte.
+    Conditions, dans l'ordre :
+      1. la branch est active ET ouverte (interrupteur manuel) ;
+      2. si `operating_hours` est configuré, l'instant tombe dans le créneau du jour
+         (un jour absent de `operating_hours` signifie « fermé ce jour-là ») ;
+      3. sinon, l'instant tombe dans la fenêtre globale `opens_at` → `closes_at`.
+
+    Le point 3 est le repli documenté par le modèle (`Branch.operating_hours` :
+    « Si NULL, on utilise opens_at/closes_at comme horaire global »). Il était
+    absent : une branch sans `operating_hours` acceptait des tickets 24 h/24, y
+    compris la nuit et les jours de fermeture, en ignorant complètement les
+    horaires saisis par l'administrateur.
 
     Args:
         branch: La branch à tester
@@ -141,14 +176,18 @@ def is_branch_open_now(branch: Branch, now_local: datetime | None = None) -> boo
     """
     if not (branch.is_active and branch.is_open):
         return False
-    hours = branch.operating_hours
-    if not hours:
-        return True
+
     now_local = now_local or datetime.now(BURUNDI_TZ)
-    slot = hours.get(_WEEKDAYS[now_local.weekday()])
-    if not slot:
-        return False
-    return slot["open"] <= now_local.strftime("%H:%M") <= slot["close"]
+    now_hhmm = now_local.strftime("%H:%M")
+
+    hours = branch.operating_hours
+    if hours:
+        slot = hours.get(_WEEKDAYS[now_local.weekday()])
+        if not slot:
+            return False
+        return is_within_window(now_hhmm, slot.get("open"), slot.get("close"))
+
+    return is_within_window(now_hhmm, branch.opens_at, branch.closes_at)
 
 
 class TicketService:
@@ -189,7 +228,22 @@ class TicketService:
         # Verrou court par utilisateur : deux requêtes simultanées (double tap,
         # retry réseau) ne peuvent pas passer toutes deux le contrôle
         # « 1 seul ticket actif » avant que l'une ait créé son ticket.
-        if not await acquire_ticket_creation_lock(user_id):
+        #
+        # Une panne Redis ne doit pas produire un 500 : la file étant indisponible,
+        # la création l'est aussi — on répond 503 QUEUE_UNAVAILABLE, comme plus bas.
+        try:
+            locked = await acquire_ticket_creation_lock(user_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Verrou de création indisponible (Redis) pour user={user_id}: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "QUEUE_UNAVAILABLE",
+                    "message": "La file d'attente est momentanément indisponible. Réessayez.",
+                },
+            ) from exc
+
+        if not locked:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
@@ -203,7 +257,11 @@ class TicketService:
         try:
             return await self._create_ticket(data, user_id, org_id)
         finally:
-            await release_ticket_creation_lock(user_id)
+            # La libération ne doit jamais masquer le résultat (ou l'erreur) de la création.
+            try:
+                await release_ticket_creation_lock(user_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Verrou de création non libéré pour user={user_id}: {exc}")
 
     async def _create_ticket(
         self, data: CreateTicketRequest, user_id: str, org_id: str | None
@@ -578,6 +636,10 @@ class TicketService:
           - Contrôle du guichet : il doit exister dans l'org et la branch, être actif
             et ouvert ; un AGENT doit y être affecté. Le nom du guichet vient de la
             base, jamais du client.
+          - Un guichet ne peut pas appeler un nouveau ticket tant qu'il traite le
+            précédent (CALLED ou SERVING) : sinon le client en cours restait
+            CALLED sans personne pour le servir, et le scheduler le déclarait
+            ABSENT 3 minutes plus tard alors qu'il était présent.
           - Échéances : l'avertissement et le passage automatique en ABSENT sont
             programmés (ABSENT_WARNING_SECONDS / ABSENT_TIMEOUT_SECONDS).
 
@@ -596,10 +658,15 @@ class TicketService:
             HTTPException 400: Guichet fermé
             HTTPException 403: Agent non affecté à ce guichet
             HTTPException 404: Guichet ou service introuvable dans cette branch/org
+            HTTPException 409: Le guichet traite déjà un client (COUNTER_BUSY)
         """
-        counter = await self._get_callable_counter(counter_id, agency_id, org_id)
+        # Verrou de ligne sur le guichet : deux appels simultanés depuis le même
+        # poste (double clic, deux onglets) ne peuvent pas franchir le contrôle
+        # « guichet libre » tous les deux. Le verrou est relâché au premier commit.
+        counter = await self._get_callable_counter(counter_id, agency_id, org_id, for_update=True)
         await self._verify_agent_assignment(actor, counter)
         await self._get_service(service_id, agency_id, org_id)
+        await self._assert_counter_free(counter)
 
         # Valeurs simples capturées AVANT toute boucle : un rollback expire les objets ORM
         counter_name = counter.name
@@ -1566,6 +1633,12 @@ class TicketService:
         Construit la réponse complète d'un ticket (position, total, ETA).
 
         Auto-réparation : un ticket WAITING absent de Redis est réinséré à sa place d'origine.
+
+        Dégradation : si Redis est indisponible, la position exacte est inconnue mais
+        la lecture ne doit PAS échouer. On renvoie alors la position 0 (inconnue), le
+        nombre d'attente lu en base, et une ETA prudente (comme si le client était le
+        dernier). Avant, une panne Redis transformait toute consultation de ticket en
+        500 — alors que l'écran public, lui, retombait déjà sur PostgreSQL.
         """
         position = 0
         total = 0
@@ -1573,20 +1646,42 @@ class TicketService:
         service = await self._get_service_row(ticket.service_id)
 
         if ticket.status == TicketStatus.WAITING:
-            position = await get_queue_position(
-                ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id
-            )
-            if position == 0:
-                position = await add_to_queue(
-                    ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
-                    PRIORITY_SCORES[ticket.priority],
-                    created_ms=to_epoch_ms(ticket.created_at),
+            try:
+                position = await get_queue_position(
+                    ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id
                 )
-                logger.warning(f"Ticket {ticket.number} absent de Redis : remis en file (auto-réparation)")
-            total = await get_queue_size(ticket.org_id, ticket.agency_id, ticket.service_id)
-            eta = await self.estimate_wait_minutes(service, position)
+                if position == 0:
+                    position = await add_to_queue(
+                        ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
+                        PRIORITY_SCORES[ticket.priority],
+                        created_ms=to_epoch_ms(ticket.created_at),
+                    )
+                    logger.warning(f"Ticket {ticket.number} absent de Redis : remis en file (auto-réparation)")
+                total = await get_queue_size(ticket.org_id, ticket.agency_id, ticket.service_id)
+                eta = await self.estimate_wait_minutes(service, position)
+            except Exception as exc:  # noqa: BLE001 — Redis ne doit jamais casser une lecture
+                logger.warning(
+                    f"File indisponible pour {ticket.number} ({exc}) : position inconnue, "
+                    "repli sur la base"
+                )
+                position = 0
+                total = await self._count_waiting_in_db(ticket.service_id)
+                eta = await self.estimate_wait_minutes(service, total + 1)
 
         return self._to_response(ticket, position=max(0, position), total=total, eta=eta)
+
+    async def _count_waiting_in_db(self, service_id: str) -> int:
+        """Nombre de tickets WAITING d'un service, lu en base (repli quand Redis est absent)."""
+        try:
+            return (await self.db.execute(
+                select(func.count(Ticket.id)).where(
+                    Ticket.service_id == service_id,
+                    Ticket.status == TicketStatus.WAITING,
+                )
+            )).scalar() or 0
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Comptage d'attente en base impossible (service={service_id}): {exc}")
+            return 0
 
     @staticmethod
     def _to_response(ticket: Ticket, *, position: int, total: int, eta: int | None) -> TicketResponse:
@@ -1889,7 +1984,7 @@ class TicketService:
         return await next_ticket_sequence(agency_id, prefix, day, load_seed)
 
     async def _get_callable_counter(
-        self, counter_id: str, agency_id: str, org_id: str
+        self, counter_id: str, agency_id: str, org_id: str, *, for_update: bool = False
     ) -> Counter:
         """
         Récupère un guichet depuis lequel on peut appeler un ticket.
@@ -1897,18 +1992,27 @@ class TicketService:
         Le guichet doit appartenir à l'organisation ET à la branch demandée,
         être actif et ouvert.
 
+        Args:
+            counter_id: Guichet visé
+            agency_id: Branch attendue
+            org_id: Organisation attendue
+            for_update: Pose un verrou de ligne (SELECT … FOR UPDATE) pour sérialiser
+                        deux appels simultanés depuis le même guichet. Sans effet
+                        sur SQLite (tests), qui ne connaît pas cette clause.
+
         Raises:
             HTTPException 404: Guichet introuvable dans cette org/branch
             HTTPException 400: Guichet fermé
         """
-        result = await self.db.execute(
-            select(Counter).where(
-                Counter.id == counter_id,
-                Counter.org_id == org_id,
-                Counter.agency_id == agency_id,
-                Counter.is_active == True,  # noqa: E712
-            )
+        query = select(Counter).where(
+            Counter.id == counter_id,
+            Counter.org_id == org_id,
+            Counter.agency_id == agency_id,
+            Counter.is_active == True,  # noqa: E712
         )
+        if for_update:
+            query = query.with_for_update()
+        result = await self.db.execute(query)
         counter = result.scalar_one_or_none()
         if not counter:
             raise HTTPException(
@@ -1951,6 +2055,47 @@ class TicketService:
                     "message": "Vous n'êtes pas affecté à ce guichet",
                 },
             )
+
+    async def _assert_counter_free(self, counter: Counter) -> None:
+        """
+        Refuse un nouvel appel tant que le guichet traite encore un client.
+
+        `Counter.current_ticket_id` est la seule trace du client en cours au guichet.
+        S'il pointe sur un ticket CALLED ou SERVING, appeler le suivant laisserait ce
+        client sans guichet : il resterait CALLED et serait déclaré ABSENT par le
+        scheduler au bout de ABSENT_TIMEOUT_SECONDS, alors qu'il est présent.
+
+        Un `current_ticket_id` périmé (ticket terminé, annulé, transféré) ne bloque
+        pas : le statut réel est relu en base, jamais supposé.
+
+        Raises:
+            HTTPException 409: Le guichet traite déjà un ticket
+        """
+        if not counter.current_ticket_id:
+            return
+
+        row = (await self.db.execute(
+            select(Ticket.number, Ticket.status).where(Ticket.id == counter.current_ticket_id)
+        )).first()
+        if row is None:
+            return
+
+        number, ticket_status = row
+        if ticket_status not in (TicketStatus.CALLED, TicketStatus.SERVING):
+            return
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "COUNTER_BUSY",
+                "message": (
+                    f"Le guichet traite déjà {number}. Terminez ce ticket, "
+                    "marquez-le absent ou transférez-le avant d'appeler le suivant."
+                ),
+                "ticket_number": number,
+                "ticket_status": ticket_status.value,
+            },
+        )
 
     async def _release_counter(self, ticket: Ticket) -> None:
         """

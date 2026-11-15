@@ -97,6 +97,10 @@ async def _make_branch(db_session, org: Organization, name: str = "Accueil") -> 
         sector="hospital",
         is_active=True,
         is_open=True,
+        # Ouverte en permanence : la fenêtre horaire est désormais appliquée,
+        # et un test ne doit pas dépendre de l'heure d'exécution.
+        opens_at="00:00",
+        closes_at="23:59",
     )
     db_session.add(branch)
     await db_session.commit()

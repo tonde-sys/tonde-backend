@@ -49,6 +49,24 @@ Redis dans le workflow), pas un échec.
 | 17 | P2 | Aucune trace d'audit des connexions (succès/échec) | `auth_service.py` |
 | 18 | P2 | `/health/ready` n'inspecte pas le scheduler | `health_service.py:64` |
 
+### État au 15/11 au soir
+
+Les trois P0 annoncés comme « courts, sans migration » sont corrigés et testés :
+
+| P0 | Correctif | Tests |
+|---|---|---|
+| 1. Guichet occupé | `call_next` refuse un nouvel appel tant que le guichet traite un ticket `CALLED`/`SERVING` → `409 COUNTER_BUSY`, avec verrou de ligne sur le guichet | `tests/test_counter_busy.py` (3) |
+| 2. Horaires ignorés | `is_branch_open_now` applique `opens_at`/`closes_at` quand `operating_hours` est NULL, gère les créneaux de nuit | `tests/test_branch_hours.py` (12) |
+| 3. Redis = 500 | lecture d'un ticket : repli base (position inconnue, total compté en SQL) ; création : `503 QUEUE_UNAVAILABLE` au lieu de 500 | `tests/test_queue_degradation.py` (3) |
+
+Suite complète après correction : **280 passés, 129 ignorés, 0 échec**.
+
+Effet de bord à connaître : les agences dont `operating_hours` est NULL voient
+désormais leur fenêtre `opens_at`/`closes_at` réellement appliquée. ULBU
+(Mutanga-Nord) est configurée `10:00 → 14:00` : elle refusera donc les tickets
+en dehors de ce créneau, ce qui est le comportement attendu mais peut surprendre
+si la valeur était un simple gabarit.
+
 ---
 
 ## P0 — à traiter avant le test partenaire

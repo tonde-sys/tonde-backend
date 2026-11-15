@@ -28,7 +28,6 @@ from app.models.queue_log import QueueLog, QueueLogAction
 from app.models.ticket import Ticket, TicketPriority, TicketStatus
 from app.schemas.ticket import CreateTicketRequest
 from app.services.queue_scheduler import QueueScheduler
-from app.services.ticket_service import is_branch_open_now
 from tests.test_queue_atomicity import (  # noqa: F401  (fixtures importées par nom)
     _call,
     _make_counter,
@@ -692,26 +691,8 @@ async def test_inactive_service_refuses_new_tickets(ticket_service, db_session, 
     assert exc.value.detail["code"] == "SERVICE_INACTIVE"
 
 
-def test_branch_open_now_follows_operating_hours():
-    """Horaires détaillés : ouvert dans le créneau du jour, fermé hors créneau ou jour absent."""
-    branch = Branch(
-        name="B", slug="b", sector="bank", is_active=True, is_open=True,
-        operating_hours={"monday": {"open": "08:00", "close": "17:00"}},
-    )
-    monday_10h = datetime(2026, 11, 9, 10, 0)    # un lundi
-    monday_18h = datetime(2026, 11, 9, 18, 0)
-    tuesday_10h = datetime(2026, 11, 10, 10, 0)  # mardi : absent des horaires
-
-    assert is_branch_open_now(branch, monday_10h) is True
-    assert is_branch_open_now(branch, monday_18h) is False
-    assert is_branch_open_now(branch, tuesday_10h) is False
-
-    branch.operating_hours = None                 # sans horaires : seul l'interrupteur compte
-    assert is_branch_open_now(branch, tuesday_10h) is True
-    branch.is_open = False
-    assert is_branch_open_now(branch, monday_10h) is False
-    branch.is_open, branch.is_active = True, False
-    assert is_branch_open_now(branch, monday_10h) is False
+# Les tests de fenêtre d'ouverture (`is_branch_open_now`) vivent dans
+# tests/test_branch_hours.py : ils sont purs et doivent tourner sans Redis.
 
 
 # ══ INCOMPLETE : requeue / close ══════════════════════════════════════════════
