@@ -230,5 +230,5 @@ qui demande une migration), puis du produit, pas de la correction.
 | Audit | 20 constats, preuves de production, plan | `3e67f8f` → `3878af0` |
 | Phase 0 | P1-7, P0-5, P1-12, P0-4 + décisions 1-4 | `137735b` |
 | CI | Correction des tests révélés par la CI (447 passed) | `eaa4a3c` |
-| Phase 1 | P1-11, P2-15, P2-16, P2-18 | à venir |
-| Phase 2 | P1-8 — `GET /tickets/queue` | à venir |
+| Phase 1 | P1-11, P2-15, P2-16, P2-18 | `790a01a` |
+| Phase 2 | P1-8 — `GET /tickets/queue` | `790a01a` |
