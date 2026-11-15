@@ -278,8 +278,8 @@ sécurité/conformité et les deux fonctions produit qui manquaient. Ce qui rest
 | CI | Correction des tests révélés par la CI (447 passed) | `eaa4a3c` |
 | Phase 1 | P1-11, P2-15, P2-16, P2-18 | `790a01a` |
 | Phase 2 | P1-8 — `GET /tickets/queue` | `790a01a` |
-| Phase 3 | P3-10, P3-9, P3-17 + migration `009_audit_org_nullable` + `GET /audit/logs` | `PENDING` |
-| Phase 4 | Mot de passe oublié (SMTP, jeton usage unique) + `daily-report` | `PENDING` |
+| Phase 3 | P3-10, P3-9, P3-17 + migration `009_audit_org_nullable` + `GET /audit/logs` | `9f2ae62` |
+| Phase 4 | Mot de passe oublié (SMTP, jeton usage unique) + `daily-report` | `9f2ae62` |
 
 ### Ce que les phases 3 et 4 ont appris
 
