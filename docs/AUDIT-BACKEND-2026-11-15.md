@@ -66,7 +66,7 @@ qu'aucun utilisateur ne peut changer lui-même.
 
 ### État d'avancement
 
-Vue unique, à jour au 15/11/2026 14:45. ✅ = corrigé **et** couvert par des
+Vue unique, à jour au 15/11/2026 16:05. ✅ = corrigé **et** couvert par des
 tests ; ⬜ = rien n'a été fait, le constat reste vrai.
 
 | # | Constat | État | Preuve |
@@ -74,15 +74,15 @@ tests ; ⬜ = rien n'a été fait, le constat reste vrai.
 | 1 | Un 2ᵉ appel au même guichet abandonne le client en cours | ✅ | `tests/test_counter_busy.py` (3) |
 | 2 | `is_branch_open_now` ignore `opens_at`/`closes_at` | ✅ | `tests/test_branch_hours.py` (12) |
 | 3 | Redis indisponible → 500 sur la lecture d'un ticket | ✅ | `tests/test_queue_degradation.py` (3) |
-| 4 | Expiration 12 h : annule des tickets encore en file | ⬜ | — |
-| 5 | `deactivate` retire rôle + `org_id` sans vérifier les autres rattachements | ⬜ | — |
+| 4 | Expiration 12 h : annule des tickets encore en file | ✅ | `tests/test_phase0_corrections.py` (4) |
+| 5 | `deactivate` retire rôle + `org_id` sans vérifier les autres rattachements | ✅ | `tests/test_phase0_corrections.py` (2) |
 | 6 | Aucun verrouillage par compte sur `POST /auth/login` | ✅ | `tests/test_login_lockout.py` (11) |
-| 7 | Fermer un guichet laisse le ticket CALLED orphelin | ⬜ | — |
+| 7 | Fermer un guichet laisse le ticket CALLED orphelin | ✅ | `tests/test_phase0_corrections.py` (3) |
 | 8 | Aucun endpoint pour lister la file côté staff | ⬜ | — |
 | 9 | Un seul WebSocket par ticket | ⬜ | — |
 | 10 | `websocket_counter` : aucun contrôle d'affectation | ⬜ | — |
 | 11 | `return_to_queue` sans repli si Redis échoue | ⬜ | — |
-| 12 | `GET /tickets/history` renvoie `position: 0` | ⬜ | — |
+| 12 | `GET /tickets/history` renvoie `position: 0` | ✅ | `tests/test_phase0_corrections.py` (2) |
 | 13 | Préfixe de service unique seulement entre services actifs | ⬜ | — |
 | 14 | `get_branch_display` : N+1 requêtes | ⬜ | — |
 | 15 | Création : `get_queue_size` dans le même `try` que `add_to_queue` | ⬜ | — |
@@ -92,7 +92,7 @@ tests ; ⬜ = rien n'a été fait, le constat reste vrai.
 | 19 | Aucun endpoint de changement de mot de passe | ✅ | `tests/test_change_password.py` (11) + `tests/test_cli_reset_password.py` (5) |
 | 20 | Mot de passe partagé par 4 comptes, écrit en clair | ✅ | rotation exécutée le 15/11 15:03, 4 mots de passe distincts |
 
-**6 constats sur 20 sont traités, 14 restent ouverts.** Les 14 restants sont
+**10 constats sur 20 sont traités, 10 restent ouverts.** Les 10 restants sont
 documentés ci-dessous avec leur correctif ; aucun n'est bloquant pour le test
 partenaire. La séquence d'exécution est dans `docs/PLAN-DEV.md`.
 
@@ -117,7 +117,7 @@ Les trois P0 annoncés comme « courts, sans migration » sont corrigés et test
 | 2. Horaires ignorés | `is_branch_open_now` applique `opens_at`/`closes_at` quand `operating_hours` est NULL, gère les créneaux de nuit | `tests/test_branch_hours.py` (12) |
 | 3. Redis = 500 | lecture d'un ticket : repli base (position inconnue, total compté en SQL) ; création : `503 QUEUE_UNAVAILABLE` au lieu de 500 | `tests/test_queue_degradation.py` (3) |
 
-Suite complète après les deux lots : **307 passés, 129 ignorés, 0 échec**.
+Suite complète après les trois lots : **318 passés, 129 ignorés, 0 échec**.
 
 Effet de bord à connaître : les agences dont `operating_hours` est NULL voient
 désormais leur fenêtre `opens_at`/`closes_at` réellement appliquée. ULBU
@@ -213,7 +213,7 @@ Correctif : envelopper les lectures de position dans un `try/except`, retourner
 `position=0` et `total=0` (l'information est cosmétique), et déplacer l'acquisition
 du verrou dans le `try` pour retomber sur le 503.
 
-### 4. L'expiration à 12 h annule des tickets encore en file — ⬜ non traité
+### 4. L'expiration à 12 h annule des tickets encore en file — ✅ corrigé
 
 `expire_stale_tickets` (`ticket_service.py:1112-1121`) applique :
 
@@ -235,7 +235,19 @@ Correctif minimal : ne jamais expirer un ticket dont la position est ≤ N, et
 notifier avant annulation. Correctif propre : expirer à la fermeture de
 l'agence, pas sur une durée fixe.
 
-### 5. `deactivate` casse les rattachements multiples — ⬜ non traité
+**Correctif livré (décision de l'exploitant : la fermeture).**
+`expire_stale_tickets` applique désormais `_expire_waiting_of_closed_branches` :
+tout ticket `WAITING` dont l'agence est fermée est clos — aucun nouveau ticket
+ne peut être créé hors horaires, donc c'est un reste de la journée que personne
+ne viendra appeler. Chaque annulation publie `TICKET_EXPIRED` et envoie une
+notification avec le motif ; avant, le ticket disparaissait en silence.
+
+`WAITING_TICKET_TTL_HOURS` passe de 12 à 72 h et devient un **filet de
+sécurité** pour une agence qui ne ferme jamais (horaires mal réglés). Ce n'est
+plus la règle : sur une agence ouverte plus de douze heures, l'ancienne règle
+annulait des tickets en pleine journée.
+
+### 5. `deactivate` casse les rattachements multiples — ✅ corrigé
 
 `employee_service.py:344-351` :
 
@@ -252,6 +264,10 @@ Aujourd'hui l'API bloque la création multi-org (`employee_service.py:125-132`),
 donc le cas est latent — mais le bootstrap et les données existantes peuvent le
 produire, et la correction est de trois lignes : ne rétrograder le `User` que si
 `select(count(Employee)).where(user_id=…, status=ACTIVE)` vaut zéro.
+
+**Correctif livré.** Le comptage est fait après `flush()` de la désactivation,
+en excluant la ligne courante. Si un autre `Employee` reste `ACTIVE`, le `User`
+conserve son `role` et son `org_id`, et un log le signale.
 
 ---
 
@@ -305,12 +321,22 @@ Redis réel et non d'une constante codée en dur. `POST /auth/change-password`
 répond `403 Not authenticated` sans jeton sur le service en ligne, ce qui
 confirme que la route est bien déployée (un 404 signifierait l'inverse).
 
-### 7. Fermer un guichet laisse le client appelé en plan
+### 7. Fermer un guichet laisse le client appelé en plan — ✅ corrigé
 
 `counter_service.py:300-301` met `is_open = False` et `current_ticket_id = None`
 sans toucher au ticket `CALLED`. Le client est déclaré absent 180 s plus tard
 alors que c'est le guichet qui a fermé. Il faudrait soit remettre le ticket en
 file, soit le transférer, soit au minimum notifier.
+
+**Correctif livré.** `close()` et `delete()` appellent
+`TicketService.requeue_after_counter_close` avant de libérer le guichet : le
+ticket repasse en `WAITING`, perd son `counter_id` / `called_at` (donc
+l'échéance d'absence cesse de courir) et retrouve **sa place d'origine** — le
+score de file utilise `created_at`, pas l'heure de réinsertion. Deux
+transitions ont été ajoutées à la machine à états : `CALLED → WAITING` et
+`SERVING → WAITING`, sans lesquelles ce retour est impossible.
+La remise en file est non bloquante : si elle échoue, la fermeture aboutit
+quand même et le scheduler rattrape le ticket.
 
 ### 8. Aucun endpoint pour lister la file
 
@@ -348,12 +374,17 @@ le ticket est `WAITING` en base mais absent de la file. Le client reste bloqué
 par la règle « 1 ticket actif » jusqu'à ce que quelqu'un appelle `call_next` ou
 lise son ticket (auto-réparation). Sur une agence sans activité, cela peut durer.
 
-### 12. `get_history` renvoie une position nulle
+### 12. `get_history` renvoie une position nulle — ✅ corrigé
 
 `ticket_service.py:451-454` construit chaque item avec `position=0, total=0`.
 Un ticket encore `WAITING` apparaît donc « position 0 » dans l'historique, ce qui
 est faux et trompeur côté mobile. Soit calculer la position réelle pour les
 tickets actifs, soit exposer `null` pour dire « non applicable ».
+
+**Correctif livré.** La position et la taille réelles sont calculées pour les
+tickets `WAITING` ; Redis n'est pas interrogé pour un ticket terminé (aucun sens,
+et 20 appels évités par page). En cas de panne Redis, la position retombe à 0
+avec un log — l'historique ne doit jamais échouer à cause du cache.
 
 ### 19. Aucun endpoint de changement de mot de passe — ✅ corrigé
 

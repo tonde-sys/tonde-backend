@@ -140,7 +140,8 @@ async def test_transfer_validation_errors(ticket_service, db_session, real_redis
     org, agency, service, counter, agent = await _world(db_session)
     inactive = await _make_service(db_session, org.id, agency.id, "C", "Fermé", active=False)
     other_branch = Branch(org_id=org.id, name="Annexe", slug="annexe-t", sector="bank",
-                          is_active=True, is_open=True)
+                          is_active=True, is_open=True,
+                          opens_at="00:00", closes_at="23:59")
     db_session.add(other_branch)
     await db_session.commit()
     foreign = await _make_service(db_session, org.id, other_branch.id, "D", "Ailleurs")
@@ -266,7 +267,8 @@ async def test_priority_decision_errors(ticket_service, db_session, real_redis):
     """Rien à rejeter/approuver → 400 ; ticket non WAITING → 400 ; autre branch → 403."""
     org, agency, service, counter, agent = await _world(db_session)
     other_branch = Branch(org_id=org.id, name="Annexe", slug="annexe-p", sector="bank",
-                          is_active=True, is_open=True)
+                          is_active=True, is_open=True,
+                          opens_at="00:00", closes_at="23:59")
     db_session.add(other_branch)
     await db_session.commit()
     other_counter = await _make_counter(db_session, org.id, other_branch.id, name="Annexe 1")
@@ -340,9 +342,17 @@ async def test_scheduler_does_not_mark_absent_before_timeout_or_after_presence(
     org, agency, service, counter, agent = await _world(db_session)
     waiting = await _new_ticket(ticket_service, agency, service, "client-1")
     present = await _new_ticket(ticket_service, agency, service, "client-2")
-    await _call(ticket_service, org, agency, service, counter, agent)   # appelle `waiting`
-    await _call(ticket_service, org, agency, service, counter, agent)   # appelle `present`
-    await ticket_service.start_serving(present.id, agent)               # client 2 s'est présenté
+
+    # Deux clients appelés en même temps ⇒ deux guichets. Un seul guichet ne peut
+    # pas avoir deux tickets CALLED : le second appel renvoie 409 COUNTER_BUSY
+    # (correctif P0-1), et c'est précisément ce qui protège le premier client.
+    counter2 = await _make_counter(db_session, org.id, agency.id, name="Guichet 2")
+    agent2 = await _make_staff(db_session, org.id, UserRole.AGENT,
+                               counter_id=counter2.id, agency_id=agency.id)
+
+    await _call(ticket_service, org, agency, service, counter, agent)    # appelle `waiting`
+    await _call(ticket_service, org, agency, service, counter2, agent2)  # appelle `present`
+    await ticket_service.start_serving(present.id, agent2)               # client 2 s'est présenté
 
     early = await _scheduler(db_engine).run_once(now_ts=time.time() + 10)
     assert early["absent"] == 0
@@ -759,7 +769,8 @@ async def test_staff_return_to_queue_is_scoped_to_branch(ticket_service, db_sess
     """Un agent remet en file un ticket ABSENT de sa branch ; pas celui d'une autre branch."""
     org, agency, service, counter, agent = await _world(db_session)
     other_branch = Branch(org_id=org.id, name="Annexe", slug="annexe-r", sector="bank",
-                          is_active=True, is_open=True)
+                          is_active=True, is_open=True,
+                          opens_at="00:00", closes_at="23:59")
     db_session.add(other_branch)
     await db_session.commit()
     other_counter = await _make_counter(db_session, org.id, other_branch.id, name="Annexe 1")

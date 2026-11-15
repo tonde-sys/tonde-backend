@@ -75,8 +75,11 @@ async def make_org(db, slug: str | None = None) -> Organization:
 
 
 async def make_branch(db, org_id: str, name: str = "Agence Centre", is_open: bool = True) -> Branch:
+    # Horaires explicites : sans eux le modèle applique 08:00-17:00 et les tests
+    # dépendraient de l'heure à laquelle la CI tourne.
     branch = Branch(org_id=org_id, name=name, slug=f"b-{uuid.uuid4().hex[:8]}", sector="bank",
-                    is_active=True, is_open=is_open)
+                    is_active=True, is_open=is_open,
+                    opens_at="00:00", closes_at="23:59")
     db.add(branch)
     await db.commit()
     await db.refresh(branch)

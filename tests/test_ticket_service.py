@@ -367,6 +367,8 @@ async def test_one_active_ticket_global_rule(ticket_service, db_session, mock_qu
         sector="bank",
         is_active=True,
         is_open=True,
+        opens_at="00:00",
+        closes_at="23:59",
     )
     db_session.add(agency_b)
     await db_session.commit()

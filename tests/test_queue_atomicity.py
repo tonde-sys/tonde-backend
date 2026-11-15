@@ -433,7 +433,8 @@ async def test_call_next_counter_of_other_branch_or_org_is_not_found(
 
     # Guichet de la même org mais d'une autre branch
     sibling_agency = Branch(org_id=org.id, name="Annexe", slug="annexe-xyz", sector="bank",
-                            is_active=True, is_open=True)
+                            is_active=True, is_open=True,
+                            opens_at="00:00", closes_at="23:59")
     db_session.add(sibling_agency)
     await db_session.commit()
     sibling_counter = await _make_counter(db_session, org.id, sibling_agency.id)
@@ -447,7 +448,8 @@ async def test_call_next_service_of_other_branch_is_not_found(ticket_service, db
     """Un service qui n'appartient pas à la branch du guichet est refusé (404)."""
     org, agency, service, counter, agent = await _world(db_session)
     sibling_agency = Branch(org_id=org.id, name="Annexe", slug="annexe-svc", sector="bank",
-                            is_active=True, is_open=True)
+                            is_active=True, is_open=True,
+                            opens_at="00:00", closes_at="23:59")
     db_session.add(sibling_agency)
     await db_session.commit()
     foreign_service = await _create_test_service(db_session, sibling_agency.id, org.id)
