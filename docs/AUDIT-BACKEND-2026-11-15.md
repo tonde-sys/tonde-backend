@@ -287,6 +287,24 @@ parce que le cache est tombé serait pire que le risque couvert. Il est testé
 explicitement (`test_redis_en_panne_ne_bloque_pas_la_connexion`), pas laissé
 implicite.
 
+**Vérifié en production le 15/11/2026, déploiement `dep-dbsqls15efls73f270cg`**
+(sur un email inexistant, pour ne verrouiller aucun compte réel) :
+
+```
+tentative 1: HTTP 401 | INVALID_CREDENTIALS
+tentative 2: HTTP 401 | INVALID_CREDENTIALS
+tentative 3: HTTP 401 | INVALID_CREDENTIALS
+tentative 4: HTTP 401 | INVALID_CREDENTIALS
+tentative 5: HTTP 401 | INVALID_CREDENTIALS
+tentative 6: HTTP 429 | ACCOUNT_LOCKED | retry_after=59
+tentative 7: HTTP 429 | ACCOUNT_LOCKED | retry_after=56
+```
+
+Le `retry_after` qui décroît (59 puis 56) prouve que la valeur vient du TTL
+Redis réel et non d'une constante codée en dur. `POST /auth/change-password`
+répond `403 Not authenticated` sans jeton sur le service en ligne, ce qui
+confirme que la route est bien déployée (un 404 signifierait l'inverse).
+
 ### 7. Fermer un guichet laisse le client appelé en plan
 
 `counter_service.py:300-301` met `is_open = False` et `current_ticket_id = None`
