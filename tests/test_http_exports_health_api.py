@@ -325,7 +325,15 @@ async def test_basic_live_and_ready_probes_are_public(api, db_session):
     assert ready.status_code == 200 and ready.json()["status"] == "ready"
     assert ready.json()["checks"]["redis"]["latency_ms"] is not None
     assert status.status_code == 200 and status.json()["status"] == "ok"
-    assert status.json()["services"] == {"api": "ok", "redis": "ok", "database": "ok"}
+    services = status.json()["services"]
+    assert services["api"] == "ok"
+    assert services["redis"] == "ok"
+    assert services["database"] == "ok"
+    # Le scheduler est rapporté depuis P2-18. Dans les tests, le lifespan n'est
+    # pas exécuté : `app.state.scheduler` est absent, donc l'état est neutre
+    # `not_wired` — rapporté, mais sans dégrader la sonde.
+    assert services["scheduler"] in {"healthy", "not_wired", "disabled", "starting"}
+    assert ready.json()["checks"]["scheduler"]["status"] == "not_wired"
 
 
 @pytest.mark.asyncio
@@ -361,6 +369,37 @@ async def test_readiness_returns_503_when_redis_is_down_but_wake_and_liveness_st
     assert status.json()["services"]["redis"] == "error"
     assert health.status_code == 200 and health.json()["status"] == "awake"
     assert live.status_code == 200, "le processus vit : Kubernetes ne doit pas le redémarrer pour une panne Redis"
+
+
+@pytest.mark.asyncio
+async def test_readiness_returns_503_when_scheduler_is_dead(api, db_session):
+    """
+    Constat P2-18 : un scheduler mort doit sortir l'instance du load balancer.
+
+    Sans ce contrôle, le service restait « ready » alors que plus aucun ticket
+    `CALLED` ne passait en `ABSENT` : panne silencieuse jusqu'au premier client
+    bloqué au guichet. Sur Render, le 503 provoque un redémarrage, et `warm_up`
+    reconstruit files et échéances.
+    """
+    from app.main import app
+
+    class _DeadScheduler:
+        is_running = False
+        last_run_at = None
+        last_error = "boucle terminée"
+
+    app.state.scheduler = _DeadScheduler()
+    try:
+        ready = await api.get("/health/ready")
+        status = await api.get("/health/status")
+    finally:
+        del app.state.scheduler
+
+    assert ready.status_code == 503 and ready.json()["status"] == "not_ready"
+    assert ready.json()["checks"]["scheduler"]["status"] == "unhealthy"
+    assert ready.json()["checks"]["scheduler"]["error"] == "loop_stopped"
+    assert status.status_code == 503
+    assert status.json()["services"]["scheduler"] == "unhealthy"
 
 
 @pytest.mark.asyncio
