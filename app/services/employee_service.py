@@ -11,6 +11,7 @@ Pattern : Router → Service → Model
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from fastapi import HTTPException
+import logging
 
 from app.models.branch import Branch
 from app.models.counter import Counter
@@ -22,6 +23,8 @@ from app.schemas.employee import (
     EmployeeResponse,
     EmployeeListResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class EmployeeService:
@@ -317,7 +320,11 @@ class EmployeeService:
     async def deactivate(self, employee_id: str, org_id: str) -> None:
         """
         Désactive un employé (soft delete).
-        Remet le User au rôle CLIENT.
+
+        Le User repasse au rôle CLIENT **uniquement s'il ne lui reste aucun
+        autre rattachement actif** : un utilisateur peut être admin d'une
+        organisation et agent d'une autre, et retirer l'un ne doit pas retirer
+        l'autre.
 
         Args:
             employee_id: UUID de l'employé
@@ -340,14 +347,34 @@ class EmployeeService:
             )
 
         employee.status = EmployeeStatus.INACTIVE
+        await self.db.flush()
 
-        # Remettre le User au rôle CLIENT
+        # Ne rétrograder le User que s'il ne lui reste AUCUN autre rattachement actif.
+        # Le modèle Employee autorise plusieurs lignes par utilisateur (une par
+        # organisation) et `get_memberships` renvoie une liste : retirer un
+        # rattachement ne doit pas retirer le rôle staff obtenu ailleurs.
+        # Avant ce correctif (P0-5), l'utilisateur perdait `role` et `org_id`
+        # même s'il restait admin d'une autre organisation.
+        others = await self.db.execute(
+            select(func.count(Employee.id)).where(
+                Employee.user_id == employee.user_id,
+                Employee.id != employee.id,
+                Employee.status == EmployeeStatus.ACTIVE,
+            )
+        )
+        remaining = others.scalar() or 0
+
         user_result = await self.db.execute(
             select(User).where(User.id == employee.user_id)
         )
         user = user_result.scalar_one_or_none()
-        if user:
+        if user and remaining == 0:
             user.role = UserRole.CLIENT
             user.org_id = None
+        elif user:
+            logger.info(
+                f"Utilisateur {user.id} conservé en {user.role.value} : "
+                f"{remaining} autre(s) rattachement(s) actif(s)"
+            )
 
         await self.db.commit()

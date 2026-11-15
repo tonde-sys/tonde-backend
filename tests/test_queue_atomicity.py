@@ -308,8 +308,16 @@ async def test_call_next_serves_each_ticket_once_in_order(ticket_service, db_ses
     await db_session.refresh(counter)
     assert counter.current_ticket_id == t1.id
 
+    # Le guichet doit être libéré avant l'appel suivant : un second appel sans
+    # terminer le premier renverrait 409 COUNTER_BUSY (correctif P0-1 de l'audit).
+    await ticket_service.start_serving(t1.id, agent)
+    await ticket_service.complete_ticket(t1.id, agent)
+
     second = await _call(ticket_service, org, agency, service, counter, agent)
     assert second["ticket_id"] == t2.id
+
+    await ticket_service.start_serving(t2.id, agent)
+    await ticket_service.complete_ticket(t2.id, agent)
 
     third = await _call(ticket_service, org, agency, service, counter, agent)
     assert third["success"] is False
@@ -474,6 +482,11 @@ async def test_call_next_skips_stale_queue_entries(ticket_service, db_session, r
     result = await _call(ticket_service, org, agency, service, counter, agent)
 
     assert result["ticket_id"] == real.id
+
+    # Libérer le guichet avant de rappeler (sinon 409 COUNTER_BUSY, correctif P0-1).
+    await ticket_service.start_serving(real.id, agent)
+    await ticket_service.complete_ticket(real.id, agent)
+
     # Le fantôme est purgé ; le ticket annulé reste en file mais ne sera jamais appelé
     second = await _call(ticket_service, org, agency, service, counter, agent)
     assert second["success"] is False

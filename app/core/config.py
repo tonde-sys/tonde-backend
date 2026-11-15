@@ -88,8 +88,12 @@ class Settings(BaseSettings):
     ABSENT_WARNING_SECONDS: int = 120
     # Un client ABSENT peut revenir en file pendant cette fenêtre, ensuite son ticket est clos.
     ABSENT_RETURN_WINDOW_MINUTES: int = 30
-    # Un ticket jamais appelé est clos après ce délai (évite de bloquer le client).
-    WAITING_TICKET_TTL_HOURS: int = 12
+    # Filet de sécurité — PAS la règle d'expiration.
+    # Un ticket WAITING est normalement clos à la FERMETURE de son agence (voir
+    # TicketService.expire_stale_tickets). Ce délai ne sert qu'à rattraper un
+    # ticket oublié sur une agence qui ne ferme jamais (horaires mal configurés) :
+    # il doit donc être large, sinon il annule des tickets en pleine journée.
+    WAITING_TICKET_TTL_HOURS: int = 72
     # Un ticket SERVING oublié par l'agent passe INCOMPLETE après ce délai.
     SERVING_TICKET_TTL_HOURS: int = 6
     # Un ticket INCOMPLETE non résolu est clos après ce délai.

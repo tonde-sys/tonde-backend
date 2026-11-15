@@ -18,12 +18,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.branch import Branch
 from app.models.counter import Counter
+from app.models.ticket import Ticket
 from app.schemas.counter import (
     CounterListResponse,
     CounterResponse,
     CreateCounterRequest,
     UpdateCounterRequest,
 )
+from app.services.ticket_service import TicketService
 from app.websocket.events import EventType
 from app.websocket.publisher import publish_event
 
@@ -298,11 +300,39 @@ class CounterService:
             )
 
         counter.is_open = False
+        # Le client appelé ne doit pas être abandonné parce que le guichet ferme.
+        await self._release_called_ticket(counter)
         counter.current_ticket_id = None
         await self.db.commit()
         await self.db.refresh(counter)
         await self._announce(counter, EventType.COUNTER_CLOSE)
         return CounterResponse.model_validate(counter)
+
+    async def _release_called_ticket(self, counter: Counter) -> None:
+        """
+        Remet en file le ticket que le guichet était en train de traiter.
+
+        Sans cela (P1-7 de l'audit), fermer un guichet laissait le ticket
+        CALLED orphelin : plus personne ne le servait, et le scheduler le
+        passait en ABSENT 180 s plus tard alors que le client était présent.
+
+        Non bloquant : si la remise en file échoue, la fermeture du guichet
+        doit aboutir quand même — le scheduler rattrapera le ticket.
+        """
+        if not counter.current_ticket_id:
+            return
+        ticket = (await self.db.execute(
+            select(Ticket).where(Ticket.id == counter.current_ticket_id)
+        )).scalar_one_or_none()
+        if ticket is None:
+            return
+        try:
+            await TicketService(self.db).requeue_after_counter_close(ticket)
+        except Exception as exc:
+            logger.error(
+                f"Ticket {ticket.number} non remis en file à la fermeture du guichet "
+                f"{counter.name}: {exc}"
+            )
 
     async def delete(
         self, counter_id: str, org_id: str, agency_id: str | None = None
@@ -321,8 +351,10 @@ class CounterService:
         counter = await self._get_counter(counter_id, org_id, agency_id)
 
         was_open = counter.is_open
+        await self._release_called_ticket(counter)
         counter.is_open = False
         counter.is_active = False
+        counter.current_ticket_id = None
         await self.db.commit()
         if was_open:
             await self._announce(counter, EventType.COUNTER_CLOSE)

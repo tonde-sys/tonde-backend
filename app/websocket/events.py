@@ -25,6 +25,7 @@ class EventType(str, Enum):
     TICKET_ABSENT      = "ticket_absent"      # Client non-présent (notif personnelle)
     TICKET_TRANSFERRED = "ticket_transferred" # Ticket transféré (notif personnelle)
     TICKET_DONE        = "ticket_done"        # Service terminé (notif personnelle)
+    TICKET_EXPIRED     = "ticket_expired"     # Ticket annulé (fermeture de l'agence, TTL dépassé)
 
     # ── Événements file ──────────────────────────────────────
     QUEUE_UPDATE       = "queue_update"       # Position/ETA mis à jour (notif personnelle)

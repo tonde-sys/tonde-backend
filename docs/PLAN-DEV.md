@@ -2,6 +2,8 @@
 
 Source : `AUDIT-BACKEND-2026-11-15.md` (20 constats) + fonctions manquantes.
 État de départ : **5 corrigés, 1 outillé, 14 ouverts.**
+État au 15/11 16:00 : **phase 0 livrée, plus P0-4 (expiration à la fermeture).**
+Les quatre décisions bloquantes ont été tranchées (voir la fin du document).
 
 Ce plan n'est pas une liste de courses. Il est ordonné par **ce qui peut casser
 pendant le test partenaire**, puis par **ce qui bloque une vente**, puis par la
@@ -18,23 +20,27 @@ Tailles : **S** ≈ quelques heures, **M** ≈ 1 à 2 jours, **L** ≈ 3 jours e
 
 ---
 
-## Phase 0 — Avant que le partenaire touche le système
+## Phase 0 — Avant que le partenaire touche le système — ✅ LIVRÉE
 
 Objectif : ne pas griller le test sur un détail visible en dix minutes.
 
-| # | Action | Taille | Pourquoi maintenant |
+| # | Action | Taille | État |
 |---|---|---|---|
 | 20 | Rotation des 4 comptes ULBU | ✅ fait | Mot de passe présent dans l'historique Git |
-| — | Trancher la fenêtre ULBU `10:00 → 14:00` | S | Désormais réellement appliquée : hors créneau, aucun ticket n'est délivré |
-| 7 | Fermer un guichet ne doit pas abandonner le client appelé | S | Pendant un test, un agent ferme son guichet : le client est marqué absent alors qu'il est présent |
-| 5 | `deactivate` ne rétrograde que s'il ne reste aucun rattachement actif | S | 3 lignes, évite de casser un compte multi-organisations |
-| 12 | `history` : `position` réelle ou `null`, jamais `0` | S | Le mobile affiche « position 0 » à un client qui attend |
-| — | Service Redis dans la CI | S | **129 tests du moteur de file ne tournent jamais.** C'est l'angle mort le plus dangereux du projet |
+| — | Fenêtre ULBU `08:00 → 17:00` | ✅ fait | Décision 1, appliquée en production |
+| 7 | Fermer un guichet ne doit pas abandonner le client appelé | ✅ fait | `requeue_after_counter_close`, transition CALLED/SERVING → WAITING |
+| 5 | `deactivate` ne rétrograde que s'il ne reste aucun rattachement actif | ✅ fait | comptage avant rétrogradation |
+| 12 | `history` : position réelle pour un ticket en file | ✅ fait | Redis interrogé seulement pour `WAITING` |
+| — | CI Redis | ✅ déjà en place | **La CI était rouge depuis 4 commits, pas à cause de Redis** |
 
-**Point d'attention** : les 129 tests ignorés couvrent précisément l'atomicité de
-la file (`ZPOPMIN`, compare-and-set, compensation). Aujourd'hui, une régression
-sur le cœur du produit peut passer en vert. C'est S en effort et ça protège tout
-le reste — à faire avant la phase 1, pas après.
+**Ce que la vérification de la CI a révélé** : le workflow contenait déjà un
+service Redis (`ci.yml:34`), donc les 129 tests n'étaient pas « jamais exécutés »
+— ils l'étaient, et **ils échouaient**. Le correctif P0-1 (refus du second appel
+sur un guichet occupé) invalidait deux tests d'atomicité qui appelaient deux fois
+`call-next` sans terminer le premier ticket. Ces tests décrivaient l'ancien
+comportement buggé. Ils ont été corrigés pour terminer le ticket entre deux
+appels. Leçon : un test local « vert » ne prouve rien quand 129 tests sont
+ignorés — vérifier la CI fait partie de la définition de « terminé ».
 
 ---
 
@@ -42,18 +48,26 @@ le reste — à faire avant la phase 1, pas après.
 
 Objectif : le moteur ne perd plus de client, même quand une brique tombe.
 
-| # | Action | Taille | Dépendance |
+| # | Action | Taille | État |
 |---|---|---|---|
-| 4 | Expiration 12 h : ne jamais expirer un ticket bien placé, notifier avant annulation | M | Décision produit sur la règle d'expiration |
-| 11 | `return_to_queue` : repli si Redis échoue (le ticket reste `WAITING` mais hors file) | S | — |
-| 15 | Séparer `get_queue_size` de `add_to_queue` (entrée fantôme si la taille échoue) | S | — |
-| 16 | `queue_score` : documenter la marge de priorité (facteur 10⁹ = 11,5 jours) | S | — |
-| 18 | `/health/ready` doit voir le scheduler mort | S | — |
+| 4 | Expiration à la fermeture de l'agence, avec notification | ✅ fait | Décision 2 — voir ci-dessous |
+| 11 | `return_to_queue` : repli si Redis échoue | S | à faire |
+| 15 | Séparer `get_queue_size` de `add_to_queue` | S | à faire |
+| 16 | `queue_score` : documenter la marge de priorité | S | à faire |
+| 18 | `/health/ready` doit voir le scheduler mort | S | à faire |
 
-Le n° 4 mérite une décision explicite avant le code : **expirer à la fermeture
-de l'agence** plutôt que sur une durée fixe est le comportement correct, mais
-change la sémantique des tickets pris en fin de journée. À trancher avec le
-partenaire, pas dans le code.
+**Ce que « expiration à la fermeture » a changé concrètement** (P0-4) :
+
+- Un ticket `WAITING` n'est plus clos au bout de 12 h, mais quand son agence
+  ferme. Un ticket pris à 08:05 dans une agence 08:00–17:00 vit jusqu'à 17:00.
+- L'ancienne règle annulait des tickets **en pleine journée** dès qu'une agence
+  restait ouverte plus de douze heures. C'était le vrai défaut, plus grave que
+  l'absence de notification.
+- Chaque annulation est désormais **notifiée** (`TICKET_EXPIRED` + push) avec le
+  motif. Un ticket qui disparaît en silence est un client qui appelle.
+- `WAITING_TICKET_TTL_HOURS` passe de 12 à **72 h** et devient un simple filet
+  de sécurité pour une agence qui ne ferme jamais (horaires mal réglés). Ce
+  n'est plus la règle.
 
 ---
 
@@ -102,7 +116,7 @@ Ces points ne sont pas des bugs. Ce sont des absences.
 | **Facturation / plan** | Aucun modèle d'abonnement | L |
 | **Rapport quotidien** | Données présentes (`queue_logs`), aucun envoi | M |
 | **Mot de passe oublié / email sortant** | Aucun SMTP | M |
-| **Confirmation de présence** (`PENDING_ARRIVAL` + QR) | Non commencé | L |
+| ~~Confirmation de présence~~ (`PENDING_ARRIVAL` + QR) | **Abandonnée** (décision 3) | — |
 
 Ordre recommandé : **back-office → distribution desktop → facturation**.
 Le back-office d'abord parce que sans lui, chaque nouvelle organisation passe
@@ -110,9 +124,11 @@ par `scripts/create_org.py` et par toi. La distribution ensuite parce qu'un MSI
 non signé déclenche SmartScreen chez le client. La facturation en dernier : elle
 n'a de sens qu'une fois qu'une organisation peut s'inscrire seule.
 
-La **confirmation de présence** est la seule réponse structurelle au problème des
-tickets pris depuis chez soi, mais elle change le parcours client. À ne pas lancer
-pendant un pilote : elle fausserait les mesures du test.
+La **confirmation de présence** est écartée. Le problème des tickets pris depuis
+chez soi est traité autrement : appel, puis 180 s pour se présenter, puis
+`ABSENT` avec retour possible pendant 30 minutes. C'est moins élégant qu'un scan
+de QR, mais ça ne change pas le parcours client et ça ne fausse pas les mesures
+du pilote.
 
 ---
 
@@ -141,26 +157,25 @@ d'optimiser — l'audit ne l'a pas fait.
 
 ---
 
-## Décisions à prendre (elles bloquent le code)
+## Décisions prises le 15/11/2026
 
-1. **Fenêtre d'ouverture ULBU** — `10:00 → 14:00` est maintenant appliquée.
-   Si le test se déroule en dehors, aucun ticket ne sera délivré. Garder, élargir
-   ou passer par `operating_hours` jour par jour ?
-2. **Règle d'expiration** (P0-4) — durée fixe de 12 h, ou expiration à la
-   fermeture de l'agence ? La seconde est correcte, la première est en place.
-3. **Confirmation de présence** — avant ou après le pilote ? Elle change le
-   parcours client et fausserait les mesures si lancée pendant.
-4. **`BOOTSTRAP_PASSWORDS_JSON`** — à retirer de Render une fois le pilote
-   stabilisé. Tant qu'il existe, les mots de passe vivent dans la config du
-   service.
-
----
+1. **Fenêtre d'ouverture ULBU — `08:00 → 17:00`.** Appliquée en production le
+   15/11 à 15:52 via `PATCH /organizations/{org}/branches/{id}`. Le test doit se
+   dérouler dans ce créneau : hors horaires, `POST /tickets` répond
+   `400 BRANCH_CLOSED`.
+2. **Expiration à la fermeture de l'agence**, pas sur une durée fixe.
+   `WAITING_TICKET_TTL_HOURS` reste à 72 h comme filet de sécurité seulement.
+3. **Pas de confirmation de présence** (`PENDING_ARRIVAL`). Le parcours reste
+   appel → 180 s → `ABSENT` → retour possible sous 30 min.
+4. **`BOOTSTRAP_PASSWORDS_JSON` sera retiré de Render** une fois le pilote
+   stabilisé. En attendant il porte les quatre nouveaux mots de passe, pour
+   qu'un bootstrap ne rétablisse pas l'ancien.
 
 ## Séquence recommandée, en une ligne
 
-**CI Redis → P0-7/5/12 → P1-4/11/15/16/18 → P1-8 (liste de la file) →
-P3-10/9/17 → back-office → desktop signé → facturation.**
+**~~CI Redis → P0-7/5/12 → P1-4~~ (fait) → P1-11/15/16/18 → P1-8 (liste de la
+file) → P3-10/9/17 → back-office → desktop signé → facturation.**
 
-Les deux premiers blocs tiennent en une semaine et suppriment le risque de perdre
-un client pendant le test. Le troisième rend le produit supervisable. Le reste
-est du produit, pas de la correction.
+Le premier bloc est livré. Le deuxième supprime les derniers scénarios de perte
+de client. Le troisième rend le produit supervisable. Le reste est du produit,
+pas de la correction.

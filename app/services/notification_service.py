@@ -103,6 +103,34 @@ class NotificationService:
                 data={"type": "ticket_absent", "ticket_id": ticket.id},
             )
 
+    async def notify_ticket_expired(self, ticket: Ticket, reason: str) -> None:
+        """
+        Informe le client que son ticket a été annulé, et pourquoi.
+
+        L'ancienne expiration à 12 h annulait des tickets en silence : le client
+        voyait son numéro disparaître sans explication et perdait jusqu'au droit
+        de revenir en file. Un ticket annulé doit toujours dire pourquoi.
+        """
+        user = await self._get_user(ticket.user_id)
+        if not user:
+            return
+        message = (
+            f"TONDE — Votre ticket {ticket.number} a été annulé : {reason}. "
+            "Vous pouvez reprendre un numéro dès la réouverture."
+        )
+        await self._save_notification(
+            org_id=ticket.org_id, user_id=user.id, ticket_id=ticket.id,
+            channel=NotificationChannel.IN_APP,
+            title=f"Ticket annulé — {ticket.number}", body=message,
+            status=NotificationStatus.SENT,
+        )
+        if user.fcm_token:
+            await self._send_fcm(
+                ticket.org_id, user, ticket.id,
+                title=f"Ticket {ticket.number} — annulé", body=message,
+                data={"type": "ticket_expired", "ticket_id": ticket.id},
+            )
+
     async def notify_ticket_done(self, ticket: Ticket) -> None:
         """Notifie le client que son service est terminé (in-app uniquement)."""
         user = await self._get_user(ticket.user_id)

@@ -63,11 +63,17 @@ ALLOWED_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.SERVING,
         TicketStatus.ABSENT,
         TicketStatus.TRANSFERRED,
+        # Retour en file quand le guichet ferme pendant que le client est appelé.
+        # Sans cette transition, le client serait déclaré ABSENT 180 s plus tard
+        # alors que c'est le guichet qui a fermé (constat P1-7 de l'audit).
+        TicketStatus.WAITING,
     ],
     TicketStatus.SERVING: [
         TicketStatus.DONE,
         TicketStatus.INCOMPLETE,
         TicketStatus.TRANSFERRED,
+        # Même raison : fermeture du guichet en pleine prise en charge.
+        TicketStatus.WAITING,
     ],
     TicketStatus.ABSENT: [
         TicketStatus.WAITING,    # Le client demande à revenir en file

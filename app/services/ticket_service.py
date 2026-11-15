@@ -506,10 +506,28 @@ class TicketService:
         )
         tickets = result.scalars().all()
 
-        items = [
-            self._to_response(t, position=0, total=0, eta=t.estimated_wait_minutes)
-            for t in tickets
-        ]
+        items = []
+        for t in tickets:
+            position, total = 0, 0
+            if t.status == TicketStatus.WAITING:
+                # Un ticket encore en file doit afficher sa vraie position.
+                # Avant, `get_history` renvoyait 0 pour tout le monde : le mobile
+                # annonçait « position 0 » à un client qui attendait (P1-12).
+                try:
+                    position = await get_queue_position(
+                        t.org_id, t.agency_id, t.service_id, t.id
+                    )
+                    total = await get_queue_size(t.org_id, t.agency_id, t.service_id)
+                except Exception as exc:
+                    logger.warning(
+                        f"File indisponible pour l'historique du ticket {t.number} ({exc}) "
+                        ": position laissée à 0"
+                    )
+            items.append(
+                self._to_response(
+                    t, position=position, total=total, eta=t.estimated_wait_minutes
+                )
+            )
 
         return TicketHistoryResponse(
             items=items,
@@ -611,6 +629,49 @@ class TicketService:
         return {"success": True, "ticket_id": ticket.id}
 
     # ══ Actions du guichetier ══════════════════════════════════════════════════
+
+    async def requeue_after_counter_close(self, ticket: Ticket) -> bool:
+        """
+        Remet en file un ticket CALLED ou SERVING dont le guichet vient de fermer.
+
+        Le problème corrigé (P1-7 de l'audit) : `CounterService.close` remettait
+        `current_ticket_id` à NULL sans toucher au ticket. Le client restait
+        CALLED, personne ne le servait, et le scheduler le passait en ABSENT
+        180 s plus tard — avec 30 minutes de pénalité avant de pouvoir revenir.
+        Le client était présent : c'est le guichet qui a fermé.
+
+        Le ticket retrouve sa place d'origine (le score de file utilise
+        `created_at`, donc son ancienneté réelle), pas la fin de file.
+
+        Returns:
+            True si le ticket a été remis en file, False s'il n'était pas appelé.
+        """
+        if ticket.status not in (TicketStatus.CALLED, TicketStatus.SERVING):
+            return False
+
+        previous = ticket.status
+        await self._transition(
+            ticket, TicketStatus.WAITING,
+            actor_role="system",
+            extra={"reason": "counter_closed", "from_status": previous.value},
+        )
+        ticket.counter_id = None
+        ticket.counter_name = None
+        ticket.called_at = None
+        ticket.served_at = None
+        await self.db.commit()
+
+        await add_to_queue(
+            ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
+            PRIORITY_SCORES[ticket.priority],
+            created_ms=to_epoch_ms(ticket.created_at),
+        )
+        await self._publish_queue_snapshot(ticket.org_id, ticket.agency_id, ticket.service_id)
+
+        logger.info(
+            f"Ticket {ticket.number} remis en file ({previous.value} → waiting) : guichet fermé"
+        )
+        return True
 
     async def call_next(
         self,
@@ -1164,11 +1225,18 @@ class TicketService:
         """
         Clôt les tickets « actifs » restés bloqués, pour ne jamais bloquer un client à vie.
 
-        Règles (délais configurables) :
-          - WAITING  trop ancien (WAITING_TICKET_TTL_HOURS)       → CANCELLED
-          - ABSENT   hors fenêtre de retour (ABSENT_RETURN_WINDOW) → CANCELLED
-          - SERVING  oublié par l'agent (SERVING_TICKET_TTL_HOURS) → INCOMPLETE
-          - INCOMPLETE non résolu (INCOMPLETE_TICKET_TTL_HOURS)    → CANCELLED
+        Règles :
+          - WAITING  dont l'agence a FERMÉ (règle principale)         → CANCELLED + notification
+          - WAITING  oublié depuis WAITING_TICKET_TTL_HOURS (filet)   → CANCELLED + notification
+          - ABSENT   hors fenêtre de retour (ABSENT_RETURN_WINDOW)    → CANCELLED
+          - SERVING  oublié par l'agent (SERVING_TICKET_TTL_HOURS)    → INCOMPLETE
+          - INCOMPLETE non résolu (INCOMPLETE_TICKET_TTL_HOURS)       → CANCELLED
+
+        L'expiration se fait à la fermeture de l'agence, pas sur une durée fixe :
+        un ticket pris à 08:05 dans une agence ouverte 08:00–17:00 doit vivre
+        jusqu'à 17:00, même s'il attend neuf heures. L'ancienne règle « 12 h »
+        l'annulait à 20:05 sans prévenir — et surtout, sur une agence ouverte
+        plus de douze heures, elle annulait des tickets en pleine journée.
 
         Returns:
             Compteurs par règle appliquée.
@@ -1176,7 +1244,11 @@ class TicketService:
         now = now or datetime.now(timezone.utc)
         counts = {"waiting": 0, "absent": 0, "serving": 0, "incomplete": 0}
 
+        # Règle principale : plus personne ne peut être servi, l'agence est fermée.
+        counts["waiting"] += await self._expire_waiting_of_closed_branches(now, batch)
+
         rules: list[tuple[str, TicketStatus, TicketStatus, datetime, object]] = [
+            # Filet de sécurité : agence qui ne ferme jamais (horaires mal réglés).
             ("waiting", TicketStatus.WAITING, TicketStatus.CANCELLED,
              now - timedelta(hours=settings.WAITING_TICKET_TTL_HOURS), Ticket.created_at),
             ("absent", TicketStatus.ABSENT, TicketStatus.CANCELLED,
@@ -1210,6 +1282,10 @@ class TicketService:
                         await self._release_counter(ticket)
                     await self.db.commit()
                     await self._leave_queue(ticket)
+                    if from_status == TicketStatus.WAITING:
+                        await self._notify_expired(
+                            ticket, "le délai d'attente maximal a été dépassé"
+                        )
                     counts[name] += 1
                 except Exception as exc:  # un ticket en erreur ne bloque pas les autres
                     await self.db.rollback()
@@ -1217,6 +1293,74 @@ class TicketService:
         if any(counts.values()):
             logger.info(f"Tickets expirés: {counts}")
         return counts
+
+    async def _expire_waiting_of_closed_branches(
+        self, now: datetime, batch: int
+    ) -> int:
+        """
+        Annule les tickets encore en file dont l'agence est fermée.
+
+        Aucun nouveau ticket ne peut être créé hors horaires (`BRANCH_CLOSED`),
+        donc tout ticket WAITING sur une agence fermée est un reste de la
+        journée : personne ne viendra l'appeler.
+
+        Returns:
+            Nombre de tickets annulés.
+        """
+        now_local = now.astimezone(BURUNDI_TZ)
+        branches = (await self.db.execute(
+            select(Branch).where(Branch.is_active == True)  # noqa: E712
+        )).scalars().all()
+        closed_ids = [b.id for b in branches if not is_branch_open_now(b, now_local)]
+        if not closed_ids:
+            return 0
+
+        rows = await self.db.execute(
+            select(Ticket.id).where(
+                Ticket.status == TicketStatus.WAITING,
+                Ticket.agency_id.in_(closed_ids),
+            ).limit(batch)
+        )
+
+        count = 0
+        for ticket_id in rows.scalars().all():
+            try:
+                ticket = (await self.db.execute(
+                    select(Ticket).where(Ticket.id == ticket_id).execution_options(populate_existing=True)
+                )).scalar_one()
+                await self._transition(
+                    ticket, TicketStatus.CANCELLED, actor_role="system",
+                    extra={"reason": "branch_closed"},
+                )
+                await self.db.commit()
+                await self._leave_queue(ticket)
+                await self._notify_expired(ticket, "l'agence a fermé")
+                count += 1
+            except Exception as exc:
+                await self.db.rollback()
+                logger.error(f"Clôture de fermeture échouée pour le ticket {ticket_id}: {exc}")
+        return count
+
+    async def _notify_expired(self, ticket: Ticket, reason: str) -> None:
+        """Prévient le client qu'un ticket a été annulé, et pourquoi (non bloquant)."""
+        try:
+            await publish_event(ticket.org_id, {
+                "type": EventType.TICKET_EXPIRED.value,
+                "ticket_id": ticket.id,
+                "ticket_number": ticket.number,
+                "agency_id": ticket.agency_id,
+                "reason": reason,
+                "message": f"Votre ticket {ticket.number} a été annulé : {reason}.",
+            })
+        except Exception as exc:
+            logger.error(f"Événement TICKET_EXPIRED non publié ({ticket.number}): {exc}")
+
+        try:
+            from app.services.notification_service import NotificationService
+
+            await NotificationService(self.db).notify_ticket_expired(ticket, reason)
+        except Exception as exc:
+            logger.error(f"Notification d'annulation non envoyée ({ticket.number}): {exc}")
 
     async def alert_long_waits(self, limit: int = 500) -> int:
         """
