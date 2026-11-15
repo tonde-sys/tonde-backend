@@ -685,6 +685,32 @@ conformité, pas une dépendance du chemin critique. La contrepartie — une pan
 d'audit passe inaperçue côté utilisateur — est assumée et surveillée par le
 niveau `ERROR`.
 
+**Preuve en production** (après déploiement, `GET /api/v1/audit/logs` avec un
+jeton `super_admin`) :
+
+```json
+{"action": "password_reset_requested", "org_id": null, "actor_id": null,
+ "extra": {"ip": "104.28.209.199", "email": "probe-inexistant@example.com",
+           "reason": "no_deliverable_account"}}
+```
+
+Cette ligne est celle d'une demande de réinitialisation pour un compte
+**inexistant** : `org_id` NULL — donc la migration `009` est bien appliquée en
+production, et une tentative d'énumération de comptes laisse une trace
+exploitable. Les connexions réussies sont également tracées, y compris celles
+du `super_admin` (org NULL) :
+
+```json
+{"action": "login_succeeded", "actor_role": "super_admin", "org_id": null,
+ "extra": {"ip": "104.28.209.199", "user_agent": "…"}}
+{"action": "login_succeeded", "actor_role": "agent",
+ "org_id": "cf5243d5-…", "extra": {"ip": "104.28.209.199", "…": "…"}}
+```
+
+Contrôles négatifs vérifiés sur la même instance : un jeton d'agent sur
+`/audit/logs` → **403**, et une requête sans jeton → **403** (l'observation
+401/403 ci-dessous, toujours ouverte).
+
 **18. `/health/ready` n'inspecte pas le scheduler** — ✅ corrigé.
 `health_service.py` vérifiait la base et Redis. Si la boucle de fond mourait, les
 tickets `CALLED` ne passaient plus en `ABSENT` et la maintenance ne tournait plus,
@@ -800,6 +826,14 @@ Par guichet
 Deux points à vérifier dans cette sortie, et ils le sont : le ticket créé le 13
 à 20:00 UTC (22:00 locales) **n'est pas** compté dans le 14, et le pic de 08:00
 UTC est bien affiché « 10h00 (heure locale) ».
+
+Les deux nouvelles routes de réinitialisation ont également été éprouvées sur la
+production, déployée depuis `main` :
+
+| Appel | Réponse |
+|---|---|
+| `POST /auth/forgot-password` (compte inexistant) | `200` + réponse neutre, aucun email |
+| `POST /auth/reset-password` (jeton inventé) | `400` `INVALID_RESET_TOKEN` |
 
 ---
 
