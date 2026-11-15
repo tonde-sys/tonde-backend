@@ -51,10 +51,10 @@ Objectif : le moteur ne perd plus de client, même quand une brique tombe.
 | # | Action | Taille | État |
 |---|---|---|---|
 | 4 | Expiration à la fermeture de l'agence, avec notification | ✅ fait | Décision 2 — voir ci-dessous |
-| 11 | `return_to_queue` : repli si Redis échoue | S | à faire |
-| 15 | Séparer `get_queue_size` de `add_to_queue` | S | à faire |
-| 16 | `queue_score` : documenter la marge de priorité | S | à faire |
-| 18 | `/health/ready` doit voir le scheduler mort | S | à faire |
+| 11 | `return_to_queue` : repli si Redis échoue | S | ✅ fait |
+| 15 | Séparer `get_queue_size` de `add_to_queue` | S | ✅ fait |
+| 16 | `queue_score` : documenter la marge de priorité | S | ✅ fait |
+| 18 | `/health/ready` doit voir le scheduler mort | S | ✅ fait |
 
 **Ce que « expiration à la fermeture » a changé concrètement** (P0-4) :
 
@@ -69,19 +69,62 @@ Objectif : le moteur ne perd plus de client, même quand une brique tombe.
   de sécurité pour une agence qui ne ferme jamais (horaires mal réglés). Ce
   n'est plus la règle.
 
+**Les trois autres correctifs, en une phrase chacun :**
+
+- **11** — quand Redis tombe, `return_to_queue` répond
+  `{"success": true, "queue_degraded": true}` au lieu de laisser remonter un 500
+  sur une transition déjà commitée ; la maintenance du scheduler appelle
+  `rebuild_queue()` et réinsère tout `WAITING` absent du ZSET (compteur
+  `repaired` + `WARNING`). *La réponse dit la vérité, la file se répare seule.*
+- **15** — l'échec de `zcard` ne peut plus annuler un ticket déjà dans la file :
+  il ne dégrade que `total_in_queue`. L'échec de l'**ajout** annule toujours
+  (contre-épreuve testée), sinon un `WAITING` hors file bloquerait son client
+  avec la règle « 1 ticket actif ».
+- **16** — `QUEUE_PRIORITY_BAND_MS` nomme les 10⁹ ms (11,57 jours) et
+  `tests/test_queue_score_geometry.py` verrouille l'invariant
+  `TTL (72 h) < marge (11,57 j)`. Relever le TTL sans toucher la marge casse un
+  test au lieu de casser la priorité en production.
+- **18** — `/health/ready` et `/health/status` rapportent un contrôle
+  `scheduler` (`healthy` / `stalled` / `loop_stopped` / `never_ran`, plus les
+  états neutres `disabled`, `not_wired`, `starting`). Un scheduler mort sort
+  l'instance du load balancer ; Render la redémarre et `warm_up` reconstruit
+  files et échéances.
+
 ---
 
 ## Phase 2 — Supervision : la fonction qui manque le plus
 
-| # | Action | Taille | Dépendance |
+| # | Action | Taille | État |
 |---|---|---|---|
-| 8 | `GET /api/v1/tickets/queue?agency_id=&service_id=` (rôle ≥ AGENT, périmètre branche) | M | — |
-| 8b | Écran desktop correspondant : qui attend, depuis quand, priorité | M | 8 |
+| 8 | `GET /api/v1/tickets/queue?agency_id=&service_id=` (rôle ≥ AGENT, périmètre branche) | M | ✅ fait |
+| 8b | Écran desktop correspondant : qui attend, depuis quand, priorité | M | ⬜ contrat figé, à câbler |
 
 C'est le complément naturel de `call-next`. Sans lui, un superviseur en agence
 bondée est aveugle : il ne peut ni voir la file, ni repérer un ticket fantôme,
 ni appeler un numéro précis. C'est aussi ce qui rend le poste guichet réellement
 utile — aujourd'hui il appelle à l'aveugle.
+
+**Ce que la route renvoie** (`QueueListResponse`) :
+
+```
+agency_id, service_id, service_name,
+waiting_count, called_count, serving_count, average_wait_minutes,
+entries[] : ticket_id, number, status, priority, requested_priority,
+            position, waiting_since_minutes, created_at, counter_name
+```
+
+Trois choix qui ont des conséquences :
+
+- **L'ordre vient de PostgreSQL, pas de Redis.** Même clé que `queue_score`
+  (priorité puis ancienneté), donc la première ligne est le prochain ticket
+  appelé — et la supervision reste utilisable pendant un incident Redis, ce qui
+  est exactement le moment où on en a besoin.
+- **`position = 0` pour les tickets appelés ou en service** : ils ne sont plus
+  dans la file.
+- **Pas de `qr_token`** : un agent n'a pas à scanner le QR d'un client.
+
+Reste l'écran desktop (8b) : hors de ce dépôt. Il consomme une réponse stable,
+couverte par 15 tests dont 2 de bout en bout (JWT + RBAC réels).
 
 ---
 
@@ -173,9 +216,19 @@ d'optimiser — l'audit ne l'a pas fait.
 
 ## Séquence recommandée, en une ligne
 
-**~~CI Redis → P0-7/5/12 → P1-4~~ (fait) → P1-11/15/16/18 → P1-8 (liste de la
-file) → P3-10/9/17 → back-office → desktop signé → facturation.**
+**~~CI Redis → P0-7/5/12 → P1-4~~ (fait) → ~~P1-11/15/16/18 → P1-8 (liste de la
+file)~~ (fait) → P3-10/9/17 → back-office → desktop signé → facturation.**
 
-Le premier bloc est livré. Le deuxième supprime les derniers scénarios de perte
-de client. Le troisième rend le produit supervisable. Le reste est du produit,
-pas de la correction.
+Les deux premiers blocs sont livrés : les P0, puis la fiabilité du moteur et la
+supervision. Il reste la sécurité/conformité (P3-10, P3-9, P3-17 — le seul point
+qui demande une migration), puis du produit, pas de la correction.
+
+## Journal d'avancement
+
+| Lot | Contenu | Commit |
+|---|---|---|
+| Audit | 20 constats, preuves de production, plan | `3e67f8f` → `3878af0` |
+| Phase 0 | P1-7, P0-5, P1-12, P0-4 + décisions 1-4 | `137735b` |
+| CI | Correction des tests révélés par la CI (447 passed) | `eaa4a3c` |
+| Phase 1 | P1-11, P2-15, P2-16, P2-18 | à venir |
+| Phase 2 | P1-8 — `GET /tickets/queue` | à venir |

@@ -26,7 +26,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.access import ORG_WIDE_ROLES, forbidden, get_staff_branch_ids
+from app.core.access import ORG_WIDE_ROLES, ROLE_RANK, forbidden, get_staff_branch_ids
 from app.core.config import settings
 from app.core.redis import (
     DEADLINE_ABSENT,
@@ -60,7 +60,13 @@ from app.models.ticket import (
     TicketStatus,
 )
 from app.models.user import User, UserRole
-from app.schemas.ticket import CreateTicketRequest, TicketHistoryResponse, TicketResponse
+from app.schemas.ticket import (
+    CreateTicketRequest,
+    QueueEntry,
+    QueueListResponse,
+    TicketHistoryResponse,
+    TicketResponse,
+)
 from app.services.audit_service import AuditService
 from app.websocket.events import EventType
 from app.websocket.publisher import publish_event, queue_snapshot_event
@@ -371,7 +377,6 @@ class TicketService:
                 PRIORITY_SCORES[TicketPriority.STANDARD],
                 created_ms=to_epoch_ms(ticket.created_at),
             )
-            total = await get_queue_size(ticket.org_id, ticket.agency_id, ticket.service_id)
         except Exception as exc:
             logger.error(f"Redis indisponible à la création du ticket {ticket.number}: {exc}")
             await self._transition(
@@ -386,6 +391,19 @@ class TicketService:
                     "message": "La file d'attente est momentanément indisponible. Réessayez.",
                 },
             ) from exc
+
+        # La taille de la file est une information d'affichage : son échec ne doit
+        # jamais annuler un ticket DÉJÀ dans la file (constat P2-15). Avant ce
+        # correctif, une erreur sur `zcard` suffisait à annuler le ticket en base
+        # tout en le laissant dans le ZSET — une entrée fantôme que `_pop_and_call`
+        # devait nettoyer plus tard. On dégrade l'affichage, pas la prise de ticket.
+        try:
+            total = await get_queue_size(ticket.org_id, ticket.agency_id, ticket.service_id)
+        except Exception as exc:
+            logger.warning(
+                f"Taille de file indisponible pour {ticket.number} (affichage dégradé) : {exc}"
+            )
+            total = position
 
         eta = await self.estimate_wait_minutes(service, position)
         ticket.estimated_wait_minutes = eta
@@ -508,7 +526,7 @@ class TicketService:
 
         items = []
         for t in tickets:
-            position, total = 0, 0
+            position, queue_total = 0, 0
             if t.status == TicketStatus.WAITING:
                 # Un ticket encore en file doit afficher sa vraie position.
                 # Avant, `get_history` renvoyait 0 pour tout le monde : le mobile
@@ -517,7 +535,7 @@ class TicketService:
                     position = await get_queue_position(
                         t.org_id, t.agency_id, t.service_id, t.id
                     )
-                    total = await get_queue_size(t.org_id, t.agency_id, t.service_id)
+                    queue_total = await get_queue_size(t.org_id, t.agency_id, t.service_id)
                 except Exception as exc:
                     logger.warning(
                         f"File indisponible pour l'historique du ticket {t.number} ({exc}) "
@@ -525,7 +543,7 @@ class TicketService:
                     )
             items.append(
                 self._to_response(
-                    t, position=position, total=total, eta=t.estimated_wait_minutes
+                    t, position=position, total=queue_total, eta=t.estimated_wait_minutes
                 )
             )
 
@@ -535,6 +553,125 @@ class TicketService:
             page=page,
             page_size=page_size,
             has_next=(offset + page_size) < total,
+        )
+
+    async def list_queue(
+        self,
+        agency_id: str,
+        service_id: str,
+        actor: User,
+    ) -> QueueListResponse:
+        """
+        File d'attente d'un service, vue par le staff (constat P1-8 de l'audit).
+
+        Avant cet endpoint, le staff n'avait aucun moyen de voir qui attendait :
+        il fallait connaître l'UUID d'un ticket pour le clôturer, et la
+        supervision d'une agence bondée se faisait à l'aveugle.
+
+        L'ordre est calculé depuis PostgreSQL, PAS depuis Redis :
+          - la base est la source de vérité, l'ordre reste correct même si Redis
+            est indisponible (or c'est précisément en cas d'incident qu'on a
+            besoin de voir la file) ;
+          - il reproduit exactement l'ordre d'appel, puisque `queue_score` classe
+            par priorité puis par `created_at`, comme le tri ci-dessous.
+
+        Args:
+            agency_id: Branch dont on liste la file
+            service_id: Service (chaque service a sa propre file)
+            actor: Utilisateur authentifié, rôle ≥ AGENT
+
+        Returns:
+            QueueListResponse : compteurs + entrées WAITING (ordonnées), puis
+            CALLED et SERVING.
+
+        Raises:
+            HTTPException 403: Rôle insuffisant ou branche hors périmètre
+            HTTPException 404: Branche ou service introuvable dans l'organisation
+        """
+        # Un client n'a rien à faire ici, même si le routeur le filtre déjà :
+        # la garde est dans le service pour protéger les appels internes.
+        if ROLE_RANK[actor.role] < ROLE_RANK[UserRole.AGENT]:
+            raise forbidden("Réservé au personnel d'agence", code="STAFF_ONLY")
+
+        branch = await self._get_agency(agency_id, actor.org_id)
+
+        # Périmètre : un agent/superviseur ne voit que ses branches d'affectation.
+        if actor.role not in ORG_WIDE_ROLES:
+            if branch.id not in await get_staff_branch_ids(self.db, actor):
+                raise forbidden(
+                    "Vous n'êtes pas affecté à cette agence", code="BRANCH_FORBIDDEN"
+                )
+
+        service = await self._get_service(service_id, branch.id, branch.org_id)
+
+        rows = (
+            await self.db.execute(
+                select(Ticket).where(
+                    Ticket.org_id == branch.org_id,
+                    Ticket.agency_id == branch.id,
+                    Ticket.service_id == service.id,
+                    Ticket.status.in_(
+                        [TicketStatus.WAITING, TicketStatus.CALLED, TicketStatus.SERVING]
+                    ),
+                )
+            )
+        ).scalars().all()
+
+        now = datetime.now(timezone.utc)
+        waiting = [t for t in rows if t.status == TicketStatus.WAITING]
+        called = [t for t in rows if t.status == TicketStatus.CALLED]
+        serving = [t for t in rows if t.status == TicketStatus.SERVING]
+
+        # Même clé de tri que `queue_score` : priorité décroissante, puis FIFO.
+        waiting.sort(key=lambda t: (-PRIORITY_SCORES[t.priority], as_utc(t.created_at)))
+        called.sort(key=lambda t: as_utc(t.called_at or t.created_at))
+        serving.sort(key=lambda t: as_utc(t.served_at or t.called_at or t.created_at))
+
+        entries: list[QueueEntry] = []
+        for index, ticket in enumerate(waiting, start=1):
+            entries.append(self._queue_entry(ticket, position=index, now=now))
+        for ticket in called + serving:
+            # Position 0 = hors file d'attente : le ticket est déjà au guichet.
+            entries.append(self._queue_entry(ticket, position=0, now=now))
+
+        waits = [e.waiting_since_minutes for e in entries[: len(waiting)]]
+        return QueueListResponse(
+            agency_id=branch.id,
+            service_id=service.id,
+            service_name=service.name,
+            waiting_count=len(waiting),
+            called_count=len(called),
+            serving_count=len(serving),
+            average_wait_minutes=round(sum(waits) / len(waits)) if waits else None,
+            entries=entries,
+            generated_at=now,
+        )
+
+    @staticmethod
+    def _queue_entry(ticket: Ticket, *, position: int, now: datetime) -> QueueEntry:
+        """Sérialise un ticket pour la liste de file (aucun objet ORM en sortie)."""
+        # L'ancienneté se mesure depuis l'entrée dans l'état courant, pas depuis
+        # la création : un ticket rappelé après une absence ne doit pas afficher
+        # 40 minutes d'attente alors qu'il vient de revenir en file.
+        if ticket.status == TicketStatus.SERVING:
+            since = ticket.served_at or ticket.called_at or ticket.created_at
+        elif ticket.status == TicketStatus.CALLED:
+            since = ticket.called_at or ticket.created_at
+        else:
+            since = ticket.created_at
+        minutes = max(0, int((now - as_utc(since)).total_seconds() // 60))
+        return QueueEntry(
+            ticket_id=ticket.id,
+            number=ticket.number,
+            status=ticket.status.value,
+            priority=ticket.priority.value,
+            requested_priority=(
+                ticket.requested_priority.value if ticket.requested_priority else None
+            ),
+            position=position,
+            waiting_since_minutes=minutes,
+            created_at=ticket.created_at,
+            counter_name=ticket.counter_name,
         )
 
     # ══ Actions du client ══════════════════════════════════════════════════════
@@ -621,12 +758,34 @@ class TicketService:
         ticket.priority = TicketPriority.STANDARD
         await self.db.commit()
 
-        await add_to_queue(
-            ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
-            PRIORITY_SCORES[TicketPriority.STANDARD],
-        )
-        await self._publish_queue_snapshot(ticket.org_id, ticket.agency_id, ticket.service_id)
-        return {"success": True, "ticket_id": ticket.id}
+        # Constat P1-11 : `add_to_queue` n'était pas protégé. Une panne Redis
+        # laissait le ticket WAITING en base mais absent du ZSET ; le client
+        # restait bloqué par la règle « 1 ticket actif » jusqu'à ce qu'un
+        # `call_next` ou une lecture de son ticket déclenche l'auto-réparation.
+        # Sur une agence sans activité, cela pouvait durer des heures.
+        #
+        # On ne peut pas annuler la transition (elle est déjà commitée, et
+        # WAITING → ABSENT n'est pas une transition autorisée) : on répond donc
+        # la vérité au client (`queue_degraded`) au lieu de simuler un succès
+        # complet, et on laisse la réparation périodique du scheduler remettre
+        # le ticket dans la file dès le retour de Redis (voir
+        # QueueScheduler.run_once → rebuild_queue).
+        queue_degraded = False
+        try:
+            await add_to_queue(
+                ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
+                PRIORITY_SCORES[TicketPriority.STANDARD],
+            )
+        except Exception as exc:  # noqa: BLE001
+            queue_degraded = True
+            logger.error(
+                f"Ticket {ticket.number} remis en file en base mais Redis indisponible "
+                f"(position indisponible jusqu'à réparation) : {exc}"
+            )
+
+        if not queue_degraded:
+            await self._publish_queue_snapshot(ticket.org_id, ticket.agency_id, ticket.service_id)
+        return {"success": True, "ticket_id": ticket.id, "queue_degraded": queue_degraded}
 
     # ══ Actions du guichetier ══════════════════════════════════════════════════
 
@@ -1432,6 +1591,39 @@ class TicketService:
             score = queue_score(PRIORITY_SCORES[t_priority], to_epoch_ms(t_created))
             if await add_to_queue_if_absent(t_org, t_agency, t_service, tid, score):
                 restored += 1
+        return restored
+
+    async def repair_open_branches(self) -> int:
+        """
+        Réinsère dans Redis les tickets `WAITING` des agences ouvertes qui manquent.
+
+        Pourquoi ne pas appeler `rebuild_queue()` sans filtre (constat P1-11) :
+        cette requête ne filtre que sur `status`, sans index dédié, et la table
+        `tickets` grandit indéfiniment. Un scan complet toutes les minutes finit
+        par coûter cher au bout de quelques mois — exactement le genre de dette
+        qui n'apparaît qu'en production.
+
+        On se limite donc aux agences **ouvertes et actives** : ce sont les
+        seules dont les tickets `WAITING` ont un sens. Un ticket en attente dans
+        une agence fermée est de toute façon expiré par
+        `_expire_waiting_of_closed_branches`. Chaque `rebuild_queue` filtré
+        s'appuie sur l'index `(agency_id, service_id, status)`.
+
+        Returns:
+            Nombre de tickets réinsérés.
+        """
+        branches = (
+            await self.db.execute(
+                select(Branch.org_id, Branch.id).where(
+                    Branch.is_open.is_(True),
+                    Branch.is_active.is_(True),
+                )
+            )
+        ).all()
+
+        restored = 0
+        for org_id, branch_id in branches:
+            restored += await self.rebuild_queue(org_id=org_id, agency_id=branch_id)
         return restored
 
     async def rebuild_deadlines(self) -> int:

@@ -78,17 +78,17 @@ tests ; ⬜ = rien n'a été fait, le constat reste vrai.
 | 5 | `deactivate` retire rôle + `org_id` sans vérifier les autres rattachements | ✅ | `tests/test_phase0_corrections.py` (2) |
 | 6 | Aucun verrouillage par compte sur `POST /auth/login` | ✅ | `tests/test_login_lockout.py` (11) |
 | 7 | Fermer un guichet laisse le ticket CALLED orphelin | ✅ | `tests/test_phase0_corrections.py` (3) |
-| 8 | Aucun endpoint pour lister la file côté staff | ⬜ | — |
+| 8 | Aucun endpoint pour lister la file côté staff | ✅ | `tests/test_queue_listing.py` (15) |
 | 9 | Un seul WebSocket par ticket | ⬜ | — |
 | 10 | `websocket_counter` : aucun contrôle d'affectation | ⬜ | — |
-| 11 | `return_to_queue` sans repli si Redis échoue | ⬜ | — |
+| 11 | `return_to_queue` sans repli si Redis échoue | ✅ | `tests/test_phase1_corrections.py` (3) |
 | 12 | `GET /tickets/history` renvoie `position: 0` | ✅ | `tests/test_phase0_corrections.py` (2) |
 | 13 | Préfixe de service unique seulement entre services actifs | ⬜ | — |
 | 14 | `get_branch_display` : N+1 requêtes | ⬜ | — |
-| 15 | Création : `get_queue_size` dans le même `try` que `add_to_queue` | ⬜ | — |
-| 16 | `queue_score` : marge de priorité de 104 jours | ⬜ | — |
+| 15 | Création : `get_queue_size` dans le même `try` que `add_to_queue` | ✅ | `tests/test_phase1_corrections.py` (2) |
+| 16 | `queue_score` : marge de priorité de 104 jours | ✅ | `tests/test_queue_score_geometry.py` (9) |
 | 17 | Aucune trace d'audit des connexions | ⬜ | voir note ci-dessous |
-| 18 | `/health/ready` n'inspecte pas le scheduler | ⬜ | — |
+| 18 | `/health/ready` n'inspecte pas le scheduler | ✅ | `tests/test_phase1_corrections.py` (9) |
 | 19 | Aucun endpoint de changement de mot de passe | ✅ | `tests/test_change_password.py` (11) + `tests/test_cli_reset_password.py` (5) |
 | 20 | Mot de passe partagé par 4 comptes, écrit en clair | ✅ | rotation exécutée le 15/11 15:03, 4 mots de passe distincts |
 
@@ -356,7 +356,7 @@ GET  /tickets/C-005                  -> status = waiting
 Le client est revenu en file avec sa position, au lieu de rester `CALLED` puis
 de devenir `ABSENT`. Ticket clôturé et guichet rouvert dans la foulée.
 
-### 8. Aucun endpoint pour lister la file
+### 8. Aucun endpoint pour lister la file — ✅ corrigé
 
 Il n'existe aucune route renvoyant les tickets en attente d'un service. Le staff
 ne peut donc pas :
@@ -366,9 +366,37 @@ ne peut donc pas :
 - réordonner ou appeler un ticket précis.
 
 C'est le complément naturel de `POST /tickets/counter/call-next`. Sans lui, la
-supervision en agence bondée se fait à l'aveugle. Un
-`GET /api/v1/tickets/queue?agency_id=&service_id=` (rôle ≥ AGENT, périmètre
-branch) suffirait.
+supervision en agence bondée se fait à l'aveugle.
+
+**Correctif livré : `GET /api/v1/tickets/queue?agency_id=&service_id=`**
+
+| Élément | Fichier |
+|---|---|
+| Route (rôle ≥ AGENT, périmètre branch) | `routers/tickets.py` |
+| `TicketService.list_queue` + `_queue_entry` | `services/ticket_service.py` |
+| `QueueEntry` / `QueueListResponse` | `schemas/ticket.py` |
+
+Décisions de conception qui comptent :
+
+- **L'ordre est calculé depuis PostgreSQL, pas depuis Redis.** La base est la
+  source de vérité, et c'est précisément pendant un incident Redis qu'un
+  superviseur a besoin de voir la file. La clé de tri est identique à celle de
+  `queue_score` (priorité décroissante, puis `created_at`), donc la première
+  ligne est bien le prochain ticket appelé.
+- **La route est déclarée avant `/{ticket_id}`.** Placée après, FastAPI
+  interpréterait « queue » comme un UUID de ticket et renverrait 404 — un test
+  verrouille cet ordre.
+- **`position = 0` pour les tickets appelés ou en service** : ils ne sont plus
+  dans la file, et afficher 1 serait faux.
+- **L'ancienneté se mesure depuis l'entrée dans l'état courant**, pas depuis la
+  création : un ticket rappelé après une absence ne doit pas afficher 40 minutes
+  d'attente alors qu'il vient de revenir en file.
+- **`qr_token` n'est pas exposé** : un agent n'a pas à scanner le QR d'un client,
+  et l'ajouter élargirait la surface sans usage.
+
+Reste à faire côté produit (hors de ce dépôt) : l'écran desktop qui consomme la
+route (liste, tri, bouton « appeler ce ticket »). Le contrat est figé par
+`QueueListResponse`, les 15 tests et deux tests HTTP de bout en bout.
 
 ### 9. Un seul WebSocket par ticket
 
@@ -385,12 +413,30 @@ l'organisation de l'utilisateur. Un agent du guichet 1 peut donc s'abonner au
 WebSocket du guichet 7 et recevoir ses événements. Le contrôle existe déjà pour
 le REST (`_verify_agent_assignment`) ; il manque ici.
 
-### 11. `return_to_queue` sans repli Redis
+### 11. `return_to_queue` sans repli Redis — ✅ corrigé
 
 `ticket_service.py:548-551` : `add_to_queue` n'est pas protégé. Si Redis échoue,
 le ticket est `WAITING` en base mais absent de la file. Le client reste bloqué
 par la règle « 1 ticket actif » jusqu'à ce que quelqu'un appelle `call_next` ou
 lise son ticket (auto-réparation). Sur une agence sans activité, cela peut durer.
+
+**Correctif livré — deux moitiés :**
+
+1. **La réponse dit la vérité.** `return_to_queue` renvoie désormais
+   `{"success": true, "ticket_id": …, "queue_degraded": true}` quand Redis est
+   tombé. Avant, l'exception remontait en 500 alors que la transition `WAITING`
+   était **déjà commitée** : le mobile croyait l'opération échouée et réessayait,
+   recevant « transition interdite ». Le client était dans les limbes — présent
+   en base, absent de la file, et aucune réponse ne le disait. On ne peut pas
+   annuler la transition (`WAITING → ABSENT` n'est pas une transition autorisée),
+   donc le service répond la vérité au lieu de simuler un succès complet.
+2. **La file se répare toute seule.** La maintenance du scheduler appelle
+   désormais `rebuild_queue()` : tout ticket `WAITING` absent du ZSET y est
+   réinséré avec son score d'origine (`ZADD NX`, donc jamais d'écrasement de
+   score existant). PostgreSQL reste la source de vérité ; le coût est un scan
+   de la table des tickets en attente, borné par l'expiration à la fermeture.
+   Le compteur `repaired` remonte dans les stats du scheduler et un `WARNING`
+   est journalisé quand il est non nul — la dérive devient visible.
 
 ### 12. `get_history` renvoie une position nulle — ✅ corrigé
 
@@ -532,27 +578,53 @@ et 6 services, ~30 requêtes par appel, appelé toutes les 7 s par chaque poste
 desktop. Un `selectinload`/jointure et un cache Redis de 2 s ramèneraient cela à
 2 requêtes.
 
-**15. `get_queue_size` dans le `try` de `add_to_queue`** —
+**15. `get_queue_size` dans le `try` de `add_to_queue`** — ✅ corrigé.
 `ticket_service.py:310-330`. Si l'ajout réussit mais que la taille échoue, le
 ticket est annulé alors qu'il est déjà dans la file : entrée fantôme, nettoyée
-plus tard par `_pop_and_call`. Séparer les deux appels.
+plus tard par `_pop_and_call`. **Correctif :** les deux appels sont séparés. Une
+erreur sur `zcard` dégrade l'affichage (`total_in_queue` retombe sur la position
+connue) mais n'annule plus un ticket déjà en file. La contre-épreuve — échec de
+l'**ajout** → annulation + 503 `QUEUE_UNAVAILABLE` — est testée explicitement,
+pour que la séparation n'ait pas relâché la protection contre le ticket
+`WAITING` hors file.
 
-**16. `queue_score`, constante trompeuse** — `redis.py:193` :
-`(10 - priority) * 1_000_000_000 + created_ms`. La priorité ne domine que parce
-que 9 × 10⁹ ms ≈ 104 jours dépasse l'écart intra-journalier. Cela fonctionne,
-mais le facteur 10⁹ ressemble à des millisecondes alors qu'il représente
-11,5 jours. Un commentaire explicite ou une formule `priority_rank * 10**13`
-éviterait une régression lors d'une future modification.
+**16. `queue_score`, constante trompeuse** — ✅ corrigé.
+`redis.py` : `(10 - priority) * 1_000_000_000 + created_ms`. Le facteur 10⁹ est
+en **millisecondes**, donc 11,57 jours — et non une seconde, l'erreur naturelle
+de lecture. **Correctif :** constante nommée `QUEUE_PRIORITY_BAND_MS`, avec
+l'invariant démontré en commentaire (un ticket de priorité p2 > p1 créé après un
+ticket p1 passe devant tant que l'écart de création reste sous
+`(p2 - p1) × MARGE`) et un test qui verrouille la relation avec le TTL :
+`WAITING_TICKET_TTL_HOURS` (72 h) **doit** rester sous la marge, sinon un ticket
+ancien pourrait être doublé par une priorité supérieure. Relever le TTL au-delà
+de 11,57 jours fait échouer `tests/test_queue_score_geometry.py` avec le chiffre
+exact à corriger — c'est le seul garde-fou qui empêche une régression silencieuse.
 
 **17. Aucun audit des connexions** — `AuditLog` existe et est utilisé pour les
 tickets et les priorités, mais ni les connexions réussies ni les échecs n'y sont
 tracés. Une banque demandera « qui s'est connecté, quand, depuis où ».
 
-**18. `/health/ready` n'inspecte pas le scheduler** — `health_service.py:64`
-vérifie la base et Redis. Si la boucle de fond meurt, les tickets `CALLED` ne
-passent plus en `ABSENT` et la maintenance ne tourne plus, sans que le monitoring
-ne le voie. `/health/detailed` expose bien `scheduler.last_run_at`, mais ce n'est
-pas la sonde interrogée par UptimeRobot.
+**18. `/health/ready` n'inspecte pas le scheduler** — ✅ corrigé.
+`health_service.py` vérifiait la base et Redis. Si la boucle de fond mourait, les
+tickets `CALLED` ne passaient plus en `ABSENT` et la maintenance ne tournait plus,
+sans que le monitoring ne le voie. `/health/detailed` exposait bien
+`scheduler.last_run_at`, mais ce n'est pas la sonde interrogée par UptimeRobot.
+**Correctif :** un contrôle `scheduler` est ajouté à `/health/ready` (et à
+`/health/status`), avec cinq états — `disabled`, `not_wired`, `starting`,
+`healthy`, `unhealthy` — et trois diagnostics distincts :
+
+| Diagnostic | Signification |
+|---|---|
+| `loop_stopped` | la tâche de fond est terminée alors qu'elle devrait tourner |
+| `stalled` | boucle vivante mais aucune itération depuis plus de `SCHEDULER_STALE_AFTER_SECONDS` |
+| `never_ran` | lancée depuis trop longtemps sans avoir bouclé un seul tour |
+
+Les états neutres (`disabled`, `not_wired`, `starting`) sont rapportés mais ne
+font pas échouer la sonde : sinon un `SCHEDULER_ENABLED=false` assumé, ou un
+script CLI, suffirait à sortir l'instance du load balancer. Seul `unhealthy`
+dégrade la readiness — ce qui, sur Render, redémarre le service et déclenche un
+`warm_up` qui reconstruit files et échéances. La panne silencieuse devient une
+panne bruyante, puis une panne réparée.
 
 ---
 

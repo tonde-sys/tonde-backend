@@ -273,6 +273,31 @@ def _queue_key(org_id: str, agency_id: str, service_id: str) -> str:
     return f"tonde:{org_id}:{agency_id}:{service_id}:queue"
 
 
+# ── Géométrie du score de file ────────────────────────────────────────────────
+# Le score est un entier : (10 - priorité) × MARGE + created_ms.
+# La MARGE est exprimée en MILLISECONDES (10⁹ ms = 11,57 jours), et non dans une
+# unité abstraite : c'est ce qui rend le facteur trompeur à la lecture.
+#
+# Invariant garanti par cette marge :
+#   un ticket de priorité p2 > p1 créé APRÈS un ticket de priorité p1 passe quand
+#   même devant lui, À CONDITION que l'écart de création reste sous la marge.
+#   Démonstration : score1 - score2 = (p2 - p1) × MARGE - (t2 - t1) > 0
+#                  dès que (t2 - t1) < (p2 - p1) × MARGE.
+#
+# Conséquence pratique : la marge la plus faible est celle entre deux niveaux
+# consécutifs, soit UNE marge = 11,57 jours. Un ticket ne peut donc être doublé
+# par une priorité supérieure que s'il attend plus de 11,57 jours. Comme
+# WAITING_TICKET_TTL_HOURS (72 h = 3 jours) expire bien avant, l'invariant tient
+# par construction — voir tests/test_queue_score_geometry.py, qui échoue si
+# quelqu'un relève le TTL au-delà de la marge sans toucher à cette constante.
+#
+# Ne pas réduire cette constante : 10⁹ « ressemble » à des millisecondes mais
+# couvre 11,57 jours d'ancienneté. Diviser par 1000 (1,157 jour) casserait la
+# priorité dès qu'un ticket attend une journée.
+QUEUE_PRIORITY_BAND_MS = 1_000_000_000
+QUEUE_PRIORITY_BAND_DAYS = QUEUE_PRIORITY_BAND_MS / 86_400_000  # 11,574 jours
+
+
 def queue_score(priority: int, created_ms: Optional[int] = None) -> int:
     """
     Calcule le score Redis d'un ticket : priorité d'abord, puis FIFO.
@@ -282,6 +307,9 @@ def queue_score(priority: int, created_ms: Optional[int] = None) -> int:
     ticket) permet de reconstruire la file ou de changer une priorité SANS faire
     perdre au client son ancienneté.
 
+    Le score reste un entier exact en JSON/Redis (double 53 bits) : la valeur
+    maximale est 10 × 10⁹ + 1,7 × 10¹² ≈ 1,7 × 10¹², très loin de 9 × 10¹⁵.
+
     Args:
         priority: Score de priorité (0=standard, 3=priority, 5=vip, 9=emergency)
         created_ms: Horodatage de référence en ms (défaut : maintenant)
@@ -289,7 +317,7 @@ def queue_score(priority: int, created_ms: Optional[int] = None) -> int:
     import time
     if created_ms is None:
         created_ms = int(time.time() * 1000)
-    return (10 - priority) * 1_000_000_000 + created_ms
+    return (10 - priority) * QUEUE_PRIORITY_BAND_MS + created_ms
 
 
 async def add_to_queue(

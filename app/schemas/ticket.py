@@ -77,6 +77,39 @@ class TicketHistoryResponse(BaseModel):
     has_next: bool      # true si une page suivante existe
 
 
+class QueueEntry(BaseModel):
+    """
+    Une ligne de la file d'attente vue par le staff (constat P1-8).
+
+    Volontairement plus légère que `TicketResponse` : le poste guichet a besoin
+    d'ordonner, d'appeler et de repérer un ticket fantôme — pas de rejouer tout
+    le cycle de vie. Pas de `qr_token` non plus : un agent n'a pas à scanner le
+    QR d'un client, et l'exposer élargirait inutilement la surface.
+    """
+    ticket_id: str
+    number: str                                  # Ex: "C-005"
+    status: str                                  # waiting | called | serving
+    priority: str                                # Priorité effective
+    requested_priority: Optional[str] = None     # Demande non encore confirmée
+    position: int                                # Rang dans la file (1 = prochain)
+    waiting_since_minutes: int                   # Ancienneté dans l'état courant
+    created_at: datetime
+    counter_name: Optional[str] = None           # Guichet, si appelé/en service
+
+
+class QueueListResponse(BaseModel):
+    """File d'un service, ordonnée comme le sera l'appel du guichetier."""
+    agency_id: str
+    service_id: str
+    service_name: Optional[str] = None
+    waiting_count: int                    # Tickets WAITING
+    called_count: int                     # Tickets CALLED (appelés, non présentés)
+    serving_count: int                    # Tickets SERVING (en cours)
+    average_wait_minutes: Optional[int] = None
+    entries: list[QueueEntry]             # WAITING d'abord, puis CALLED, puis SERVING
+    generated_at: datetime
+
+
 class QueueUpdateEvent(BaseModel):
     """Structure des messages WebSocket envoyés au client mobile."""
     type: str                     # "queue_update", "your_turn", "absent_warning"

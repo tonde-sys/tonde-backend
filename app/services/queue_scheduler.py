@@ -47,6 +47,10 @@ class QueueScheduler:
         self._stopping = False
         self.last_run_at: float | None = None
         self.last_error: str | None = None
+        # Instant de démarrage de la boucle (après le warm-up). Sert de référence
+        # à la sonde de santé tant que `last_run_at` est encore vide : sans lui,
+        # une instance qui vient de démarrer paraîtrait « scheduler mort ».
+        self.started_at: float | None = None
 
     # ── Cycle de vie ──────────────────────────────────────────────────────────
 
@@ -54,6 +58,7 @@ class QueueScheduler:
         """Reconstruit l'état depuis la base, puis lance la boucle de fond."""
         await self.warm_up()
         self._stopping = False
+        self.started_at = time.time()
         self._task = asyncio.create_task(self._loop(), name="queue-scheduler")
         logger.info(
             f"Scheduler démarré (échéances toutes les {settings.SCHEDULER_INTERVAL_SECONDS}s, "
@@ -122,7 +127,7 @@ class QueueScheduler:
         """
         now_ts = now_ts if now_ts is not None else time.time()
         self.last_run_at = now_ts
-        stats = {"warnings": 0, "absent": 0, "expired": 0, "alerts": 0}
+        stats = {"warnings": 0, "absent": 0, "expired": 0, "alerts": 0, "repaired": 0}
 
         for org_id, ticket_id in await claim_due_deadlines(DEADLINE_WARNING, now_ts):
             if await self._safely(org_id, ticket_id, "avertissement", "send_absent_warning"):
@@ -140,6 +145,17 @@ class QueueScheduler:
                     expired = await service.expire_stale_tickets()
                     stats["expired"] = sum(expired.values())
                     stats["alerts"] = await service.alert_long_waits()
+                    # Auto-réparation des files (constat P1-11) : tout ticket WAITING
+                    # absent du ZSET y est réinséré avec son score d'origine.
+                    # PostgreSQL reste la source de vérité ; ZADD NX ne touche
+                    # jamais un score déjà présent. Le périmètre est restreint aux
+                    # agences ouvertes pour éviter un scan complet de `tickets`.
+                    stats["repaired"] = await service.repair_open_branches()
+                    if stats["repaired"]:
+                        logger.warning(
+                            f"Scheduler : {stats['repaired']} ticket(s) WAITING absents "
+                            f"de la file Redis ont été réinsérés"
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"Scheduler : maintenance échouée : {exc}", exc_info=True)
 

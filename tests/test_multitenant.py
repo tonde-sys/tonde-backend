@@ -36,13 +36,21 @@ async def _create_agency(db, org_id: str, slug: str) -> str:
         CreateBranchRequest(name=f"Agence {slug}", slug=slug, sector="bank"),
         caller_org_id=None,
     )
-    # Ouvrir la branch pour permettre la création de tickets dans les tests
+    # Ouvrir la branch pour permettre la création de tickets dans les tests.
+    # Les horaires sont explicites (00:00 → 23:59) : depuis que
+    # `is_branch_open_now` applique réellement la fenêtre `opens_at`/`closes_at`,
+    # une branch laissée aux valeurs par défaut (08:00 → 17:00) rendait ces
+    # tests dépendants de l'heure d'exécution. Ils passaient l'après-midi et
+    # échouaient en soirée sur `400 BRANCH_CLOSED` — sans qu'aucun code métier
+    # n'ait changé.
     from app.models.branch import Branch
     from sqlalchemy import select as sa_select
     result = await db.execute(sa_select(Branch).where(Branch.id == agency.id))
     ag = result.scalar_one()
     ag.is_open = True
     ag.is_active = True
+    ag.opens_at = "00:00"
+    ag.closes_at = "23:59"
     await db.commit()
     return agency.id
 

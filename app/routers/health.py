@@ -52,12 +52,14 @@ async def liveness():
 
 
 @router.get("/health/status", summary="État riche de l'API (base + Redis)")
-async def health_status():
+async def health_status(request: Request):
     """
     État complet pour les tableaux de bord et l'exploitation.
-    Retourne 503 « degraded » si la base ou Redis ne répond pas.
+    Retourne 503 « degraded » si la base, Redis ou le scheduler ne répond pas.
     """
-    ready, checks = await health_service.readiness()
+    ready, checks = await health_service.readiness(
+        scheduler=getattr(request.app.state, "scheduler", None)
+    )
     return JSONResponse(
         status_code=200 if ready else 503,
         content={
@@ -69,15 +71,23 @@ async def health_status():
                 "api": "ok",
                 "redis": "ok" if checks["redis"]["status"] == "healthy" else "error",
                 "database": "ok" if checks["database"]["status"] == "healthy" else "error",
+                "scheduler": checks["scheduler"]["status"],
             },
         },
     )
 
 
 @router.get("/health/ready", summary="Readiness probe")
-async def readiness():
-    """Prêt à recevoir du trafic ? 503 tant que la base ou Redis ne répond pas."""
-    ready, checks = await health_service.readiness()
+async def readiness(request: Request):
+    """
+    Prêt à recevoir du trafic ? 503 tant que la base ou Redis ne répond pas,
+    ou si la boucle de fond est arrêtée/bloquée (constat P2-18 : sans ce
+    contrôle, un scheduler mort laissait les tickets `CALLED` sans passage
+    automatique en `ABSENT`, sans alerte).
+    """
+    ready, checks = await health_service.readiness(
+        scheduler=getattr(request.app.state, "scheduler", None)
+    )
     return JSONResponse(
         status_code=200 if ready else 503,
         content={"status": "ready" if ready else "not_ready", "checks": checks},

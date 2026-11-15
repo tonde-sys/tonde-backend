@@ -25,6 +25,7 @@ from app.schemas.ticket import (
     CallNextRequest,
     CloseTicketRequest,
     CreateTicketRequest,
+    QueueListResponse,
     SetPriorityRequest,
     TransferTicketRequest,
 )
@@ -79,6 +80,36 @@ async def get_history(
     """
     service = TicketService(db)
     return await service.get_history(current_user.id, page)
+
+
+@router.get(
+    "/queue",
+    summary="File d'attente d'un service (staff)",
+    response_model=QueueListResponse,
+)
+async def list_queue(
+    agency_id: str = Query(..., description="Branch dont on liste la file"),
+    service_id: str = Query(..., description="Service (chaque service a sa file)"),
+    current_user: User = Depends(get_current_agent),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Liste les tickets en attente d'un service, dans l'ordre où ils seront appelés.
+
+    Complément indispensable de `POST /counter/call-next` : sans cette route, le
+    staff ne pouvait ni voir qui attend, ni repérer un ticket fantôme (il lui
+    fallait son UUID), ni anticiper la prochaine convocation.
+
+    - Rôle minimum : AGENT. Un agent ou un superviseur ne voit que les branches
+      où il est affecté ; un admin d'organisation voit toute son organisation.
+    - Ordre : priorité décroissante puis ancienneté — identique à celui de
+      `call-next`, donc la première ligne est le prochain ticket appelé.
+    - `position` vaut 0 pour les tickets déjà appelés ou en service (hors file).
+    - L'ordre est calculé depuis PostgreSQL : la route reste utilisable quand
+      Redis est indisponible.
+    """
+    service = TicketService(db)
+    return await service.list_queue(agency_id, service_id, current_user)
 
 
 @router.get("/qr/{qr_token}", summary="Valider un QR code de ticket")
