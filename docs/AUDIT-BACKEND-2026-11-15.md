@@ -117,7 +117,9 @@ Les trois P0 annoncés comme « courts, sans migration » sont corrigés et test
 | 2. Horaires ignorés | `is_branch_open_now` applique `opens_at`/`closes_at` quand `operating_hours` est NULL, gère les créneaux de nuit | `tests/test_branch_hours.py` (12) |
 | 3. Redis = 500 | lecture d'un ticket : repli base (position inconnue, total compté en SQL) ; création : `503 QUEUE_UNAVAILABLE` au lieu de 500 | `tests/test_queue_degradation.py` (3) |
 
-Suite complète après les trois lots : **318 passés, 129 ignorés, 0 échec**.
+Suite locale après les trois lots : **318 passés, 129 ignorés, 0 échec**.
+CI (avec Redis, donc les 129 tests inclus) : **447 passés, 0 ignoré, 0 échec**
+— run 26, commit `eaa4a3c`.
 
 Effet de bord à connaître : les agences dont `operating_hours` est NULL voient
 désormais leur fenêtre `opens_at`/`closes_at` réellement appliquée. ULBU
@@ -337,6 +339,22 @@ transitions ont été ajoutées à la machine à états : `CALLED → WAITING` e
 `SERVING → WAITING`, sans lesquelles ce retour est impossible.
 La remise en file est non bloquante : si elle échoue, la fermeture aboutit
 quand même et le scheduler rattrape le ticket.
+
+**Vérifié en production le 15/11/2026 à 16:31** (service en ligne, guichet 1
+d'ULBU) :
+
+```
+POST /tickets                        -> 200   C-005
+POST /tickets/counter/call-next      -> 200   C-005
+GET  /tickets/C-005                  -> status = called
+POST /counters/{id}/close            -> 200
+GET  /tickets/C-005                  -> status = waiting
+                                        counter_name = null
+                                        position = 1 / 1
+```
+
+Le client est revenu en file avec sa position, au lieu de rester `CALLED` puis
+de devenir `ABSENT`. Ticket clôturé et guichet rouvert dans la foulée.
 
 ### 8. Aucun endpoint pour lister la file
 
