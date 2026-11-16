@@ -228,6 +228,53 @@ jour où une agence dépassera la centaine de postes, pas avant.
 
 ---
 
+## Phase 6 — Le canal guichet — ✅ LIVRÉE
+
+Trois défauts signalés par l'agent desktop, tous confirmés dans le code avant
+d'écrire une ligne. Ils formaient un seul sujet : **le poste de guichet était un
+canal à sens unique**, alimenté à la connexion et jamais ensuite.
+
+| Défaut | Ce qui se passait réellement |
+|---|---|
+| `websocket_counter` lisait `user.org_id` seul | `super_admin` a `org_id = NULL` par construction → **aucun** guichet écoutable par l'équipe Tonde. Un agent dont `org_id` désignait une organisation périmée (P0-5) était refusé à son propre guichet. |
+| Pas de `POST /tickets/{id}/recall` | L'agent qui venait d'appeler un client resté dehors n'avait qu'une option : le déclarer `ABSENT`, donc le renvoyer derrière tout le monde. Le bouton « R » du desktop avait dû être masqué hors mode démonstration. |
+| `counter_connections` jamais parcouru | Alimenté par `connect_counter`, lu par `send_to_counter`, et **aucun événement ne le traversait**. D'où le sondage HTTP toutes les 7 s. |
+
+Ce qui a été fait :
+
+- `app.core.access.get_staff_org_ids` — union de `User.org_id` et des `Employee`
+  actifs. Source unique du contrôle, au lieu d'un champ hérité mono-organisation
+  qui ne peut pas représenter le staff multi-organisations du modèle.
+- `_authorize_counter_stream` — la décision d'autorisation sortie du handler
+  WebSocket, donc testable sans socket. Le reste du handler n'est que du
+  transport.
+- `TicketService.recall` + `POST /{id}/recall` — rediffuse `your_turn` et
+  `ticket_called`, renvoie le SMS, **remet le compte à rebours ABSENT à zéro**
+  (sans quoi la relance est une annonce dans le vide), trace l'action.
+- `EventType.COUNTER_QUEUE_CHANGED` + `counter_agency` +
+  `send_to_agency_counters` — les écrans de guichet d'une agence reçoivent enfin
+  les créations, appels, services terminés, absences, transferts et relances.
+
+Trois arbitrages méritent d'être notés :
+
+- **Le plafond de relance est compté dans `audit_logs`, pas dans Redis.** Chaque
+  relance coûte un vrai SMS ; un redémarrage de Redis ne doit pas rouvrir le
+  droit d'en envoyer trois de plus au même client. Le journal est la source
+  durable, et il porte déjà « qui a relancé quoi ».
+- **L'événement de guichet est publié dans `_transition`, pas chez chaque
+  appelant.** C'est le point unique par lequel passe tout changement d'état :
+  aucune transition ne peut être oubliée. Contrepartie assumée — une transition
+  annulée par un rollback émet un événement de trop. Le client y réagit en
+  relisant l'état, donc l'annonce excédentaire est sans effet ; une transition
+  manquée, elle, laisserait le poste muet jusqu'au prochain sondage.
+- **Le message reste pauvre** : il dit *ce qui* a changé (`reason`, statut,
+  numéro), pas l'état complet de la file. Inventer ici un format que le desktop
+  devra suivre à vie serait un contrat gratuit.
+
+Suite locale : **492 passés, 138 ignorés, 0 échec** (+32).
+
+---
+
 ## Ce que ce plan ne couvre pas
 
 - **Charge réelle** : aucune mesure sous 12 postes simultanés. Le N+1 est une
@@ -267,12 +314,13 @@ jour où une agence dépassera la centaine de postes, pas avant.
 
 **~~CI Redis → P0-7/5/12 → P1-4~~ (fait) → ~~P1-11/15/16/18 → P1-8~~ (fait) →
 ~~P3-10/9/17 → mot de passe oublié + rapport quotidien~~ (fait) →
-~~P2-13/14 + 401/403~~ (fait) → back-office → desktop signé → facturation.**
+~~P2-13/14 + 401/403~~ (fait) → ~~canal guichet~~ (fait) → back-office →
+desktop signé → facturation.**
 
 Tout ce qui relève de ce dépôt est livré : P0, fiabilité du moteur, supervision,
-sécurité/conformité, les deux fonctions produit qui manquaient, et la dette
-technique. Ce qui reste — back-office, distribution desktop, facturation — ne se
-code pas ici.
+sécurité/conformité, les deux fonctions produit qui manquaient, la dette
+technique, et le canal temps réel du guichet. Ce qui reste — back-office,
+distribution desktop, facturation — ne se code pas ici.
 
 ## Journal d'avancement
 
@@ -287,6 +335,7 @@ code pas ici.
 | Phase 4 | Mot de passe oublié (SMTP, jeton usage unique) + `daily-report` | `9f2ae62` |
 | Phase 5 | P2-13 + migration `010`, P2-14, 401/403 | `53f9ff5` |
 | Phase 5 bis | SMTP visible dans `/health/detailed`, sondes en `HEAD` | `a69b37d` |
+| Phase 6 | Canal guichet : autorisation WS multi-organisations, `POST /recall`, événements de file vers les écrans | à venir |
 
 ### Ce que les phases 3 et 4 ont appris
 
@@ -331,3 +380,26 @@ Suite locale : **429 passés, 132 ignorés, 0 échec**. CI : **run #33 verte**
 
 Suite locale : **460 passés, 138 ignorés, 0 échec**. CI : **run #37 verte**
 (2 min 18 s), `alembic upgrade head` inclus sur PostgreSQL 15.
+
+### Ce que la phase 6 a appris
+
+- **Un canal qui n'écoute rien ne se voit pas dans les tests.** `connect_counter`
+  et `send_to_counter` étaient chacun testés et verts ; personne ne testait le
+  lien entre les deux. Un dictionnaire alimenté et jamais parcouru est une
+  fonctionnalité morte qui a l'air vivante.
+- **Un champ dénormalisé ne peut pas porter une règle multi-valuée.**
+  `User.org_id` est mono-organisation ; le modèle autorise plusieurs `Employee`.
+  Tant qu'un contrôle lit le champ, le cas minoritaire est un bug — et ce
+  minoritaire est `super_admin`, c'est-à-dire l'équipe qui doit diagnostiquer.
+- **La bonne façon de tester un handler WebSocket est de ne pas le tester.** La
+  décision a été extraite dans une fonction pure de transport ; 13 tests
+  couvrent l'autorisation sans ouvrir une seule socket.
+- **Un plafond doit être compté là où il survit.** Un compteur Redis aurait été
+  plus rapide et faux : le redémarrage remet le compteur à zéro, et l'argent
+  perdu ne revient pas.
+- **Il faut distinguer les deux modes de panne de `publish_event`.** Le simuler
+  par un `raise` teste le mock ; en production il retourne `False`. Les deux
+  fixtures existent, chacune pour ce qu'elle prouve vraiment.
+- **Une mutation vérifie qu'un test mord.** Les trois correctifs ont été retirés
+  un par un pour confirmer que la suite tombe : sans cela, 32 tests verts
+  pouvaient aussi bien ne rien tester.

@@ -66,7 +66,7 @@ qu'aucun utilisateur ne peut changer lui-même.
 
 ### État d'avancement
 
-Vue unique, à jour au 16/11/2026 12:45. ✅ = corrigé **et** couvert par des
+Vue unique, à jour au 16/11/2026 15:30. ✅ = corrigé **et** couvert par des
 tests ; ⬜ = rien n'a été fait, le constat reste vrai.
 
 **Les 20 constats sont traités, et l'observation 401/403 est corrigée.** Ce
@@ -86,7 +86,7 @@ qui manquent encore (voir la dernière section).
 | 7 | Fermer un guichet laisse le ticket CALLED orphelin | ✅ | `tests/test_phase0_corrections.py` (3) |
 | 8 | Aucun endpoint pour lister la file côté staff | ✅ | `tests/test_queue_listing.py` (15) |
 | 9 | Un seul WebSocket par ticket | ✅ | `tests/test_phase3_security.py` (6) |
-| 10 | `websocket_counter` : aucun contrôle d'affectation | ✅ | `tests/test_phase3_security.py` (5) |
+| 10 | `websocket_counter` : aucun contrôle d'affectation | ✅ | `tests/test_phase3_security.py` (5) + `tests/test_phase6_counter_channel.py` (13) |
 | 11 | `return_to_queue` sans repli si Redis échoue | ✅ | `tests/test_phase1_corrections.py` (3) |
 | 12 | `GET /tickets/history` renvoie `position: 0` | ✅ | `tests/test_phase0_corrections.py` (2) |
 | 13 | Préfixe de service unique seulement entre services actifs | ✅ | `tests/test_phase5_service_prefix.py` (10) + migration `010` |
@@ -469,6 +469,17 @@ Le code 4003 est distinct du 4004 déjà utilisé pour « guichet d'une autre
 organisation » : côté client, « pas votre guichet » (réaffectation à demander) et
 « pas votre organisation » (erreur de configuration) demandent deux réactions
 différentes.
+
+**Suite trouvée plus tard (phase 6).** Le contrôle d'organisation, lui, lisait
+`user.org_id` seul — exactement le défaut corrigé par `715dfb1` pour
+`/auth/login`, `/auth/me` et `GET /tickets/{id}`, mais oublié ici. Conséquence
+concrète : `super_admin` a `org_id = NULL` par construction, donc **l'équipe
+Tonde ne pouvait s'abonner au flux d'aucun guichet** — c'est-à-dire que le canal
+qui sert à diagnostiquer une salle était fermé à ceux qui diagnostiquent. Le
+contrôle lit désormais `get_staff_org_ids` (union de `User.org_id` et des
+`Employee` actifs), et la décision est sortie du handler dans
+`_authorize_counter_stream` pour être testable sans socket. Détail en fin de
+document, « Livraison de la phase 6 ».
 
 ### 11. `return_to_queue` sans repli Redis — ✅ corrigé
 
@@ -923,6 +934,84 @@ production, déployée depuis `main` :
 |---|---|
 | `POST /auth/forgot-password` (compte inexistant) | `200` + réponse neutre, aucun email |
 | `POST /auth/reset-password` (jeton inventé) | `400` `INVALID_RESET_TOKEN` |
+
+---
+
+## Livraison de la phase 6 — le canal guichet
+
+Trois défauts signalés par l'agent desktop, tous confirmés dans le code avant
+d'écrire une ligne. Ils forment un seul sujet : **le poste de guichet était un
+canal à sens unique**, alimenté à la connexion et jamais ensuite.
+
+| Signalement | Vérification | Livré |
+|---|---|---|
+| `if not user.org_id` sur `/tickets/ws/counter/{id}` | Exact — et `super_admin` a `org_id = NULL`, donc aucun guichet écoutable par l'équipe Tonde | `get_staff_org_ids` + `_authorize_counter_stream` |
+| Pas de `POST /tickets/{id}/recall` | Exact — aucun `recall` dans le code hors préférences SMS | `TicketService.recall` + route + `AuditAction.TICKET_RECALLED` |
+| `counter_connections` ne reçoit aucun événement métier | Exact — écrit par `connect_counter`, lu par `send_to_counter`, jamais traversé | `COUNTER_QUEUE_CHANGED` + `counter_agency` + `send_to_agency_counters` |
+
+### Pourquoi le premier défaut n'était pas anodin
+
+`User.org_id` est un champ **mono-organisation hérité**. Le modèle `Employee`
+autorise plusieurs lignes par utilisateur (une par organisation) et
+`get_memberships` renvoie une liste : le staff multi-organisations est un cas
+prévu. Un contrôle qui ne lit que `User.org_id` refuse donc un agent légitime
+dans deux situations, et la seconde est plus vicieuse que la première :
+
+- `super_admin` : `org_id = NULL` par construction (`bootstrap_service`). Le
+  canal de diagnostic était fermé à l'équipe qui diagnostique.
+- rattachement multiple : `deactivate` ne réécrit pas `org_id` quand un autre
+  rattachement subsiste (P0-5), donc `org_id` peut désigner une organisation dont
+  le rattachement a été retiré. L'agent est alors refusé **à son propre guichet**,
+  avec le motif « guichet introuvable dans votre organisation ».
+
+Le correctif est une fonction, `get_staff_org_ids`, et non un `or` ajouté dans
+le handler : la même règle servira au prochain contrôle multi-organisations.
+
+### Pourquoi la relance devait exister
+
+Quand un client n'entend pas son numéro — salle bruyante, il était dehors — la
+seule action disponible était de le déclarer `ABSENT`. C'est-à-dire de le
+**renvoyer derrière tout le monde pour un problème d'audition**. Le poste desktop
+avait masqué son bouton « Rappeler » hors mode démonstration pour ne pas offrir
+un bouton qui échoue.
+
+Une relance rediffuse `your_turn` (téléphone) et `ticket_called` (salle), renvoie
+le SMS, et **remet le compte à rebours ABSENT à zéro**. Sans ce dernier point, la
+relance serait une annonce dans le vide : le ticket passerait `ABSENT` pendant que
+le client arrive.
+
+Le plafond (`MAX_RECALLS_PER_TICKET`, défaut 2) est compté dans `audit_logs`, pas
+dans Redis. Chaque relance envoie un vrai SMS ; un redémarrage de Redis ne doit
+pas rouvrir le droit d'en envoyer trois de plus au même client. Le journal est la
+source durable, et il porte déjà « qui a relancé quoi ».
+
+### Pourquoi le message diffusé est pauvre
+
+L'événement `counter_queue_changed` dit *ce qui* a changé (`reason`, statut,
+numéro, guichet), jamais l'état complet de la file. Deux raisons :
+
+- un format d'état complet devient un contrat que le desktop devra suivre à vie,
+  pour un gain nul : le poste redemande le détail s'il en a besoin ;
+- l'événement est publié dans `_transition`, le point unique par lequel passe
+  tout changement d'état — donc aucune transition ne peut être oubliée. La
+  contrepartie assumée est qu'une transition annulée par un rollback émet un
+  événement de trop. Le client y réagit en relisant l'état : l'annonce
+  excédentaire est sans effet, alors qu'une transition **manquée** laisserait le
+  poste muet jusqu'au prochain sondage — c'est précisément le défaut corrigé.
+
+### Ce que les tests ont dû apprendre à distinguer
+
+Deux modes de panne de `publish_event` coexistent et ne se testent pas de la même
+façon : en production la fonction **avale** ses exceptions et retourne `False`,
+elle ne lève pas. La simuler par un `raise` teste le mock, pas le service. Les
+deux fixtures existent donc — `canaux_muet` (`False`) pour le comportement réel,
+`canaux_en_panne` (`raise`) pour vérifier que les garde-fous locaux tiennent même
+si ce contrat changeait un jour.
+
+Les trois correctifs ont ensuite été **retirés un par un** pour confirmer que la
+suite tombe : sans cela, 32 tests verts pouvaient aussi bien ne rien tester.
+
+**Vérification.** Suite locale : **492 passés, 138 ignorés, 0 échec** (+32).
 
 ---
 

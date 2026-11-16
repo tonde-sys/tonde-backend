@@ -56,6 +56,39 @@ def assert_org_access(user: User, org_id: str) -> None:
         raise forbidden("Accès refusé à cette organisation")
 
 
+async def get_staff_org_ids(db: AsyncSession, user: User) -> set[str]:
+    """
+    Organisations dans lesquelles l'utilisateur a un rattachement staff.
+
+    `User.org_id` est un champ MONO-organisation hérité. Le modèle `Employee`
+    autorise plusieurs lignes par utilisateur (une par organisation) et
+    `get_memberships` renvoie une liste — le staff multi-organisations est donc
+    un cas prévu par le modèle. Un contrôle qui ne lit que `User.org_id` refuse
+    un agent légitime dans deux situations :
+
+      - `super_admin` : `org_id = NULL` par construction (compte Tonde,
+        transverse). Il ne pouvait se connecter au WebSocket d'AUCUN guichet.
+      - rattachement multiple : `deactivate` ne réécrit pas `org_id` quand un
+        autre rattachement subsiste (P0-5), donc `org_id` peut désigner une
+        organisation dont le rattachement a été retiré.
+
+    Returns:
+        L'ensemble des organisations accessibles, `User.org_id` inclus.
+    """
+    org_ids: set[str] = set()
+    if user.org_id:
+        org_ids.add(user.org_id)
+
+    result = await db.execute(
+        select(Employee.org_id).where(
+            Employee.user_id == user.id,
+            Employee.status == EmployeeStatus.ACTIVE,
+        )
+    )
+    org_ids.update(org_id for (org_id,) in result.all() if org_id)
+    return org_ids
+
+
 async def get_staff_branch_ids(db: AsyncSession, user: User) -> set[str]:
     """
     Retourne les branches auxquelles un employé est affecté.

@@ -55,6 +55,14 @@ AGENCY_BROADCAST_EVENTS = {
     EventType.COUNTER_PAUSE.value,
 }
 
+# Événements diffusés à tous les ÉCRANS DE GUICHET d'une branch (champ
+# 'agency_id' obligatoire). Un guichet peut servir n'importe quel service de son
+# agence : un changement de file le concerne donc tous, pas seulement celui qui
+# l'a provoqué.
+COUNTER_BROADCAST_EVENTS = {
+    EventType.COUNTER_QUEUE_CHANGED.value,
+}
+
 
 class QueueWebSocketManager:
     """
@@ -81,6 +89,9 @@ class QueueWebSocketManager:
         self.connections_by_agency: Dict[str, Set[WebSocket]] = {}
         # Guichetiers desktop (plusieurs écrans possibles)
         self.counter_connections: Dict[str, Set[WebSocket]] = {}
+        # counter_id → agency_id : nécessaire pour router un événement de file
+        # vers tous les écrans d'une agence sans connaître la base.
+        self.counter_agency: Dict[str, str] = {}
 
     # ── Connexions ────────────────────────────────────────────────────────────
 
@@ -109,13 +120,24 @@ class QueueWebSocketManager:
         )
 
     async def connect_counter(
-        self, websocket: WebSocket, counter_id: str
+        self, websocket: WebSocket, counter_id: str, agency_id: str | None = None
     ) -> None:
-        """Enregistre la connexion d'un guichetier desktop (ajout, pas remplacement)."""
+        """
+        Enregistre la connexion d'un guichetier desktop (ajout, pas remplacement).
+
+        Args:
+            websocket: La connexion acceptée
+            counter_id: Guichet du poste
+            agency_id: Branch du guichet. Sans elle, l'écran ne recevra aucun
+                événement de file : c'est l'index qui permet de router un
+                changement de file vers tous les guichets de l'agence.
+        """
         await websocket.accept()
         self.counter_connections.setdefault(counter_id, set()).add(websocket)
+        if agency_id:
+            self.counter_agency[counter_id] = agency_id
         logger.info(
-            f"WS guichet connecté — counter={counter_id} | "
+            f"WS guichet connecté — counter={counter_id} | agency={agency_id} | "
             f"écrans={len(self.counter_connections[counter_id])}"
         )
 
@@ -171,6 +193,10 @@ class QueueWebSocketManager:
                 connections.discard(websocket)
                 if not connections:
                     self.counter_connections.pop(counter_id, None)
+        # L'index d'agence ne survit pas au dernier écran du guichet : sinon il
+        # pointerait indéfiniment vers un guichet dont plus personne n'écoute.
+        if counter_id not in self.counter_connections:
+            self.counter_agency.pop(counter_id, None)
         logger.info(f"WS guichet déconnecté — counter={counter_id}")
 
     # ── Envoi ciblé ───────────────────────────────────────────────────────────
@@ -245,6 +271,25 @@ class QueueWebSocketManager:
         if disconnected:
             self.connections_by_agency[agency_id] -= disconnected
             logger.debug(f"Nettoyage {len(disconnected)} connexions mortes — agency={agency_id}")
+
+    async def send_to_agency_counters(self, agency_id: str, data: dict) -> None:
+        """
+        Envoie un message à tous les ÉCRANS DE GUICHET d'une agence.
+
+        C'est le chaînon qui manquait : `counter_connections` était alimenté à la
+        connexion mais aucun événement ne le parcourait jamais, si bien que le
+        poste desktop n'apprenait rien en temps réel et devait interroger l'API
+        toutes les 7 secondes pour voir arriver un client.
+
+        Chaque guichet reçoit une copie séparée (`send_to_counter`), pour qu'un
+        écran mort n'empêche pas les autres d'être servis.
+        """
+        counter_ids = [
+            counter_id for counter_id, agency in list(self.counter_agency.items())
+            if agency == agency_id and counter_id in self.counter_connections
+        ]
+        for counter_id in counter_ids:
+            await self.send_to_counter(counter_id, data)
 
     # ── Événements métier ─────────────────────────────────────────────────────
 
@@ -347,6 +392,10 @@ class QueueWebSocketManager:
         # Événements de SALLE : tous les clients connectés à la branch
         elif event_type in AGENCY_BROADCAST_EVENTS:
             await self.broadcast_to_agency(event["agency_id"], event)
+
+        # Événements de GUICHET : tous les écrans de guichet de la branch
+        elif event_type in COUNTER_BROADCAST_EVENTS:
+            await self.send_to_agency_counters(event["agency_id"], event)
 
         # État complet d'une file → un QUEUE_UPDATE individuel par client local
         elif event_type == EventType.QUEUE_SNAPSHOT.value:

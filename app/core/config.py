@@ -117,6 +117,12 @@ class Settings(BaseSettings):
     ABSENT_TIMEOUT_SECONDS: int = 180
     # Avertissement « dépêchez-vous » envoyé avant l'expiration.
     ABSENT_WARNING_SECONDS: int = 120
+    # Nombre de RELANCES autorisées pour un ticket déjà appelé.
+    # Une relance renvoie un SMS au client : sans plafond, un agent qui s'acharne
+    # sur le bouton « Rappeler » fait exploser la facture SMS et harcèle un client
+    # qui a peut-être simplement tourné les talons. 2 relances = 3 annonces en
+    # tout, largement suffisant pour une salle d'attente.
+    MAX_RECALLS_PER_TICKET: int = 2
     # Un client ABSENT peut revenir en file pendant cette fenêtre, ensuite son ticket est clos.
     ABSENT_RETURN_WINDOW_MINUTES: int = 30
     # Filet de sécurité — PAS la règle d'expiration.

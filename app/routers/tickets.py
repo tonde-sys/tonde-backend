@@ -16,9 +16,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.access import get_staff_org_ids
 from app.core.database import AsyncSessionLocal, get_db
 from app.core.deps import get_current_agent, get_current_user, get_optional_user
 from app.core.middlewares import check_ws_rate_limit, limiter
+from app.models.counter import Counter
+from app.models.employee import Employee, EmployeeStatus
 from app.models.ticket import Ticket
 from app.models.user import User, UserRole
 from app.schemas.ticket import (
@@ -30,7 +33,7 @@ from app.schemas.ticket import (
     TransferTicketRequest,
 )
 from app.services.public_service import PublicQueueService
-from app.services.ticket_service import TicketService
+from app.services.ticket_service import ANY_COUNTER_ROLES, TicketService
 from app.websocket.queue_ws import ws_manager
 
 logger = logging.getLogger(__name__)
@@ -203,6 +206,26 @@ async def call_next(
         org_id=current_user.org_id,
         actor=current_user,
     )
+
+
+@router.post("/{ticket_id}/recall", summary="Relancer l'annonce d'un ticket appelé")
+async def recall_ticket(
+    ticket_id: str,
+    current_user: User = Depends(get_current_agent),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Relance l'annonce d'un client déjà appelé qui ne s'est pas présenté.
+
+    Rediffuse l'appel (salle + téléphone), renvoie le SMS et **remet le compte à
+    rebours ABSENT à zéro**. Plafonné par `MAX_RECALLS_PER_TICKET` : chaque
+    relance coûte un SMS.
+
+    Sans cet endpoint, la seule action possible était de déclarer le client
+    ABSENT — c'est-à-dire de le renvoyer derrière tout le monde parce qu'il
+    n'avait pas entendu son numéro.
+    """
+    return await TicketService(db).recall(ticket_id, current_user)
 
 
 @router.post("/{ticket_id}/serving", summary="Guichetier confirme le service")
@@ -401,7 +424,7 @@ async def websocket_counter(
     Reçoit les notifications en temps réel. Nécessite un token valide avec rôle AGENT minimum.
 
     Sécurité (constat P3-10 de l'audit) :
-    - le guichet doit appartenir à l'organisation de l'agent ;
+    - le guichet doit appartenir à une organisation où l'agent est rattaché ;
     - et l'agent doit y être **affecté** : un agent du guichet 1 ne peut pas
       s'abonner au flux du guichet 7.
 
@@ -409,11 +432,11 @@ async def websocket_counter(
     (`TicketService._verify_agent_assignment`) mais pas ici : n'importe quel
     agent de l'organisation pouvait écouter les événements d'un autre guichet,
     donc voir les tickets appelés et servis par un collègue.
+
+    L'autorisation elle-même est dans `_authorize_counter_stream`, testable sans
+    ouvrir de socket.
     """
     from app.core.security import verify_token
-    from app.models.counter import Counter
-    from app.models.employee import Employee, EmployeeStatus
-    from app.services.ticket_service import ANY_COUNTER_ROLES
 
     if not await check_ws_rate_limit(websocket):
         await websocket.close(code=4029, reason="Trop de connexions")
@@ -426,39 +449,16 @@ async def websocket_counter(
 
     async with AsyncSessionLocal() as session:
         user = (await session.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-        if not user or not user.is_active or user.role == UserRole.CLIENT:
-            await websocket.close(code=4003, reason="Accès réservé aux agents")
-            return
-        if not user.org_id:
-            await websocket.close(code=4003, reason="Agent sans organisation")
-            return
-        counter = (await session.execute(
-            select(Counter).where(Counter.id == counter_id, Counter.org_id == user.org_id)
-        )).scalar_one_or_none()
-        if not counter:
-            await websocket.close(code=4004, reason="Guichet introuvable dans votre organisation")
-            return
+        counter, refusal = await _authorize_counter_stream(session, user, counter_id)
 
-        # Affectation : même règle que le REST, appliquée ici.
-        if user.role not in ANY_COUNTER_ROLES:
-            assigned = (await session.execute(
-                select(Employee.id).where(
-                    Employee.user_id == user.id,
-                    Employee.org_id == counter.org_id,
-                    Employee.counter_id == counter.id,
-                    Employee.status == EmployeeStatus.ACTIVE,
-                )
-            )).scalar_one_or_none()
-            if assigned is None:
-                await websocket.close(code=4003, reason="Vous n'êtes pas affecté à ce guichet")
-                logger.warning(
-                    f"WS guichet refusé — agent={user_id} non affecté au counter={counter_id}"
-                )
-                return
-        org_id = user.org_id
+    if refusal is not None:
+        code, reason = refusal
+        await websocket.close(code=code, reason=reason)
+        logger.warning(f"WS guichet refusé — agent={user_id} counter={counter_id} : {reason}")
+        return
 
-    await ws_manager.connect_counter(websocket, counter_id)
-    logger.info(f"WS guichet connecté — counter={counter_id} | agent={user_id} | org={org_id}")
+    await ws_manager.connect_counter(websocket, counter_id, agency_id=counter.agency_id)
+    logger.info(f"WS guichet connecté — counter={counter_id} | agent={user_id} | org={counter.org_id}")
 
     try:
         await websocket.send_text('{"type": "connected", "message": "Guichet connecté"}')
@@ -471,3 +471,57 @@ async def websocket_counter(
     finally:
         # Un guichet peut avoir deux écrans : on ne retire que celui qui part.
         ws_manager.disconnect_counter(counter_id, websocket)
+
+
+async def _authorize_counter_stream(
+    session: AsyncSession, user: User | None, counter_id: str
+) -> tuple[Counter | None, tuple[int, str] | None]:
+    """
+    Autorise — ou refuse — l'abonnement au flux d'un guichet.
+
+    Isolée du handler WebSocket pour être testable sans ouvrir de socket : c'est
+    la seule partie qui contient une décision, le reste est du transport.
+
+    Règles, alignées sur le REST (`_verify_agent_assignment`) :
+      - CLIENT : refusé (le flux d'un guichet n'est pas public) ;
+      - aucun rattachement staff actif : refusé (compte mal configuré) ;
+      - guichet d'une organisation étrangère : refusé ;
+      - AGENT non affecté à ce guichet : refusé ;
+      - SUPERVISOR et au-dessus : accepté dans leur périmètre d'organisation.
+
+    Le rattachement est lu sur `Employee` (actif) ET sur `User.org_id` : ce
+    dernier seul ne suffit pas — il vaut NULL pour un `super_admin`, et il peut
+    désigner une organisation dont le rattachement a été retiré alors qu'un autre
+    subsiste (voir `app.core.access.get_staff_org_ids`).
+
+    Returns:
+        (counter, None) si autorisé ; (None, (code_fermeture, raison)) sinon.
+    """
+    if user is None or not user.is_active or user.role == UserRole.CLIENT:
+        return None, (4003, "Accès réservé aux agents")
+
+    org_ids = await get_staff_org_ids(session, user)
+    if user.role != UserRole.SUPER_ADMIN and not org_ids:
+        return None, (4003, "Compte staff sans rattachement à une organisation")
+
+    counter = (await session.execute(
+        select(Counter).where(Counter.id == counter_id)
+    )).scalar_one_or_none()
+    if counter is None or (
+        user.role != UserRole.SUPER_ADMIN and counter.org_id not in org_ids
+    ):
+        return None, (4004, "Guichet introuvable dans votre organisation")
+
+    if user.role not in ANY_COUNTER_ROLES:
+        assigned = (await session.execute(
+            select(Employee.id).where(
+                Employee.user_id == user.id,
+                Employee.org_id == counter.org_id,
+                Employee.counter_id == counter.id,
+                Employee.status == EmployeeStatus.ACTIVE,
+            )
+        )).scalar_one_or_none()
+        if assigned is None:
+            return None, (4003, "Vous n'êtes pas affecté à ce guichet")
+
+    return counter, None

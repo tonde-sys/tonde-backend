@@ -29,6 +29,10 @@ class AuditAction:
     TICKET_TRANSFERRED = "ticket_transferred"
     TICKET_REQUEUED = "ticket_requeued"
     TICKET_EXPIRED = "ticket_expired"
+    # Relance de l'annonce d'un ticket appelé. Tracée parce qu'elle envoie un SMS
+    # (coût réel) et parce qu'un agent qui relance dix fois le même client est un
+    # signal d'exploitation, pas un détail.
+    TICKET_RECALLED = "ticket_recalled"
     # Connexions (constat P3-17) — « qui s'est connecté, quand, depuis où ».
     LOGIN_SUCCEEDED = "login_succeeded"
     LOGIN_FAILED = "login_failed"

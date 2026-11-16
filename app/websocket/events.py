@@ -36,6 +36,12 @@ class EventType(str, Enum):
     COUNTER_OPEN       = "counter_open"       # Guichet ouvert (broadcast agence)
     COUNTER_CLOSE      = "counter_close"      # Guichet fermé (broadcast agence)
     COUNTER_PAUSE      = "counter_pause"      # Guichet en pause (broadcast agence)
+    # Une file de l'agence a changé (création, appel, service terminé, absence,
+    # transfert, annulation, priorité). Diffusé à TOUS les écrans de guichet de
+    # l'agence : sans lui, `counter_connections` ne recevait jamais rien et le
+    # poste desktop devait interroger l'API toutes les 7 secondes pour voir
+    # arriver un client.
+    COUNTER_QUEUE_CHANGED = "counter_queue_changed"
 
     # ── Événements internes / priorité ───────────────────────
     # QUEUE_SNAPSHOT circule UNIQUEMENT entre instances (via Redis) : il contient

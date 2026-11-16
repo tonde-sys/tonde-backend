@@ -47,7 +47,7 @@ from app.core.redis import (
     restore_to_queue,
     set_deadline,
 )
-from app.models.audit_log import AuditAction
+from app.models.audit_log import AuditAction, AuditLog
 from app.models.branch import Branch, Service
 from app.models.counter import Counter
 from app.models.employee import Employee, EmployeeStatus
@@ -69,7 +69,7 @@ from app.schemas.ticket import (
 )
 from app.services.audit_service import AuditService
 from app.websocket.events import EventType
-from app.websocket.publisher import publish_event, queue_snapshot_event
+from app.websocket.publisher import counter_activity_event, publish_event, queue_snapshot_event
 
 logger = logging.getLogger(__name__)
 
@@ -413,6 +413,13 @@ class TicketService:
             f"Ticket créé: {ticket_number} | org={ticket.org_id} | position={position} | ETA={eta}min"
             + (f" | priorité demandée={requested_priority.value}" if requested_priority else "")
         )
+
+        # La création n'est pas une transition : `_transition` n'est pas appelé ici,
+        # donc l'écran de salle et les guichets ne sauraient rien avant le prochain
+        # sondage. C'est le cas le plus fréquent de la journée (un client arrive),
+        # et c'est précisément celui que le poste desktop devait attendre 7 secondes.
+        await self._publish_counter_activity(ticket, "ticket_created")
+
         return self._to_response(ticket, position=position, total=total, eta=eta)
 
     # ══ Consultation ═══════════════════════════════════════════════════════════
@@ -945,6 +952,166 @@ class TicketService:
             "ticket_number": ticket.number,
             "counter_name": counter_name,
             "user_id": ticket.user_id,
+        }
+
+    async def recall(self, ticket_id: str, actor: User) -> dict:
+        """
+        Relance l'annonce d'un ticket DÉJÀ appelé.
+
+        Pourquoi ce endpoint existe : quand un client n'entend pas son numéro (salle
+        bruyante, il était dehors), l'agent n'avait aucun moyen de le rappeler. Sa
+        seule option était de le déclarer ABSENT, ce qui renvoyait le client
+        derrière tout le monde — une punition pour un problème d'audition. Le poste
+        desktop a donc dû masquer son bouton « Rappeler » hors mode démonstration.
+
+        Ce que fait une relance :
+          - rediffuse `your_turn` (téléphone du client) et `ticket_called` (salle) ;
+          - renvoie le SMS / push d'appel ;
+          - **remet le compte à rebours à zéro** (avertissement + passage en ABSENT),
+            sans quoi la relance serait un bruit sans effet ;
+          - prévient les écrans de guichet ;
+          - laisse une trace d'audit.
+
+        Limite : `MAX_RECALLS_PER_TICKET` (défaut 2). Chaque relance envoie un SMS
+        réel ; sans plafond, un agent qui s'acharne sur le bouton fait exploser la
+        facture et harcèle un client qui a peut-être simplement quitté la salle.
+
+        Args:
+            ticket_id: Ticket concerné
+            actor: Agent ou superviseur qui relance
+
+        Returns:
+            Dict avec ticket_number, counter_name, recall_count, recalls_left,
+            timeout_seconds.
+
+        Raises:
+            HTTPException 404: Ticket introuvable dans le périmètre de l'acteur
+            HTTPException 403: Ticket d'un autre guichet / d'une autre branch
+            HTTPException 409: Ticket pas en état CALLED, ou plafond de relances atteint
+        """
+        ticket = await self._get_ticket_for_staff(ticket_id, actor)
+        await self._assert_staff_can_handle(actor, ticket)
+
+        if ticket.status != TicketStatus.CALLED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "TICKET_NOT_CALLED",
+                    "message": (
+                        f"Seul un ticket appelé peut être relancé "
+                        f"(statut actuel : {ticket.status.value})"
+                    ),
+                },
+            )
+
+        if not ticket.counter_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "TICKET_WITHOUT_COUNTER",
+                    "message": "Ce ticket n'est associé à aucun guichet : rien à relancer",
+                },
+            )
+
+        counter = (await self.db.execute(
+            select(Counter).where(Counter.id == ticket.counter_id)
+        )).scalar_one_or_none()
+        if counter is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "COUNTER_NOT_FOUND", "message": "Guichet du ticket introuvable"},
+            )
+        await self._verify_agent_assignment(actor, counter)
+
+        # Plafond : compté sur le journal d'audit, pas sur un compteur Redis. Le
+        # journal est la source durable — un redémarrage de Redis ne doit pas
+        # rouvrir le droit d'envoyer trois SMS de plus au même client.
+        recall_count = (await self.db.execute(
+            select(func.count(AuditLog.id)).where(
+                AuditLog.action == AuditAction.TICKET_RECALLED,
+                AuditLog.target_id == ticket.id,
+            )
+        )).scalar() or 0
+        if recall_count >= settings.MAX_RECALLS_PER_TICKET:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "RECALL_LIMIT_REACHED",
+                    "message": (
+                        f"Ce ticket a déjà été relancé {recall_count} fois. "
+                        "Déclarez le client absent s'il ne s'est pas présenté."
+                    ),
+                    "recall_count": recall_count,
+                    "max_recalls": settings.MAX_RECALLS_PER_TICKET,
+                },
+            )
+
+        counter_name = counter.name
+        ticket_number = ticket.number
+
+        # 1. Le compte à rebours repart de zéro : une relance sans nouveau délai
+        #    serait une annonce dans le vide (le ticket passerait ABSENT pendant
+        #    que le client arrive).
+        await self._schedule_absent_deadlines(ticket)
+
+        # 2. Le client : téléphone (your_turn) puis SMS / push.
+        await publish_event(ticket.org_id, {
+            "type": EventType.YOUR_TURN.value,
+            "ticket_id": ticket.id,
+            "ticket_number": ticket_number,
+            "agency_id": ticket.agency_id,
+            "counter_name": counter_name,
+            "message": f"Rappel : présentez-vous au {counter_name}",
+            "timeout_seconds": settings.ABSENT_TIMEOUT_SECONDS,
+            "recall": True,
+        })
+        await publish_event(ticket.org_id, {
+            "type": EventType.TICKET_CALLED.value,
+            "called_number": ticket_number,
+            "counter_name": counter_name,
+            "agency_id": ticket.agency_id,
+            "recall": True,
+        })
+
+        try:
+            from app.services.notification_service import NotificationService
+            await NotificationService(self.db).notify_ticket_called(ticket, counter_name)
+        except Exception as exc:  # noqa: BLE001 — jamais bloquant
+            logger.error(f"Notification de relance échouée ({ticket_number}): {exc}")
+
+        # 3. Les autres écrans du guichet (et ceux de l'agence) voient la relance.
+        await self._publish_counter_activity(
+            ticket, "ticket_recalled", counter_id=counter.id, counter_name=counter_name
+        )
+
+        # 4. Trace : qui a relancé, combien de fois, à quel guichet.
+        await AuditService(self.db).log(
+            org_id=ticket.org_id,
+            action=AuditAction.TICKET_RECALLED,
+            actor_id=actor.id,
+            actor_role=actor.role.value,
+            target_type="ticket",
+            target_id=ticket.id,
+            extra={
+                "ticket_number": ticket_number,
+                "counter_id": counter.id,
+                "counter_name": counter_name,
+                "recall_number": recall_count + 1,
+            },
+        )
+
+        logger.info(
+            f"Ticket relancé: {ticket_number} au {counter_name} "
+            f"({recall_count + 1}/{settings.MAX_RECALLS_PER_TICKET}) par {actor.id}"
+        )
+        return {
+            "success": True,
+            "ticket_id": ticket.id,
+            "ticket_number": ticket_number,
+            "counter_name": counter_name,
+            "recall_count": recall_count + 1,
+            "recalls_left": settings.MAX_RECALLS_PER_TICKET - (recall_count + 1),
+            "timeout_seconds": settings.ABSENT_TIMEOUT_SECONDS,
         }
 
     async def start_serving(self, ticket_id: str, actor: User) -> dict:
@@ -1851,6 +2018,46 @@ class TicketService:
             counter_name=counter_name,
             extra=extra,
         )
+
+        # Les écrans de guichet de l'agence apprennent le changement en temps réel.
+        # Diffuser ici plutôt que chez chaque appelant garantit qu'AUCUNE
+        # transition n'est oubliée — c'est le point unique par lequel passe tout
+        # changement d'état. Contrepartie assumée : une transition ensuite
+        # annulée par un rollback produit un événement de trop. Le client y réagit
+        # en relisant l'état, donc l'annonce de trop est sans effet ; une
+        # transition MANQUÉE, elle, laisserait le poste muet jusqu'au prochain
+        # sondage — c'est le défaut qu'on corrige.
+        await self._publish_counter_activity(
+            ticket, new_status.value, counter_id=counter_id, counter_name=counter_name
+        )
+
+    async def _publish_counter_activity(
+        self,
+        ticket: Ticket,
+        reason: str,
+        *,
+        status_value: str | None = None,
+        counter_id: str | None = None,
+        counter_name: str | None = None,
+    ) -> None:
+        """
+        Prévient les écrans de guichet qu'une file de l'agence a changé.
+
+        Ne lève jamais : le temps réel est un accélérateur, pas une dépendance du
+        chemin métier (même règle que `publish_event`).
+        """
+        try:
+            await publish_event(ticket.org_id, counter_activity_event(
+                agency_id=ticket.agency_id,
+                service_id=ticket.service_id,
+                reason=reason,
+                ticket_number=ticket.number,
+                status=status_value or ticket.status.value,
+                counter_id=counter_id or ticket.counter_id,
+                counter_name=counter_name or ticket.counter_name,
+            ))
+        except Exception as exc:  # noqa: BLE001 — jamais bloquant
+            logger.error(f"Événement guichet non publié ({ticket.number}): {exc}")
 
     async def _log_action(
         self,

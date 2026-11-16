@@ -38,6 +38,50 @@ async def publish_event(org_id: str | None, event: dict[str, Any]) -> bool:
         return False
 
 
+def counter_activity_event(
+    *,
+    agency_id: str,
+    service_id: str,
+    reason: str,
+    ticket_number: str | None = None,
+    status: str | None = None,
+    counter_id: str | None = None,
+    counter_name: str | None = None,
+) -> dict[str, Any]:
+    """
+    Construit l'événement qui prévient les ÉCRANS DE GUICHET qu'une file a changé.
+
+    Il ne remplace pas les événements métier existants (YOUR_TURN pour le client,
+    TICKET_CALLED pour la salle) : il les complète d'un canal qui n'existait pas.
+    Sans lui, `counter_connections` ne recevait jamais rien et le poste desktop
+    devait interroger l'API toutes les 7 s pour voir arriver un client.
+
+    Le message est volontairement pauvre : il dit CE QUI a changé, pas l'état
+    complet de la file. Un client qui a besoin du détail le redemande — c'est ce
+    qui évite d'inventer ici un format que le desktop devra suivre à vie.
+
+    Args:
+        agency_id: Branch concernée (clé de routage vers les guichets)
+        service_id: Service dont la file a changé
+        reason: Ce qui a changé — une valeur de `TicketStatus`, ou
+            `ticket_created` / `ticket_recalled`
+        ticket_number: Numéro concerné (affichage immédiat possible)
+        status: Statut du ticket APRÈS le changement
+        counter_id: Guichet concerné, s'il y en a un
+        counter_name: Nom du guichet, pour l'affichage
+    """
+    return {
+        "type": EventType.COUNTER_QUEUE_CHANGED.value,
+        "agency_id": agency_id,
+        "service_id": service_id,
+        "reason": reason,
+        "ticket_number": ticket_number,
+        "status": status,
+        "counter_id": counter_id,
+        "counter_name": counter_name,
+    }
+
+
 def queue_snapshot_event(
     *,
     agency_id: str,
