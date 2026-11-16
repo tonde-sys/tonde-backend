@@ -1011,7 +1011,11 @@ si ce contrat changeait un jour.
 Les trois correctifs ont ensuite été **retirés un par un** pour confirmer que la
 suite tombe : sans cela, 32 tests verts pouvaient aussi bien ne rien tester.
 
-**Vérification.** Suite locale : **492 passés, 138 ignorés, 0 échec** (+32).
+**Vérification.** Suite locale : **492 passés, 138 ignorés, 0 échec** (+32). CI :
+**run #39 verte** (2 min 06 s). Les 32 tests de ce lot tournent aussi en local :
+la décision d'autorisation et le routage des événements ont été conçus pour ne
+pas dépendre d'un Redis réel — c'est ce qui les rend utilisables à chaque
+modification, pas seulement en intégration.
 
 ---
 

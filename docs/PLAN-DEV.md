@@ -271,7 +271,8 @@ Trois arbitrages méritent d'être notés :
   numéro), pas l'état complet de la file. Inventer ici un format que le desktop
   devra suivre à vie serait un contrat gratuit.
 
-Suite locale : **492 passés, 138 ignorés, 0 échec** (+32).
+Suite locale : **492 passés, 138 ignorés, 0 échec** (+32). CI : **run #39 verte**
+(2 min 06 s), PostgreSQL 15 + Redis 7 réels.
 
 ---
 
