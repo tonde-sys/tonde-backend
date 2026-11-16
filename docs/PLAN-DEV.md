@@ -322,9 +322,25 @@ Deux points méritent d'être notés :
 - **Relancer repose la grâce.** Sans cela, « relancer puis déclarer absent »
   aurait été un contournement du contrôle en deux clics.
 
-**Preuve :** `tests/test_phase7_absence_recovery.py` (18). Les quatre correctifs
+**Preuve :** `tests/test_phase7_absence_recovery.py` (19). Les quatre correctifs
 ont été retirés un par un (grâce, priorité, ancrage de l'expiration, plafond) et
-la suite tombe à chaque fois. Suite locale : **510 passés, 138 ignorés, 0 échec**.
+la suite tombe à chaque fois. Suite locale : **649 passés, 0 ignoré, 0 échec**.
+
+**Le délai de grâce a cassé cinq tests — et c'est la CI qui l'a vu.** Les tests
+`mark_absent` après `_call` (libération du guichet, idempotence du scheduler,
+périmètre des agents, événements temps réel) attendaient l'absence immédiate :
+ils butaient désormais sur le `409 GRACE_PERIOD_NOT_ELAPSED`, ce qui est le
+comportement **voulu**. Ces cinq tests vivent dans des fichiers qui exigent un
+vrai Redis, donc ignorés en local — d'où deux passages en CI rouge pour un
+défaut invisible sur la machine de développement. Ils antidatent maintenant
+l'échéance via `_grace_ecoulee()` : ils continuent de tester ce qu'ils testent,
+sans simuler un contournement du contrôle.
+
+La cause profonde reste traitée : `_fakeredis_local.py` (plugin pytest, activé
+par `-p _fakeredis_local`) branche `aioredis.from_url` sur fakeredis et rejoue
+les 138 tests « vrai Redis » sans Docker. Il ne remplace pas la CI — la
+sémantique de fakeredis n'est pas celle de Redis 7 — mais il ferme le trou dans
+lequel je suis tombé deux fois.
 
 Reste de la spécification, dans cet ordre : index unique « un ticket actif
 global » (`012`), `queue_sequence BIGINT` (`013`), Outbox (`014`).
@@ -392,7 +408,8 @@ distribution desktop, facturation — ne se code pas ici.
 | Phase 5 | P2-13 + migration `010`, P2-14, 401/403 | `53f9ff5` |
 | Phase 5 bis | SMTP visible dans `/health/detailed`, sondes en `HEAD` | `a69b37d` |
 | Phase 6 | Canal guichet : autorisation WS multi-organisations, `POST /recall`, événements de file vers les écrans | `f380e39` |
-| Phase 7 (1+2) | Absence/reprise : échéances persistées (migration `011`), grâce, plafond d'absences, priorité conservée | à venir |
+| Phase 7 (1+2) | Absence/reprise : échéances persistées (migration `011`), grâce, plafond d'absences, priorité conservée | `37b7b03` + `b11ee83` |
+| Phase 7 (tests) | Cinq tests d'absence antidatent la grâce ; pont fakeredis pour rejouer les tests « vrai Redis » en local | à venir |
 
 ### Ce que les phases 3 et 4 ont appris
 

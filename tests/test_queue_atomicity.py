@@ -13,7 +13,7 @@ Si Redis est injoignable, les tests sont ignorés (skip), pas en échec.
 """
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -132,6 +132,24 @@ async def _call(ticket_service, org, agency, service, counter, actor):
         agency_id=agency.id, service_id=service.id, counter_id=counter.id,
         org_id=org.id, actor=actor,
     )
+
+
+async def _grace_ecoulee(db_session, ticket_id: str) -> None:
+    """
+    Antidate la fin du délai de grâce de l'appel en cours.
+
+    Depuis la migration 011 (spécification §3.1), `mark_absent` refuse qu'un AGENT
+    déclare absent un client appelé il y a moins de `GRACE_PERIOD_SECONDS`. Les
+    tests qui portent sur autre chose que ce délai — libération du guichet,
+    idempotence du scheduler, périmètre des agents, événements temps réel — n'ont
+    pas à patienter 90 secondes : on place l'échéance dans le passé, exactement
+    comme le ferait le temps qui passe.
+    """
+    ticket = (await db_session.execute(
+        select(Ticket).where(Ticket.id == ticket_id).execution_options(populate_existing=True)
+    )).scalar_one()
+    ticket.grace_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    await db_session.commit()
 
 
 # ══ 1. Primitives Redis : atomicité ═══════════════════════════════════════════
@@ -535,6 +553,7 @@ async def test_counter_freed_when_ticket_done_or_absent(ticket_service, db_sessi
     await _call(ticket_service, org, agency, service, counter, agent)
     await db_session.refresh(counter)
     assert counter.current_ticket_id == t2.id
+    await _grace_ecoulee(db_session, t2.id)
     await ticket_service.mark_absent(t2.id, agent)
     await db_session.refresh(counter)
     assert counter.current_ticket_id is None

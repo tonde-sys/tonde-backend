@@ -30,6 +30,7 @@ from app.schemas.ticket import CreateTicketRequest
 from app.services.queue_scheduler import QueueScheduler
 from tests.test_queue_atomicity import (  # noqa: F401  (fixtures importées par nom)
     _call,
+    _grace_ecoulee,
     _make_counter,
     _make_staff,
     _new_ticket,
@@ -372,6 +373,7 @@ async def test_scheduler_is_idempotent_and_ignores_manual_absence(
     ticket = await _new_ticket(ticket_service, agency, service, "client-1")
     org_id = org.id
     await _call(ticket_service, org, agency, service, counter, agent)
+    await _grace_ecoulee(db_session, ticket.id)                         # 90 s ont passé
     await ticket_service.mark_absent(ticket.id, agent)                  # l'agent l'a déjà fait
     future = time.time() + settings.ABSENT_TIMEOUT_SECONDS + 1
 
@@ -752,6 +754,7 @@ async def test_close_ticket_frees_the_client(ticket_service, db_session, real_re
     ticket = await _new_ticket(ticket_service, agency, service, "client-1")
     agency_id, service_id, org_id = agency.id, service.id, org.id
     await _call(ticket_service, org, agency, service, counter, agent)
+    await _grace_ecoulee(db_session, ticket.id)
     await ticket_service.mark_absent(ticket.id, agent)
 
     await ticket_service.close_ticket(ticket.id, agent, reason="n'est jamais revenu")
@@ -779,6 +782,7 @@ async def test_staff_return_to_queue_is_scoped_to_branch(ticket_service, db_sess
     ticket = await _new_ticket(ticket_service, agency, service, "client-1")
     org_id = org.id
     await _call(ticket_service, org, agency, service, counter, agent)
+    await _grace_ecoulee(db_session, ticket.id)
     await ticket_service.mark_absent(ticket.id, agent)
 
     with pytest.raises(HTTPException) as exc:
@@ -867,6 +871,7 @@ async def test_done_and_absent_publish_personal_events(ticket_service, db_sessio
     with patch("app.services.ticket_service.publish_event", new_callable=AsyncMock) as publish:
         await ticket_service.complete_ticket(done.id, agent)
         await _call(ticket_service, org, agency, service, counter, agent)
+        await _grace_ecoulee(db_session, absent.id)
         await ticket_service.mark_absent(absent.id, agent)
 
     types = [(c.args[1]["type"], c.args[1].get("ticket_id")) for c in publish.call_args_list]
