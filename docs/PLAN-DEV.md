@@ -507,7 +507,8 @@ distribution desktop, facturation — ne se code pas ici.
 | Phase 6 | Canal guichet : autorisation WS multi-organisations, `POST /recall`, événements de file vers les écrans | `f380e39` |
 | Phase 7 (1+2) | Absence/reprise : échéances persistées (migration `011`), grâce, plafond d'absences, priorité conservée | `37b7b03` + `b11ee83` |
 | Phase 7 (tests) | Cinq tests d'absence antidatent la grâce ; pont fakeredis pour rejouer les tests « vrai Redis » en local | `6106d8b` (CI #43 verte) |
-| Phase 8 | `012` index unique ticket actif + création indépendante de Redis, `013` `queue_sequence`, `014` Outbox | à venir |
+| Phase 8 | `012` index unique ticket actif + création indépendante de Redis, `013` `queue_sequence`, `014` Outbox | `3712a46` (CI #45 verte, 665 tests) |
+| Poste (8b) | Le guichet suit le moteur d'absence : corps d'erreur conservé, grâce respectée avant l'état local, tri par `queue_sequence` | `8736684` — dépôt `tonde-desktop` (CI verte) |
 
 ### Ce que les phases 3 et 4 ont appris
 
@@ -575,3 +576,37 @@ Suite locale : **460 passés, 138 ignorés, 0 échec**. CI : **run #37 verte**
 - **Une mutation vérifie qu'un test mord.** Les trois correctifs ont été retirés
   un par un pour confirmer que la suite tombe : sans cela, 32 tests verts
   pouvaient aussi bien ne rien tester.
+
+### Ce que la phase 8 a appris
+
+- **Un index déplace l'invariant du code vers la base — et démasque les décors
+  impossibles.** Cinq fixtures créaient plusieurs tickets actifs pour un même
+  client. Le code les tolérait, la base non. Ce n'était pas le comportement
+  testé qui était faux, c'était le décor.
+- **Un test qui ne tourne qu'en CI ne protège rien pendant le développement.**
+  Les 138 tests « vrai Redis » étaient ignorés en local : deux passages rouges
+  pour un défaut invisible sur la machine. fakeredis ne remplace pas Redis 7,
+  mais il rend la suite locale représentative.
+- **Deux quantités dans un même nombre finissent par se contredire.** Le score
+  Redis mêlait priorité et millisecondes : une séquence assez grande pouvait
+  franchir une bande de priorité. Bande × priorité, puis séquence — l'ordre est
+  vrai par construction. Les tests de géométrie passaient des millisecondes là
+  où le code attendait une séquence ; ils décrivaient l'ancien contrat.
+- **Un rejeu n'existe que si le service en panne n'est pas sur le chemin.**
+  L'Outbox ne vaut que parce que le scheduler republie sans Redis, avec un
+  abandon explicite (`MAX_ATTEMPTS`, `MAX_AGE_MINUTES`) plutôt qu'une boucle
+  silencieuse.
+
+### Ce que l'adaptation du poste a appris
+
+- **Une erreur qui jette son corps oblige l'interface à deviner.** `ApiError`
+  ne gardait que `code` : `seconds_left` arrivait bien, personne ne pouvait le
+  lire. Le guichet affichait « opération refusée » là où le serveur disait
+  « attendez 42 s ».
+- **Un contrôle qui n'existe que côté serveur fait clignoter l'écran.** Le refus
+  de la grâce était correct, mais le poste vidait l'écran de service avant de le
+  restaurer sur le `409`. Le contrôle local n'ajoute aucune règle : il évite un
+  aller-retour qui déplace l'affichage sous les yeux de l'agent.
+- **Un raccourci clavier contourne tout ce qui n'est pas dans la même
+  fonction.** Le bouton respectait la grâce, la touche A non. Les deux appellent
+  désormais le même prédicat.
