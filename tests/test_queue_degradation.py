@@ -71,23 +71,31 @@ async def test_lecture_d_un_ticket_survit_a_une_panne_redis(
 
 
 @pytest.mark.asyncio
-async def test_creation_renvoie_503_et_non_500_si_redis_est_injoignable(
+async def test_creation_survit_a_une_panne_du_verrou_redis(
     ticket_service, db_session
 ):
-    """Le verrou de création vit dans Redis : son échec devient un 503 explicite."""
+    """
+    Le verrou de création vit dans Redis, mais l'invariant vit dans la base.
+
+    Depuis la migration 012, « un seul ticket actif par utilisateur » est garanti
+    par un index unique partiel. Le verrou n'est plus qu'une optimisation (moins
+    de conflits, message plus précis) : son indisponibilité ne doit donc plus
+    empêcher un client de prendre un ticket. Avant, une panne Redis produisait un
+    503 alors que la base savait parfaitement se protéger seule — on refusait un
+    ticket pour une raison qui n'en était plus une.
+    """
     org = await _create_test_org(db_session)
     agency = await _create_test_agency(db_session, org.id)
     service = await _create_test_service(db_session, agency.id, org.id)
 
     with patch("app.services.ticket_service.acquire_ticket_creation_lock",
                new_callable=AsyncMock, side_effect=ConnectionError("redis down")):
-        with pytest.raises(HTTPException) as exc:
-            await ticket_service.create_ticket(
-                CreateTicketRequest(agency_id=agency.id, service_id=service.id), "client-1", None
-            )
+        ticket = await ticket_service.create_ticket(
+            CreateTicketRequest(agency_id=agency.id, service_id=service.id), "client-1", None
+        )
 
-    assert exc.value.status_code == 503
-    assert exc.value.detail["code"] == "QUEUE_UNAVAILABLE"
+    assert ticket.status == "waiting"
+    assert ticket.number.startswith("A-")
 
 
 @pytest.mark.asyncio

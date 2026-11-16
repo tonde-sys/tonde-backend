@@ -356,50 +356,55 @@ def _queue_key(org_id: str, agency_id: str, service_id: str) -> str:
 
 
 # ── Géométrie du score de file ────────────────────────────────────────────────
-# Le score est un entier : (10 - priorité) × MARGE + created_ms.
-# La MARGE est exprimée en MILLISECONDES (10⁹ ms = 11,57 jours), et non dans une
-# unité abstraite : c'est ce qui rend le facteur trompeur à la lecture.
+# Le score est un entier : (10 - priorité) × MARGE + SÉQUENCE DE FILE.
+#
+# La MARGE doit dépasser l'ÉTENDUE des séquences observables dans une même file.
+# Elle valait 10⁹ millisecondes (11,57 jours) du temps où la partie basse était
+# un horodatage ; elle vaut désormais 10⁹ SÉQUENCES, ce qui couvre un milliard de
+# tickets — très au-delà de ce qu'un système peut délivrer avant que la plus
+# ancienne ligne ne soit purgée.
 #
 # Invariant garanti par cette marge :
-#   un ticket de priorité p2 > p1 créé APRÈS un ticket de priorité p1 passe quand
-#   même devant lui, À CONDITION que l'écart de création reste sous la marge.
-#   Démonstration : score1 - score2 = (p2 - p1) × MARGE - (t2 - t1) > 0
-#                  dès que (t2 - t1) < (p2 - p1) × MARGE.
+#   un ticket de priorité p2 > p1 entré APRÈS un ticket de priorité p1 passe quand
+#   même devant lui, À CONDITION que l'écart de séquence reste sous la marge.
+#   Démonstration : score1 - score2 = (p2 - p1) × MARGE - (s2 - s1) > 0
+#                  dès que (s2 - s1) < (p2 - p1) × MARGE.
 #
-# Conséquence pratique : la marge la plus faible est celle entre deux niveaux
-# consécutifs, soit UNE marge = 11,57 jours. Un ticket ne peut donc être doublé
-# par une priorité supérieure que s'il attend plus de 11,57 jours. Comme
-# WAITING_TICKET_TTL_HOURS (72 h = 3 jours) expire bien avant, l'invariant tient
-# par construction — voir tests/test_queue_score_geometry.py, qui échoue si
-# quelqu'un relève le TTL au-delà de la marge sans toucher à cette constante.
+# La séquence remplace l'horloge pour une raison précise (spécification §4.2) :
+# deux tickets créés dans la MÊME milliseconde étaient départagés par l'ordre
+# lexicographique de leur UUID — stable, mais arbitraire, et impossible à
+# expliquer à un client qui voit passer son voisin devant lui.
 #
-# Ne pas réduire cette constante : 10⁹ « ressemble » à des millisecondes mais
-# couvre 11,57 jours d'ancienneté. Diviser par 1000 (1,157 jour) casserait la
-# priorité dès qu'un ticket attend une journée.
-QUEUE_PRIORITY_BAND_MS = 1_000_000_000
-QUEUE_PRIORITY_BAND_DAYS = QUEUE_PRIORITY_BAND_MS / 86_400_000  # 11,574 jours
+# Ne pas réduire cette constante sans revoir la démonstration ci-dessus.
+QUEUE_PRIORITY_BAND = 1_000_000_000
 
 
-def queue_score(priority: int, created_ms: Optional[int] = None) -> int:
+def queue_score(priority: int, sequence: int) -> int:
     """
-    Calcule le score Redis d'un ticket : priorité d'abord, puis FIFO.
+    Calcule le score Redis d'un ticket : priorité d'abord, puis ordre de file.
 
-    Plus le score est bas, plus le ticket passe tôt. Le timestamp en ms départage
-    les tickets de même priorité. Passer `created_ms` (date de création réelle du
-    ticket) permet de reconstruire la file ou de changer une priorité SANS faire
-    perdre au client son ancienneté.
+    Plus le score est bas, plus le ticket passe tôt. La séquence départage les
+    tickets de même priorité, de façon STRICTEMENT déterministe : deux tickets
+    ne peuvent pas partager une séquence, donc il n'existe plus de cas où
+    l'ordre dépend d'un détail d'implémentation.
 
     Le score reste un entier exact en JSON/Redis (double 53 bits) : la valeur
-    maximale est 10 × 10⁹ + 1,7 × 10¹² ≈ 1,7 × 10¹², très loin de 9 × 10¹⁵.
+    maximale est 10 × 10⁹ + 10⁹ ≈ 1,1 × 10¹⁰, très loin de 9 × 10¹⁵.
 
     Args:
         priority: Score de priorité (0=standard, 3=priority, 5=vip, 9=emergency)
-        created_ms: Horodatage de référence en ms (défaut : maintenant)
+        sequence: Numéro d'ordre monotone du ticket (`tickets.queue_sequence`)
+
+    Raises:
+        ValueError: séquence hors de la marge — la priorité ne serait plus
+                    respectée. Mieux vaut une erreur bruyante qu'un ordre faux.
     """
-    import time
-    if created_ms is None:
-        created_ms = int(time.time() * 1000)
-    return (10 - priority) * QUEUE_PRIORITY_BAND_MS + created_ms
+    if not 0 <= sequence < QUEUE_PRIORITY_BAND:
+        raise ValueError(
+            f"Séquence de file hors bornes ({sequence}) : la marge de priorité "
+            f"({QUEUE_PRIORITY_BAND}) ne garantit plus l'ordre."
+        )
+    return (10 - priority) * QUEUE_PRIORITY_BAND + sequence
 
 
 async def add_to_queue(
@@ -407,15 +412,15 @@ async def add_to_queue(
     agency_id: str,
     service_id: str,
     ticket_id: str,
-    priority: int = 0,
-    created_ms: Optional[int] = None,
+    priority: int,
+    sequence: int,
 ) -> int:
     """
     Ajoute (ou repositionne) un ticket dans la file d'attente Redis (Sorted Set).
 
     Le score garantit l'ordre de service :
       - Priorité haute (emergency=9) → score bas → servi en premier
-      - FIFO dans la même priorité via le timestamp
+      - FIFO strict dans la même priorité, via la séquence de file
 
     Args:
         org_id: Isolation multi-tenant
@@ -423,14 +428,14 @@ async def add_to_queue(
         service_id: Identifiant du service (Caisse, Crédit, etc.)
         ticket_id: UUID du ticket
         priority: Score de priorité (0=standard, 3=priority, 5=vip, 9=emergency)
-        created_ms: Horodatage de référence (défaut : maintenant)
+        sequence: Numéro d'ordre monotone du ticket (`tickets.queue_sequence`)
 
     Returns:
         Position dans la file (commence à 1)
     """
     r = await get_redis()
     key = _queue_key(org_id, agency_id, service_id)
-    await r.zadd(key, {ticket_id: queue_score(priority, created_ms)})
+    await r.zadd(key, {ticket_id: queue_score(priority, sequence)})
     position = await r.zrank(key, ticket_id)
     return (position or 0) + 1
 

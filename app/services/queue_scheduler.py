@@ -31,6 +31,7 @@ from app.core.redis import (
     claim_due_deadlines,
     mark_once,
 )
+from app.services.outbox import OutboxService
 from app.services.ticket_service import TicketService
 
 logger = logging.getLogger(__name__)
@@ -127,7 +128,8 @@ class QueueScheduler:
         """
         now_ts = now_ts if now_ts is not None else time.time()
         self.last_run_at = now_ts
-        stats = {"warnings": 0, "absent": 0, "expired": 0, "alerts": 0, "repaired": 0}
+        stats = {"warnings": 0, "absent": 0, "expired": 0, "alerts": 0, "repaired": 0,
+                 "published": 0}
 
         for org_id, ticket_id in await claim_due_deadlines(DEADLINE_WARNING, now_ts):
             if await self._safely(org_id, ticket_id, "avertissement", "send_absent_warning"):
@@ -156,6 +158,11 @@ class QueueScheduler:
                             f"Scheduler : {stats['repaired']} ticket(s) WAITING absents "
                             f"de la file Redis ont été réinsérés"
                         )
+                    # Rejeu des événements temps réel dont la diffusion a échoué
+                    # au moment du commit (migration 014). C'est la moitié
+                    # « garantie » de l'Outbox : sans ce passage, une ligne en
+                    # attente le resterait indéfiniment.
+                    stats["published"] = await OutboxService(session).dispatch()
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"Scheduler : maintenance échouée : {exc}", exc_info=True)
 

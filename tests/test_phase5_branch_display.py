@@ -133,15 +133,23 @@ async def agence(db_session):
     user = await _make_user(db_session)
 
     now = datetime.now(timezone.utc)
-    await _make_ticket(db_session, org.id, branch.id, depot, user.id, 1)
-    await _make_ticket(db_session, org.id, branch.id, depot, user.id, 2)
+
+    # Un client ne peut avoir qu'UN ticket actif (index unique de la migration
+    # 012) : chaque ticket actif a donc son propre client. Cette fixture décrit
+    # un ÉCRAN DE SALLE — plusieurs clients qui attendent en même temps — et non
+    # la vie d'un seul client ; c'est la seule contrainte que l'index impose ici.
+    async def client() -> str:
+        return (await _make_user(db_session)).id
+
+    await _make_ticket(db_session, org.id, branch.id, depot, await client(), 1)
+    await _make_ticket(db_session, org.id, branch.id, depot, await client(), 2)
     appele = await _make_ticket(
-        db_session, org.id, branch.id, depot, user.id, 3,
+        db_session, org.id, branch.id, depot, await client(), 3,
         TicketStatus.CALLED, called_at=now - timedelta(minutes=2),
     )
     for i in range(3):
         await _make_ticket(
-            db_session, org.id, branch.id, depot, user.id, 10 + i,
+            db_session, org.id, branch.id, depot, await client(), 10 + i,
             TicketStatus.DONE,
             called_at=now - timedelta(hours=2),
             done_at=now - timedelta(hours=1, minutes=i),
@@ -241,7 +249,13 @@ async def test_nombre_de_requetes_constant_quel_que_soit_le_nombre_de_services(
         service = await _make_service(
             db_session, org.id, branch.id, chr(ord("D") + index), f"Service {index}"
         )
-        await _make_ticket(db_session, org.id, branch.id, service, appele.user_id, 1)
+        # Un client par ticket : l'index unique de la migration 012 interdit
+        # deux tickets actifs pour le même utilisateur. Ce qui compte ici est le
+        # nombre de SERVICES, pas l'identité des clients.
+        await _make_ticket(
+            db_session, org.id, branch.id, service,
+            (await _make_user(db_session)).id, 1,
+        )
     for index in range(4):
         await _make_counter(db_session, org.id, branch.id, f"Guichet {index + 3}")
 
@@ -283,7 +297,13 @@ async def test_repli_redis_ne_cree_pas_de_n_plus_un(agence, db_session, db_engin
         service = await _make_service(
             db_session, org.id, branch.id, chr(ord("D") + index), f"Service {index}"
         )
-        await _make_ticket(db_session, org.id, branch.id, service, appele.user_id, 1)
+        # Un client par ticket : l'index unique de la migration 012 interdit
+        # deux tickets actifs pour le même utilisateur. Ce qui compte ici est le
+        # nombre de SERVICES, pas l'identité des clients.
+        await _make_ticket(
+            db_session, org.id, branch.id, service,
+            (await _make_user(db_session)).id, 1,
+        )
 
     with QueryCounter(db_engine) as grand:
         data = await ecran.get_branch_display(branch.id)

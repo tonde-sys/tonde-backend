@@ -22,7 +22,7 @@ import math
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,6 +68,7 @@ from app.schemas.ticket import (
     TicketResponse,
 )
 from app.services.audit_service import AuditService
+from app.services.outbox import OutboxService
 from app.websocket.events import EventType
 from app.websocket.publisher import counter_activity_event, publish_event, queue_snapshot_event
 
@@ -235,19 +236,19 @@ class TicketService:
         # retry réseau) ne peuvent pas passer toutes deux le contrôle
         # « 1 seul ticket actif » avant que l'une ait créé son ticket.
         #
-        # Une panne Redis ne doit pas produire un 500 : la file étant indisponible,
-        # la création l'est aussi — on répond 503 QUEUE_UNAVAILABLE, comme plus bas.
+        # Depuis la migration 012, cet invariant est garanti par un index unique
+        # partiel : le verrou n'est plus qu'une OPTIMISATION (moins de conflits
+        # à gérer, message plus précis). Une panne Redis ne doit donc plus
+        # interrompre la création — c'est précisément ce qui rendait la prise de
+        # ticket dépendante de Redis alors que la base suffit.
+        locked = True
         try:
             locked = await acquire_ticket_creation_lock(user_id)
         except Exception as exc:  # noqa: BLE001
-            logger.error(f"Verrou de création indisponible (Redis) pour user={user_id}: {exc}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={
-                    "code": "QUEUE_UNAVAILABLE",
-                    "message": "La file d'attente est momentanément indisponible. Réessayez.",
-                },
-            ) from exc
+            logger.warning(
+                f"Verrou de création indisponible (Redis) pour user={user_id}, "
+                f"on s'appuie sur l'index unique : {exc}"
+            )
 
         if not locked:
             raise HTTPException(
@@ -333,6 +334,11 @@ class TicketService:
             number=ticket_number,
             prefix=service.ticket_prefix,
             sequence=sequence,
+            # Ordre de passage monotone, attribué par la base (migration 013).
+            # C'est lui, et non l'horloge, qui départage deux tickets de même
+            # priorité : deux créations dans la même milliseconde ne peuvent
+            # plus être ordonnées par le hasard d'un UUID.
+            queue_sequence=await self._next_queue_sequence(),
             user_id=user_id,
             org_id=ticket_org_id,
             agency_id=data.agency_id,
@@ -346,13 +352,34 @@ class TicketService:
         try:
             await self.db.flush()   # obtenir ticket.id avant commit
             await self.db.commit()
-        except IntegrityError:
+        except IntegrityError as exc:
             # Course inter-instances sur (user_id, client_action_id) : le gagnant a déjà créé
             await self.db.rollback()
             if data.client_action_id:
                 replay = await self._find_by_client_action(user_id, data.client_action_id)
                 if replay is not None:
                     return await self._build_response(replay)
+            # Violation de `uq_tickets_active_per_user` (migration 012) : une autre
+            # requête — ou une autre instance — a créé un ticket actif entre notre
+            # `SELECT` et notre `INSERT`. C'est exactement ce que l'index doit
+            # arrêter, et c'est la base qui l'a arrêté, pas nous. On répond le
+            # même 409 que le contrôle applicatif, avec le ticket gagnant, pour
+            # que le client voie son vrai ticket au lieu d'une erreur serveur.
+            winner = await self._get_active_ticket(user_id)
+            if winner is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "TICKET_ALREADY_ACTIVE",
+                        "message": (
+                            f"Vous avez déjà un ticket actif ({winner.number} — "
+                            f"statut : {winner.status.value}). "
+                            "Attendez qu'il soit terminé ou annulez-le avant d'en prendre un nouveau."
+                        ),
+                        "active_ticket_id": winner.id,
+                        "active_ticket_number": winner.number,
+                    },
+                ) from exc
             raise
         await self.db.refresh(ticket)
 
@@ -369,43 +396,47 @@ class TicketService:
         await self.db.commit()
 
         # Insérer dans la file Redis — segmentée par service (DÉCISION 5).
-        # Si Redis échoue, on annule proprement le ticket : sinon il resterait WAITING
-        # en base sans être en file, et bloquerait le client (règle « 1 ticket actif »).
+        #
+        # Si Redis échoue, on ne détruit plus le ticket. L'ancien comportement
+        # (annuler puis répondre 503) avait un coût absurde : la base avait
+        # accepté la demande, et le client repartait sans ticket, obligé de
+        # recommencer. Le ticket reste donc WAITING avec une position inconnue
+        # (0 = hors file), et la réparation périodique du scheduler le remettra
+        # dans la file au retour de Redis (`rebuild_queue`). C'est le même
+        # arbitrage que `return_to_queue` (constat P1-11) : on dégrade, on ne
+        # perd pas le travail déjà fait.
+        queue_degraded = False
         try:
             position = await add_to_queue(
                 ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
                 PRIORITY_SCORES[TicketPriority.STANDARD],
-                created_ms=to_epoch_ms(ticket.created_at),
+                sequence=ticket.queue_sequence,
             )
-        except Exception as exc:
-            logger.error(f"Redis indisponible à la création du ticket {ticket.number}: {exc}")
-            await self._transition(
-                ticket, TicketStatus.CANCELLED, actor_role="system",
-                extra={"reason": "queue_unavailable"},
+        except Exception as exc:  # noqa: BLE001
+            queue_degraded = True
+            position = 0
+            logger.error(
+                f"Ticket {ticket.number} créé en base mais Redis indisponible "
+                f"(position inconnue jusqu'à réparation) : {exc}"
             )
-            await self.db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={
-                    "code": "QUEUE_UNAVAILABLE",
-                    "message": "La file d'attente est momentanément indisponible. Réessayez.",
-                },
-            ) from exc
 
         # La taille de la file est une information d'affichage : son échec ne doit
         # jamais annuler un ticket DÉJÀ dans la file (constat P2-15). Avant ce
         # correctif, une erreur sur `zcard` suffisait à annuler le ticket en base
         # tout en le laissant dans le ZSET — une entrée fantôme que `_pop_and_call`
         # devait nettoyer plus tard. On dégrade l'affichage, pas la prise de ticket.
-        try:
-            total = await get_queue_size(ticket.org_id, ticket.agency_id, ticket.service_id)
-        except Exception as exc:
-            logger.warning(
-                f"Taille de file indisponible pour {ticket.number} (affichage dégradé) : {exc}"
-            )
-            total = position
-
-        eta = await self.estimate_wait_minutes(service, position)
+        if queue_degraded:
+            total = await self._count_waiting_in_db(ticket.service_id)
+            eta = await self.estimate_wait_minutes(service, total + 1)
+        else:
+            try:
+                total = await get_queue_size(ticket.org_id, ticket.agency_id, ticket.service_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"Taille de file indisponible pour {ticket.number} (affichage dégradé) : {exc}"
+                )
+                total = position
+            eta = await self.estimate_wait_minutes(service, position)
         ticket.estimated_wait_minutes = eta
         await self.db.commit()
 
@@ -420,7 +451,9 @@ class TicketService:
         # et c'est précisément celui que le poste desktop devait attendre 7 secondes.
         await self._publish_counter_activity(ticket, "ticket_created")
 
-        return self._to_response(ticket, position=position, total=total, eta=eta)
+        response = self._to_response(ticket, position=position, total=total, eta=eta)
+        response.queue_degraded = queue_degraded
+        return response
 
     # ══ Consultation ═══════════════════════════════════════════════════════════
 
@@ -831,11 +864,13 @@ class TicketService:
             extra={"missed_count": ticket.missed_count or 0},
         )
         # La priorité est CONSERVÉE (spécification §4.3). Le retour en fin de
-        # tranche suffit : `add_to_queue` avec created_ms=None place le ticket
-        # derrière tous ceux de même priorité déjà en file.
+        # tranche suffit, et il est désormais FORMEL : la reprise reçoit une
+        # NOUVELLE séquence de file (spécification §4.2), donc postérieure à
+        # tous les tickets déjà en attente — y compris ceux de sa propre tranche.
         ticket.requeued_at = datetime.now(timezone.utc)
         ticket.recovery_expires_at = None
         ticket.grace_expires_at = None
+        ticket.queue_sequence = await self._next_queue_sequence()
         await self.db.commit()
 
         # Constat P1-11 : `add_to_queue` n'était pas protégé. Une panne Redis
@@ -855,6 +890,7 @@ class TicketService:
             await add_to_queue(
                 ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
                 PRIORITY_SCORES[ticket.priority],
+                sequence=ticket.queue_sequence,
             )
         except Exception as exc:  # noqa: BLE001
             queue_degraded = True
@@ -927,7 +963,7 @@ class TicketService:
         await add_to_queue(
             ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
             PRIORITY_SCORES[ticket.priority],
-            created_ms=to_epoch_ms(ticket.created_at),
+            sequence=ticket.queue_sequence,
         )
         await self._publish_queue_snapshot(ticket.org_id, ticket.agency_id, ticket.service_id)
 
@@ -1495,7 +1531,7 @@ class TicketService:
             position = await add_to_queue(
                 ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
                 PRIORITY_SCORES[ticket.priority],
-                created_ms=to_epoch_ms(ticket.created_at),
+                sequence=ticket.queue_sequence,
             )
         except Exception as exc:  # la file sera reconstruite (auto-réparation) au prochain accès
             logger.error(f"Transfert {ticket.number}: ajout Redis échoué ({exc}) — auto-réparation attendue")
@@ -1604,7 +1640,7 @@ class TicketService:
         position = await add_to_queue(
             ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
             PRIORITY_SCORES[new_priority],
-            created_ms=to_epoch_ms(ticket.created_at),
+            sequence=ticket.queue_sequence,
         )
 
         await publish_event(ticket.org_id, {
@@ -1657,7 +1693,7 @@ class TicketService:
         position = await add_to_queue(
             ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
             PRIORITY_SCORES[ticket.priority],
-            created_ms=to_epoch_ms(ticket.created_at),
+            sequence=ticket.queue_sequence,
         )
         await self._publish_queue_snapshot(ticket.org_id, ticket.agency_id, ticket.service_id)
         return {"success": True, "ticket_id": ticket.id, "position": position}
@@ -1937,7 +1973,7 @@ class TicketService:
         """
         query = select(
             Ticket.id, Ticket.org_id, Ticket.agency_id, Ticket.service_id,
-            Ticket.priority, Ticket.created_at,
+            Ticket.priority, Ticket.queue_sequence,
         ).where(Ticket.status == TicketStatus.WAITING)
         if org_id:
             query = query.where(Ticket.org_id == org_id)
@@ -1947,8 +1983,8 @@ class TicketService:
             query = query.where(Ticket.service_id == service_id)
 
         restored = 0
-        for tid, t_org, t_agency, t_service, t_priority, t_created in (await self.db.execute(query)).all():
-            score = queue_score(PRIORITY_SCORES[t_priority], to_epoch_ms(t_created))
+        for tid, t_org, t_agency, t_service, t_priority, t_seq in (await self.db.execute(query)).all():
+            score = queue_score(PRIORITY_SCORES[t_priority], t_seq)
             if await add_to_queue_if_absent(t_org, t_agency, t_service, tid, score):
                 restored += 1
         return restored
@@ -2236,20 +2272,38 @@ class TicketService:
         """
         Prévient les écrans de guichet qu'une file de l'agence a changé.
 
-        Ne lève jamais : le temps réel est un accélérateur, pas une dépendance du
-        chemin métier (même règle que `publish_event`).
+        Depuis la migration 014, l'événement passe par l'OUTBOX : il est écrit
+        dans la transaction courante (donc commité avec le changement d'état),
+        puis diffusé immédiatement. Si la diffusion échoue, la ligne reste en
+        attente et le scheduler la rejoue — un écran de salle ne peut plus
+        manquer un appel parce que Redis est tombé une seconde.
+
+        La diffusion immédiate, elle, ne lève jamais : le temps réel est un
+        accélérateur, pas une dépendance du chemin métier.
         """
+        event = counter_activity_event(
+            agency_id=ticket.agency_id,
+            service_id=ticket.service_id,
+            reason=reason,
+            ticket_number=ticket.number,
+            status=status_value or ticket.status.value,
+            counter_id=counter_id or ticket.counter_id,
+            counter_name=counter_name or ticket.counter_name,
+        )
+
+        # L'écriture en base fait partie de la transaction métier : si elle
+        # échoue, l'opération échoue — c'est voulu, c'est la durabilité.
+        row_id = await OutboxService(self.db).enqueue(
+            org_id=ticket.org_id,
+            event_type=event.get("type", reason),
+            payload=event,
+        )
+
         try:
-            await publish_event(ticket.org_id, counter_activity_event(
-                agency_id=ticket.agency_id,
-                service_id=ticket.service_id,
-                reason=reason,
-                ticket_number=ticket.number,
-                status=status_value or ticket.status.value,
-                counter_id=counter_id or ticket.counter_id,
-                counter_name=counter_name or ticket.counter_name,
-            ))
+            await OutboxService(self.db).publish_now(row_id, ticket.org_id, event)
         except Exception as exc:  # noqa: BLE001 — jamais bloquant
+            # `publish_event` retourne False plutôt que de lever ; ce filet
+            # couvre l'imprévu (et laisse la ligne en attente pour le rejeu).
             logger.error(f"Événement guichet non publié ({ticket.number}): {exc}")
 
     async def _log_action(
@@ -2500,7 +2554,7 @@ class TicketService:
                     position = await add_to_queue(
                         ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
                         PRIORITY_SCORES[ticket.priority],
-                        created_ms=to_epoch_ms(ticket.created_at),
+                        sequence=ticket.queue_sequence,
                     )
                     logger.warning(f"Ticket {ticket.number} absent de Redis : remis en file (auto-réparation)")
                 total = await get_queue_size(ticket.org_id, ticket.agency_id, ticket.service_id)
@@ -2552,6 +2606,7 @@ class TicketService:
             grace_expires_at=ticket.grace_expires_at,
             recovery_expires_at=ticket.recovery_expires_at,
             missed_count=ticket.missed_count or 0,
+            queue_sequence=ticket.queue_sequence,
         )
 
     async def _current_called_number(self, service_id: str) -> str | None:
@@ -2836,6 +2891,31 @@ class TicketService:
         )
         return result.scalars().first()
 
+    async def _next_queue_sequence(self) -> int:
+        """
+        Numéro d'ordre de file monotone et GLOBAL (migration 013).
+
+        PostgreSQL : `nextval` sur une séquence dédiée. C'est atomique, sans
+        verrou applicatif et sans risque de doublon, même avec plusieurs
+        instances — deux transactions concurrentes obtiennent deux valeurs
+        distinctes, dans l'ordre de leur appel. Les trous (transaction annulée)
+        sont normaux et sans conséquence : seule la croissance compte.
+
+        SQLite (tests) : `MAX + 1`. Suffisant parce que les tests sont
+        mono-écrivain ; ce n'est PAS le chemin de production.
+
+        Returns:
+            Le prochain numéro d'ordre, strictement supérieur à tous les
+            précédents.
+        """
+        dialect = self.db.bind.dialect.name if self.db.bind is not None else "postgresql"
+        if dialect == "postgresql":
+            result = await self.db.execute(text("SELECT nextval('ticket_queue_sequence_seq')"))
+            return int(result.scalar_one())
+
+        maximum = (await self.db.execute(select(func.max(Ticket.queue_sequence)))).scalar() or 0
+        return int(maximum) + 1
+
     async def _get_next_sequence(self, agency_id: str, prefix: str) -> int:
         """
         Génère le prochain numéro de séquence pour le jour en cours, de façon atomique.
@@ -2868,7 +2948,24 @@ class TicketService:
             )
             return result.scalar() or 0
 
-        return await next_ticket_sequence(agency_id, prefix, day, load_seed)
+        try:
+            return await next_ticket_sequence(agency_id, prefix, day, load_seed)
+        except Exception as exc:  # noqa: BLE001
+            # Panne Redis : la numérotation se replie sur la base. Sans ce repli,
+            # `create_ticket` restait dépendant de Redis même après la migration
+            # 012 — l'index unique protégeait l'invariant, mais le client ne
+            # pouvait toujours pas obtenir de ticket.
+            #
+            # Deux créations STRICTEMENT simultanées dans la même agence pendant
+            # une panne peuvent obtenir le même numéro : c'est un désagrément
+            # d'affichage (le ticket reste unique par son `id`), pas une
+            # corruption, et il disparaît dès que Redis répond. Refuser la
+            # création serait pire : l'agence ne délivrerait plus aucun ticket.
+            logger.error(
+                f"Compteur de numéros indisponible (Redis) pour {prefix} : "
+                f"repli sur la base : {exc}"
+            )
+            return await load_seed() + 1
 
     async def _get_callable_counter(
         self, counter_id: str, agency_id: str, org_id: str, *, for_update: bool = False

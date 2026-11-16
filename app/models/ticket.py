@@ -10,8 +10,8 @@ la machine à états est dans ticket_service.py.
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy import (
-    String, DateTime, Enum as SAEnum, Integer, ForeignKey, Boolean,
-    UniqueConstraint, Index,
+    String, DateTime, Enum as SAEnum, Integer, BigInteger, ForeignKey, Boolean,
+    UniqueConstraint, Index, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
@@ -44,6 +44,15 @@ PRIORITY_SCORES: dict[TicketPriority, int] = {
     TicketPriority.PRIORITY:  3,
     TicketPriority.STANDARD:  0,
 }
+
+# Prédicat SQL des statuts « actifs » — même liste que `ACTIVE_STATUSES`
+# (ticket_service.py). En MAJUSCULES : SQLAlchemy persiste le NOM du membre
+# (`WAITING`) et non sa valeur (`waiting`). Se tromper ici ne se voit pas en
+# test — SQLite construit son schéma depuis les modèles — mais casse
+# `alembic upgrade` sur une base PostgreSQL vide.
+ACTIVE_TICKET_PREDICATE = (
+    "status IN ('WAITING', 'CALLED', 'SERVING', 'ABSENT', 'TRANSFERRED', 'INCOMPLETE')"
+)
 
 # Transitions d'états autorisées — source de vérité pour la machine à états
 # Toute transition absente de ce dict est INTERDITE
@@ -102,6 +111,19 @@ class Ticket(Base):
         # Recherche du worker d'expiration : « les ABSENT dont la fenêtre est
         # échue ». Sans cet index, chaque passage balaie tous les tickets.
         Index("ix_tickets_status_recovery", "status", "recovery_expires_at"),
+        # Invariant « un seul ticket actif par utilisateur » (migration 012).
+        # Il était tenu par `_get_active_ticket` + un verrou Redis : quand Redis
+        # tombait, la création répondait 503 — l'invariant tenait, la
+        # disponibilité non. Cet index rend l'invariant STRUCTUREL (deux
+        # instances ne peuvent pas le violer) et la création indépendante de
+        # Redis. `user_id` est NOT NULL : aucun ticket n'échappe au prédicat.
+        Index(
+            "uq_tickets_active_per_user",
+            "user_id",
+            unique=True,
+            postgresql_where=text(ACTIVE_TICKET_PREDICATE),
+            sqlite_where=text(ACTIVE_TICKET_PREDICATE),
+        ),
     )
 
     # ── Identifiant unique ────────────────────────────────────
@@ -122,6 +144,19 @@ class Ticket(Base):
     number: Mapped[str] = mapped_column(String(20))
     prefix: Mapped[str] = mapped_column(String(5), default="A")
     sequence: Mapped[int] = mapped_column(Integer)
+
+    # ── Ordre de file (spécification §4.2) ────────────────────
+    # Numéro monotone GLOBAL, attribué par la base. Il remplace l'horodatage dans
+    # le score Redis : deux tickets créés dans la même milliseconde étaient
+    # départagés par l'ordre lexicographique de leur UUID — stable, mais
+    # arbitraire et inexplicable pour le client qui voit passer son voisin.
+    #
+    # Ce n'est PAS le numéro affiché (`sequence`, qui repart à 1 chaque jour et
+    # par préfixe) : celui-ci est l'ordre de passage, et il ne recule jamais.
+    # Une reprise en file reçoit une NOUVELLE séquence, donc la fin de sa tranche.
+    queue_sequence: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default="0", index=True
+    )
 
     # ── Relations ─────────────────────────────────────────────
     user_id: Mapped[str] = mapped_column(

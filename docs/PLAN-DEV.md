@@ -349,6 +349,101 @@ global » (`012`), `queue_sequence BIGINT` (`013`), Outbox (`014`).
 
 ---
 
+## Phase 8 — Garanties structurelles — ✅ LOT 3, 4 et 5 LIVRÉS
+
+Les trois lots qui restaient ne corrigent aucun défaut visible : ils transforment
+des règles tenues par du CODE en règles tenues par la BASE. La différence
+n'apparaît pas en test, elle apparaît le jour où une seconde instance, un script
+de maintenance ou un redémarrage au mauvais moment contourne le code.
+
+### `012` — un seul ticket actif, garanti par la base
+
+L'invariant reposait sur un `SELECT` applicatif et un verrou Redis. Deux
+conséquences mesurables :
+
+| Défaut | Ce qui se passait |
+|---|---|
+| Non garanti entre instances | deux instances pouvaient franchir le `SELECT` en même temps ; seule la fenêtre du verrou les séparait |
+| Disponibilité liée à Redis | Redis tombait → `503 QUEUE_UNAVAILABLE`. L'invariant tenait, la prise de ticket non |
+
+Un **index unique partiel** `WHERE status IN (actifs)` rend l'invariant
+structurel. Trois effets en cascade, tous voulus :
+
+- le verrou Redis devient une **optimisation**, plus une condition : son échec
+  n'interrompt plus la création ;
+- une violation de contrainte est traduite en `409 TICKET_ALREADY_ACTIVE` **avec
+  le ticket gagnant** — le client voit son vrai ticket au lieu d'une erreur 500 ;
+- **la création ne dépend plus de Redis du tout.** Il restait un piège : le
+  compteur de numéros (`INCR` Redis) levait avant même d'arriver à la file. Un
+  repli sur `MAX(sequence)+1` en base a été ajouté. Deux créations strictement
+  simultanées pendant une panne peuvent alors partager un numéro affiché — un
+  désagrément, pas une corruption (le ticket reste unique par son `id`), et
+  infiniment moins grave qu'une agence qui ne délivre plus rien.
+
+La reprise de données n'est pas cosmétique : l'index ne peut pas être créé s'il
+existe des doublons, et il en existe. On garde le ticket actif **le plus récent**
+de chaque utilisateur — celui qu'il est en train de vivre — on annule les autres
+et on **libère les guichets** qui les servaient, sinon un guichet resterait
+bloqué sur un ticket clos.
+
+**Effet de bord assumé :** une création qui échoue faute de Redis ne détruit plus
+le ticket. Il reste `WAITING`, `queue_degraded = true`, position inconnue, et
+`rebuild_queue` le remet en file au retour de Redis. C'est l'arbitrage déjà
+retenu pour `return_to_queue` (P1-11) : on dégrade, on ne jette pas le travail
+déjà accepté.
+
+### `013` — `queue_sequence`, un ordre qui ne doit rien à l'horloge
+
+Le score Redis était `(10 - priorité) × 10⁹ + created_ms`. Correct presque
+toujours — sauf pour deux tickets créés dans la **même milliseconde**, alors
+départagés par l'ordre lexicographique de leur UUID. Stable, mais arbitraire, et
+sans explication possible au client qui voit passer son voisin.
+
+`queue_sequence` est un entier monotone attribué par une séquence PostgreSQL. Le
+backfill vaut `ROW_NUMBER() OVER (ORDER BY created_at, id)` : **l'ordre existant
+est figé, aucune file n'est réordonnée par la migration**.
+
+La géométrie devient plus simple et plus forte :
+
+- la séquence est bornée par la marge, donc l'écart maximal possible est
+  inférieur à la marge — **la priorité l'emporte inconditionnellement**, alors
+  qu'avant elle ne l'emportait que si l'écart de création restait sous 11,57 jours ;
+- une reprise en file reçoit une **nouvelle** séquence : « fin de sa tranche »
+  n'est plus une conséquence heureuse de `created_ms = maintenant`, c'est une
+  valeur strictement supérieure à tout ce qui attend.
+
+### `014` — Outbox : l'événement ne peut plus être perdu
+
+`publish_event` diffuse après le `commit()` et avale ses erreurs. Bon choix pour
+le métier, mauvais pour la salle d'attente : Redis qui tombe entre les deux et
+l'écran ne voit jamais l'appel.
+
+L'événement est désormais écrit dans `event_outbox` **dans la transaction
+métier** — donc les deux réussissent ou échouent ensemble — puis diffusé
+immédiatement. Si la diffusion échoue, la ligne reste en attente et le scheduler
+la rejoue. Contrat « au moins une fois » : un doublon est possible si le
+processus meurt entre la diffusion et la mise à jour ; les consommateurs le
+tolèrent (ils relisent l'état).
+
+Deux garde-fous d'exploitation : plafond de 5 tentatives (une ligne irrécupérable
+sort du circuit **sans être supprimée** — on veut pouvoir répondre à « pourquoi
+cet écran n'a rien reçu ? ») et péremption à 1 h (au-delà, l'écran s'est
+resynchronisé dix fois).
+
+**Preuve :** `tests/test_phase8_engine_guarantees.py` (15). Les lots ont été
+vérifiés par mutation : retirer le traitement de `IntegrityError`, le repli de
+numérotation, ou le rejeu de l'Outbox fait tomber la suite. Suite locale :
+**665 passés, 0 ignoré, 0 échec**.
+
+**Trois tests existants ont dû changer de camp** — et c'est instructif : cinq
+fixtures créaient plusieurs tickets ACTIFS pour le même client, ce que l'index
+interdit désormais. Le code avait raison, les fixtures décrivaient un monde
+impossible. Un test (`test_reprise_refusee_si_un_autre_ticket_est_actif`) ne
+testait plus qu'une branche devenue inatteignable : il vérifie maintenant que
+c'est la BASE qui refuse, là où le refus se produit réellement.
+
+---
+
 ## Ce que ce plan ne couvre pas
 
 - **Charge réelle** : aucune mesure sous 12 postes simultanés. Le N+1 est une
@@ -412,6 +507,7 @@ distribution desktop, facturation — ne se code pas ici.
 | Phase 6 | Canal guichet : autorisation WS multi-organisations, `POST /recall`, événements de file vers les écrans | `f380e39` |
 | Phase 7 (1+2) | Absence/reprise : échéances persistées (migration `011`), grâce, plafond d'absences, priorité conservée | `37b7b03` + `b11ee83` |
 | Phase 7 (tests) | Cinq tests d'absence antidatent la grâce ; pont fakeredis pour rejouer les tests « vrai Redis » en local | `6106d8b` (CI #43 verte) |
+| Phase 8 | `012` index unique ticket actif + création indépendante de Redis, `013` `queue_sequence`, `014` Outbox | à venir |
 
 ### Ce que les phases 3 et 4 ont appris
 

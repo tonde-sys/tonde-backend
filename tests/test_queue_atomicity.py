@@ -156,12 +156,17 @@ async def _grace_ecoulee(db_session, ticket_id: str) -> None:
 
 @pytest.mark.asyncio
 async def test_pop_respects_priority_then_fifo(real_redis):
-    """ZPOPMIN sert l'urgence d'abord, puis FIFO dans la même priorité."""
+    """
+    ZPOPMIN sert l'urgence d'abord, puis FIFO dans la même priorité.
+
+    L'ordre FIFO ne dépend plus d'une pause entre deux insertions : il vient de
+    la séquence de file (migration 013). C'est le point du lot : deux tickets
+    peuvent être créés dans la même milliseconde et rester parfaitement ordonnés.
+    """
     org, agency, service = (str(uuid.uuid4()) for _ in range(3))
-    await add_to_queue(org, agency, service, "standard-1", priority=0)
-    await asyncio.sleep(0.005)
-    await add_to_queue(org, agency, service, "standard-2", priority=0)
-    await add_to_queue(org, agency, service, "urgence", priority=9)
+    await add_to_queue(org, agency, service, "standard-1", 0, 1)
+    await add_to_queue(org, agency, service, "standard-2", 0, 2)
+    await add_to_queue(org, agency, service, "urgence", 9, 3)
 
     order = []
     while (popped := await pop_next_ticket(org, agency, service)) is not None:
@@ -175,8 +180,8 @@ async def test_concurrent_pop_never_returns_same_ticket(real_redis):
     """60 guichets simultanés sur 30 tickets : chaque ticket sort exactement une fois."""
     org, agency, service = (str(uuid.uuid4()) for _ in range(3))
     ids = {f"t-{i}" for i in range(30)}
-    for tid in ids:
-        await add_to_queue(org, agency, service, tid)
+    for seq, tid in enumerate(sorted(ids), start=1):
+        await add_to_queue(org, agency, service, tid, 0, seq)
 
     results = await asyncio.gather(*(pop_next_ticket(org, agency, service) for _ in range(60)))
 

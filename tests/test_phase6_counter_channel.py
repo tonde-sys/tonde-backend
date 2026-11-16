@@ -111,8 +111,17 @@ class _Canaux:
 # sa libération passent par le client Redis, pas par ces helpers.
 @pytest.fixture
 def canaux(mock_redis):
-    """TicketService isolé de Redis : la publication et les échéances sont observables."""
+    """
+    TicketService isolé de Redis : la publication et les échéances sont observables.
+
+    Depuis la migration 014, les événements de guichet passent par l'Outbox :
+    `_publish_counter_activity` écrit une ligne puis appelle le `publish_event`
+    de `app.services.outbox`. On patche donc les DEUX points de diffusion avec le
+    MÊME mock, pour que `call_args_list` contienne tous les événements dans
+    l'ordre — sinon le test ne verrait que la moitié de ce qui est publié.
+    """
     with patch("app.services.ticket_service.publish_event", new_callable=AsyncMock) as publish, \
+         patch("app.services.outbox.publish_event", new=publish), \
          patch("app.services.ticket_service.set_deadline", new_callable=AsyncMock) as deadline, \
          patch("app.services.ticket_service.clear_deadlines", new_callable=AsyncMock), \
          patch("app.services.ticket_service.add_to_queue", new_callable=AsyncMock, return_value=1), \
@@ -131,10 +140,13 @@ def canaux_muet(mock_redis):
 
     `publish_event` avale ses propres exceptions et retourne `False` : c'est son
     contrat (`app/websocket/publisher.py`). Simuler un `raise` ici testerait le
-    mock, pas le service — on simule donc le vrai mode de défaillance.
+    mock, pas le service — on simule donc le vrai mode de défaillance. C'est
+    aussi ce mode que l'Outbox doit savoir rattraper (migration 014) : la ligne
+    reste en attente au lieu de disparaître.
     """
     with patch("app.services.ticket_service.publish_event", new_callable=AsyncMock,
-               return_value=False), \
+               return_value=False) as publish, \
+         patch("app.services.outbox.publish_event", new=publish), \
          patch("app.services.ticket_service.set_deadline", new_callable=AsyncMock), \
          patch("app.services.ticket_service.clear_deadlines", new_callable=AsyncMock), \
          patch("app.services.ticket_service.add_to_queue", new_callable=AsyncMock, return_value=1), \
@@ -153,10 +165,12 @@ def canaux_en_panne(mock_redis):
 
     Il sert à vérifier les garde-fous locaux (`try/except` autour de la
     publication) : si un jour `publish_event` laissait remonter une exception,
-    le chemin métier ne doit pas en mourir.
+    le chemin métier ne doit pas en mourir. Depuis l'Outbox, l'événement est de
+    toute façon déjà en base — l'exception ne peut plus le perdre.
     """
     with patch("app.services.ticket_service.publish_event", new_callable=AsyncMock,
-               side_effect=RuntimeError("Redis injoignable")), \
+               side_effect=RuntimeError("Redis injoignable")) as publish, \
+         patch("app.services.outbox.publish_event", new=publish), \
          patch("app.services.ticket_service.set_deadline", new_callable=AsyncMock), \
          patch("app.services.ticket_service.clear_deadlines", new_callable=AsyncMock), \
          patch("app.services.ticket_service.add_to_queue", new_callable=AsyncMock, return_value=1), \

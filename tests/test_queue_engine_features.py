@@ -527,25 +527,40 @@ async def test_call_next_rebuilds_queue_when_redis_is_empty(ticket_service, db_s
 
 
 @pytest.mark.asyncio
-async def test_create_ticket_cancelled_cleanly_when_redis_fails(ticket_service, db_session, real_redis):
-    """Redis en panne à la création : 503, ticket annulé (pas d'orphelin), le client peut réessayer."""
+async def test_create_ticket_survit_a_une_panne_redis(ticket_service, db_session, real_redis):
+    """
+    Redis en panne à la création : le ticket existe, dégradé — il n'est plus détruit.
+
+    L'ancien comportement annulait le ticket et répondait 503. Il « évitait un
+    orphelin » en supprimant le travail déjà accepté : le client n'avait plus de
+    ticket et devait recommencer. Depuis la migration 012, l'invariant « un seul
+    ticket actif » est garanti par la base, et `rebuild_queue` remet dans la file
+    tout WAITING qui en est absent. On garde donc le ticket, on annonce une
+    position inconnue, et le client peut suivre son ticket normalement.
+    """
     org, agency, service, counter, agent = await _world(db_session)
     agency_id, service_id = agency.id, service.id
 
     with patch("app.services.ticket_service.add_to_queue", new_callable=AsyncMock,
                side_effect=ConnectionError("redis down")):
-        with pytest.raises(HTTPException) as exc:
-            await ticket_service.create_ticket(
-                CreateTicketRequest(agency_id=agency_id, service_id=service_id), "client-1", None
-            )
-    assert exc.value.status_code == 503 and exc.value.detail["code"] == "QUEUE_UNAVAILABLE"
-    row = (await db_session.execute(select(Ticket).where(Ticket.user_id == "client-1"))).scalar_one()
-    assert row.status == TicketStatus.CANCELLED
+        ticket = await ticket_service.create_ticket(
+            CreateTicketRequest(agency_id=agency_id, service_id=service_id), "client-1", None
+        )
 
-    retry = await ticket_service.create_ticket(
-        CreateTicketRequest(agency_id=agency_id, service_id=service_id), "client-1", None
-    )
-    assert retry.status == "waiting"
+    assert ticket.status == "waiting"
+    assert ticket.queue_degraded is True
+    assert ticket.position == 0, "position inconnue, mais le ticket est valide"
+
+    row = (await db_session.execute(select(Ticket).where(Ticket.user_id == "client-1"))).scalar_one()
+    assert row.status == TicketStatus.WAITING, "le ticket n'est plus annulé"
+
+    # Le client ne peut pas prendre un second ticket : il en a déjà un, actif.
+    with pytest.raises(HTTPException) as exc:
+        await ticket_service.create_ticket(
+            CreateTicketRequest(agency_id=agency_id, service_id=service_id), "client-1", None
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "TICKET_ALREADY_ACTIVE"
 
 
 # ══ ETA ═══════════════════════════════════════════════════════════════════════

@@ -391,24 +391,29 @@ async def test_reprise_place_le_ticket_en_fin_de_sa_tranche(db_session, canaux):
 @pytest.mark.asyncio
 async def test_reprise_refusee_si_un_autre_ticket_est_actif(db_session, canaux):
     """
-    Garde-fou contre une donnée incohérente : si un second ticket actif existait
-    (créé à une époque où la règle n'était pas atomique), reprendre le premier
-    donnerait deux tickets actifs pour un client. On refuse, explicitement.
+    L'état incohérent contre lequel ce garde-fou luttait est devenu IMPOSSIBLE.
+
+    `return_to_queue` refusait la reprise si le client avait déjà un autre ticket
+    actif — une donnée héritée d'une époque où la règle n'était garantie ni en
+    base ni atomiquement. Depuis la migration 012, l'index unique partiel
+    interdit deux tickets actifs pour un même client : l'insertion elle-même
+    échoue, même en écrivant directement en base, sans passer par le service.
+
+    Le contrôle applicatif reste en place (défense en profondeur, et bases sur
+    lesquelles l'index n'aurait pas encore été appliqué), mais il n'est plus le
+    seul rempart : c'est la base qui refuse. On vérifie donc le refus là où il
+    se produit désormais.
     """
+    from sqlalchemy.exc import IntegrityError
+
     scene = await _scene_guichets(db_session)
     service = TicketService(db_session)
-    agent = await _agent_au_guichet(db_session, scene)
-    ticket = await _absent(db_session, service, scene, recovery_seconds=600)
+    await _absent(db_session, service, scene, recovery_seconds=600)
 
-    intrus = await _ticket_brut(db_session, scene)  # WAITING, même client
-    assert intrus.status == TicketStatus.WAITING
+    with pytest.raises(IntegrityError):
+        await _ticket_brut(db_session, scene)   # WAITING, même client → refusé
 
-    with pytest.raises(HTTPException) as exc:
-        await service.return_to_queue(ticket.id, scene["org_a"].id, actor=agent)
-
-    assert exc.value.status_code == 409
-    assert exc.value.detail["code"] == "ACTIVE_TICKET_ALREADY_EXISTS"
-    assert exc.value.detail["active_ticket_id"] == intrus.id
+    await db_session.rollback()
 
 
 @pytest.mark.asyncio

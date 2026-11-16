@@ -195,16 +195,19 @@ async def test_taille_de_file_indisponible_n_annule_pas_le_ticket(db_session, mo
 
 
 @pytest.mark.asyncio
-async def test_ajout_en_file_impossible_annule_toujours_le_ticket(db_session, mock_queue):
+async def test_ajout_en_file_impossible_ne_detruit_plus_le_ticket(db_session, mock_queue):
     """
-    Contre-épreuve : si l'AJOUT échoue, le ticket est bien annulé et la réponse 503.
+    Contre-épreuve inversée : si l'AJOUT échoue, le ticket SURVIT, dégradé.
 
-    C'est la garantie qui empêche un ticket WAITING hors file de bloquer son
-    propriétaire avec la règle « 1 ticket actif ». Séparer les deux appels ne
-    doit pas relâcher cette protection.
+    L'ancien comportement annulait le ticket puis répondait 503. Il protégeait
+    l'invariant « pas de WAITING hors file » en détruisant un travail déjà
+    accepté en base : le client repartait sans ticket et devait recommencer.
+
+    Depuis la migration 012, l'invariant « un seul ticket actif » est garanti par
+    la base, et `rebuild_queue` remet dans la file tout WAITING qui en est absent.
+    On garde donc le ticket, on annonce `queue_degraded` et une position inconnue
+    — le même arbitrage que `return_to_queue` (P1-11).
     """
-    from fastapi import HTTPException
-
     org = await _org(db_session, "org-p2-15-ko")
     branch = await _branch(db_session, org.id)
     service = await _service(db_session, org.id, branch.id)
@@ -214,21 +217,21 @@ async def test_ajout_en_file_impossible_annule_toujours_le_ticket(db_session, mo
         new_callable=AsyncMock,
         side_effect=RuntimeError("redis down"),
     ):
-        with pytest.raises(HTTPException) as exc:
-            await TicketService(db_session).create_ticket(
-                CreateTicketRequest(agency_id=branch.id, service_id=service.id),
-                user_id="client-p2-15-ko",
-                org_id=org.id,
-            )
+        ticket = await TicketService(db_session).create_ticket(
+            CreateTicketRequest(agency_id=branch.id, service_id=service.id),
+            user_id="client-p2-15-ko",
+            org_id=org.id,
+        )
 
-    assert exc.value.status_code == 503
-    assert exc.value.detail["code"] == "QUEUE_UNAVAILABLE"
+    assert ticket.status == "waiting", "le ticket n'est plus détruit"
+    assert ticket.queue_degraded is True, "le client doit savoir sa position inconnue"
+    assert ticket.position == 0
 
     rows = (await db_session.execute(
         Ticket.__table__.select().where(Ticket.user_id == "client-p2-15-ko")
     )).all()
     assert len(rows) == 1
-    assert rows[0].status == TicketStatus.CANCELLED
+    assert rows[0].status == TicketStatus.WAITING
 
 
 # ══ P2-18 — la sonde de readiness doit voir le scheduler ═════════════════════
@@ -377,8 +380,10 @@ async def test_la_reparation_se_limite_aux_agences_ouvertes(db_session, mock_que
     service_open = await _service(db_session, org.id, open_branch.id)
     service_closed = await _service(db_session, org.id, closed_branch.id)
 
-    await _ticket(db_session, org.id, open_branch.id, service_open.id, "A-001")
-    await _ticket(db_session, org.id, closed_branch.id, service_closed.id, "A-002")
+    await _ticket(db_session, org.id, open_branch.id, service_open.id, "A-001",
+                  user_id="client-open")
+    await _ticket(db_session, org.id, closed_branch.id, service_closed.id, "A-002",
+                  user_id="client-closed")
 
     with patch(
         "app.services.ticket_service.add_to_queue_if_absent",
@@ -407,9 +412,16 @@ async def test_history_garde_le_total_de_pagination(db_session, mock_queue):
     org = await _org(db_session, "org-hist")
     branch = await _branch(db_session, org.id)
     service = await _service(db_session, org.id, branch.id)
-    for i in range(1, 4):
+    # Un client ne peut avoir qu'UN ticket actif (index unique de la migration
+    # 012) : les deux autres sont clos, ce qui est de toute façon le cas réel
+    # d'un historique. Le ticket WAITING reste nécessaire : c'est sa branche qui
+    # écrasait `total` avec la taille de la file, le défaut que ce test couvre.
+    await _ticket(db_session, org.id, branch.id, service.id,
+                  number="A-001", user_id="client-hist")
+    for i in range(2, 4):
         await _ticket(db_session, org.id, branch.id, service.id,
-                      number=f"A-{i:03d}", user_id="client-hist")
+                      number=f"A-{i:03d}", user_id="client-hist",
+                      status=TicketStatus.DONE)
 
     # La file simulée annonce 1 ticket : si `total` était écrasé, il vaudrait 1.
     history = await TicketService(db_session).get_history("client-hist", page=1)

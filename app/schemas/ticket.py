@@ -79,6 +79,18 @@ class TicketResponse(BaseModel):
     recovery_expires_at: Optional[datetime] = None
     missed_count: int = 0
 
+    # ── File dégradée (spécification §7.2) ───────────────────
+    # Vrai quand le ticket existe en base mais n'a pas pu être inséré dans la
+    # file Redis : `position` vaut alors 0 (« hors file ») et le scheduler le
+    # remettra en place au retour de Redis. Le client doit le savoir pour ne pas
+    # afficher une position qui n'existe pas.
+    queue_degraded: bool = False
+
+    # Ordre de passage monotone (spécification §4.2). Le client s'en sert pour
+    # trier sans recalculer un ordre à partir des horodatages — ce que le desktop
+    # faisait, et qui ne reproduisait pas exactement l'ordre du serveur.
+    queue_sequence: Optional[int] = None
+
 
 class TicketHistoryResponse(BaseModel):
     """Réponse paginée pour l'historique des tickets."""
