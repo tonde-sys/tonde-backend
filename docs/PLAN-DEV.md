@@ -276,6 +276,61 @@ Suite locale : **492 passés, 138 ignorés, 0 échec** (+32). CI : **run #39 ver
 
 ---
 
+## Phase 7 — Algorithme d'absence et de reprise — 🟡 LOT 1+2 LIVRÉ
+
+Spécification externe « Queue Engine — Absence & Recovery » v1.0. Audit complet
+dans `docs/AUDIT-QUEUE-ENGINE-ABSENCE.md` ; ce qui suit n'en retient que les
+défauts réels et ce qui a été corrigé.
+
+Le dépôt couvrait déjà l'essentiel sous d'autres noms (`SERVED ≡ DONE`,
+`Institution ≡ Organization`, la file est le triplet `(org, branch, service)`).
+L'atomicité de l'appel était solide. Trois défauts, en revanche, étaient réels :
+
+| Défaut | Ce qui se passait |
+|---|---|
+| Aucun contrôle du délai de grâce | Un agent pouvait déclarer absent un client **une seconde** après l'avoir appelé. Le client qui traversait la salle finissait derrière tout le monde pour avoir marché trop lentement. |
+| Fenêtre de récupération ancrée sur `called_at` | 180 s d'écart, et `called_at` étant écrasé à chaque appel, une reprise suivie d'un nouvel appel repoussait silencieusement l'échéance d'expiration. |
+| Aucun `missed_count` | Un client pouvait revenir indéfiniment : deux SMS et 180 s de guichet par cycle, sans fin. |
+
+Ce qui a été fait :
+
+- **Les échéances sont devenues des données** (migration `011`) :
+  `grace_expires_at`, `missed_count`, `last_missed_at`, `recovery_expires_at`,
+  `requeued_at`, `updated_at`, plus l'index `(status, recovery_expires_at)` qui
+  est exactement le prédicat du worker d'expiration.
+- **Grâce à 90 s, filet à 180 s.** À 90 s le bouton « Client absent » s'ouvre et
+  l'agent confirme ; à 180 s le système rattrape. L'automatisme est conservé
+  parce qu'un ticket `CALLED` bloque `call_next` : sans filet, un poste abandonné
+  fige toute la file de ce guichet. La spécification voulait la confirmation
+  seule ; c'est un écart assumé, documenté.
+- **Dérogation superviseur auditée.** Un superviseur peut déclarer absent avant
+  la grâce, et l'acte est journalisé (`TICKET_ABSENT_OVERRIDE`) avec le temps
+  restant. Un agent, non : il n'a pas autorité pour raccourcir le délai qu'on
+  lui impose.
+- **La priorité est conservée à la reprise.** Le ticket revient en fin de SA
+  tranche. Le code précédent forçait STANDARD à vie : une femme enceinte perdait
+  définitivement sa priorité après un appel manqué.
+- **Plafond de deux absences**, vérifié avant la reprise.
+
+Deux points méritent d'être notés :
+
+- **La reprise de données de la migration n'est pas cosmétique.** Sans elle,
+  tous les `ABSENT` existants auraient eu `recovery_expires_at = NULL` et
+  seraient devenus **immortels** : le worker ne les aurait plus jamais vus. Un
+  correctif qui crée des zombies n'est pas un correctif — d'où une règle de
+  repli qui garde ces lignes expirables.
+- **Relancer repose la grâce.** Sans cela, « relancer puis déclarer absent »
+  aurait été un contournement du contrôle en deux clics.
+
+**Preuve :** `tests/test_phase7_absence_recovery.py` (18). Les quatre correctifs
+ont été retirés un par un (grâce, priorité, ancrage de l'expiration, plafond) et
+la suite tombe à chaque fois. Suite locale : **510 passés, 138 ignorés, 0 échec**.
+
+Reste de la spécification, dans cet ordre : index unique « un ticket actif
+global » (`012`), `queue_sequence BIGINT` (`013`), Outbox (`014`).
+
+---
+
 ## Ce que ce plan ne couvre pas
 
 - **Charge réelle** : aucune mesure sous 12 postes simultanés. Le N+1 est une
@@ -337,6 +392,7 @@ distribution desktop, facturation — ne se code pas ici.
 | Phase 5 | P2-13 + migration `010`, P2-14, 401/403 | `53f9ff5` |
 | Phase 5 bis | SMTP visible dans `/health/detailed`, sondes en `HEAD` | `a69b37d` |
 | Phase 6 | Canal guichet : autorisation WS multi-organisations, `POST /recall`, événements de file vers les écrans | `f380e39` |
+| Phase 7 (1+2) | Absence/reprise : échéances persistées (migration `011`), grâce, plafond d'absences, priorité conservée | à venir |
 
 ### Ce que les phases 3 et 4 ont appris
 

@@ -197,15 +197,22 @@ def test_le_prefixe_n_est_pas_modifiable_par_patch():
 
 # ══ La ceinture : index unique partiel en base ═══════════════════════════════
 
-def test_migration_010_est_la_tete_de_la_chaine():
-    """La migration existe et ferme la chaîne après 009."""
+def test_migration_010_est_dans_la_chaine_et_la_tete_reste_unique():
+    """
+    La migration existe, ferme la chaîne après 009, et il n'y a qu'UNE tête.
+
+    Ne pas figer le nom de la tête : c'était l'erreur du premier jet, et elle
+    casse à chaque nouveau lot sans rien protéger de plus. Ce qui compte est que
+    `010` soit dans la chaîne et qu'Alembic n'ait pas deux têtes à fusionner.
+    """
     from alembic.config import Config
     from alembic.script import ScriptDirectory
 
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["010_unique_active_service_prefix"]
+    assert len(script.get_heads()) == 1, f"têtes multiples : {script.get_heads()}"
 
     revision = script.get_revision("010_unique_active_service_prefix")
+    assert revision is not None
     assert revision.down_revision == "009_audit_org_nullable"
 
 

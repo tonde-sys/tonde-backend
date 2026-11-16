@@ -65,6 +65,20 @@ class TicketResponse(BaseModel):
     served_at: Optional[datetime] = None
     done_at: Optional[datetime] = None
 
+    # ── Absence et reprise (spécification Queue Engine §5.1) ──
+    # Le poste guichet a besoin de ces trois valeurs pour AGIR, pas pour décider :
+    #   - `grace_expires_at` : quand le bouton « Client absent » devient actif.
+    #     Sans elle, le desktop devrait recalculer `called_at + 90 s` et se
+    #     tromperait dès que la valeur change côté serveur ;
+    #   - `recovery_expires_at` : ce qu'on affiche au client (« revenez avant
+    #     10h32 ») ;
+    #   - `missed_count` : ce qui reste comme chances avant la clôture.
+    # Ce sont des valeurs SERVEUR exposées, jamais des valeurs que le client
+    # recalcule ou dont il déduit une autorisation.
+    grace_expires_at: Optional[datetime] = None
+    recovery_expires_at: Optional[datetime] = None
+    missed_count: int = 0
+
 
 class TicketHistoryResponse(BaseModel):
     """Réponse paginée pour l'historique des tickets."""

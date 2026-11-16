@@ -99,6 +99,9 @@ class Ticket(Base):
         UniqueConstraint("user_id", "client_action_id", name="uq_tickets_user_client_action"),
         Index("ix_tickets_user_status", "user_id", "status"),
         Index("ix_tickets_queue_lookup", "agency_id", "service_id", "status"),
+        # Recherche du worker d'expiration : « les ABSENT dont la fenêtre est
+        # échue ». Sans cet index, chaque passage balaie tous les tickets.
+        Index("ix_tickets_status_recovery", "status", "recovery_expires_at"),
     )
 
     # ── Identifiant unique ────────────────────────────────────
@@ -180,6 +183,43 @@ class Ticket(Base):
     )
     done_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # ── Absence et reprise (spécification Queue Engine v1.0, §5.1) ───────────
+    # Ces cinq champs étaient jusqu'ici RECALCULÉS à la volée depuis `called_at`,
+    # ce qui produisait deux défauts : la fenêtre de récupération partait de
+    # l'appel et non de l'absence (180 s d'écart), et un nouvel appel écrasait
+    # `called_at`, donc repoussait silencieusement l'échéance. Une échéance doit
+    # être une DONNÉE, pas un calcul refait à chaque lecture.
+    #
+    # `grace_expires_at` : fin du délai pendant lequel l'agent ne peut pas encore
+    #   déclarer le client absent (il vient de l'appeler, laissons-lui le temps).
+    # `missed_count` : nombre d'absences cumulées. Plafonné par MAX_MISSED_COUNT,
+    #   sans quoi un client pouvait revenir indéfiniment — deux SMS et 180 s de
+    #   guichet par cycle.
+    # `recovery_expires_at` : fin de la fenêtre de reprise, ancrée sur l'ABSENCE.
+    #   Effacé à la reprise, pour qu'une nouvelle absence reparte de zéro.
+    grace_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    missed_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    last_missed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    recovery_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    requeued_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # ── Mise à jour ──────────────────────────────────────────
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
     )
 
     # ── Notifications envoyées ────────────────────────────────

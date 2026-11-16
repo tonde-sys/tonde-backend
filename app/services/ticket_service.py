@@ -731,7 +731,21 @@ class TicketService:
     ) -> dict:
         """
         Un ticket ABSENT revient dans la file : ABSENT → WAITING.
-        Le ticket revient en fin de file, en priorité standard (pénalité).
+
+        Trois conditions sont vérifiées ici, et elles n'existaient pas
+        (spécification §3.4) :
+
+          - la fenêtre de récupération n'est pas écoulée ;
+          - le plafond d'absences n'est pas atteint ;
+          - l'utilisateur n'a pas déjà un AUTRE ticket actif (garde-fou contre
+            une donnée incohérente héritée d'une époque où la règle n'était pas
+            atomique).
+
+        Le ticket conserve sa tranche de priorité et revient en FIN de cette
+        tranche (spécification §4.3). Le code précédent forçait STANDARD à vie :
+        une femme enceinte ou une personne âgée perdait définitivement sa priorité
+        après un seul appel manqué. La pénalité de temps est déjà assurée par le
+        retour en fin de tranche — la double peine n'ajoutait rien qu'une injustice.
 
         Deux appelants possibles :
           - le CLIENT (user_id fourni) : ticket retrouvé par propriétaire ;
@@ -747,6 +761,7 @@ class TicketService:
             HTTPException 400: Transition interdite (ticket non ABSENT)
             HTTPException 403: Staff hors de sa branch
             HTTPException 404: Ticket introuvable (ou appartenant à un autre user)
+            HTTPException 409: Fenêtre expirée, plafond atteint, ou autre ticket actif
         """
         if user_id is not None:
             ticket = await self._get_ticket_for_owner(ticket_id, user_id)
@@ -756,13 +771,71 @@ class TicketService:
         else:
             ticket = await self._get_ticket_by_id(ticket_id, org_id)
 
+        # La machine à états refuse déjà tout statut autre qu'ABSENT (400).
+        # Ces contrôles ne s'appliquent donc qu'aux tickets réellement absents.
+        if ticket.status == TicketStatus.ABSENT:
+            now = datetime.now(timezone.utc)
+
+            deadline = self._recovery_deadline(ticket)
+            if deadline is not None and now >= deadline:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "RECOVERY_WINDOW_EXPIRED",
+                        "message": (
+                            "La fenêtre de retour est écoulée : ce ticket ne peut plus "
+                            "être réactivé. Prenez un nouveau ticket."
+                        ),
+                        "recovery_expires_at": deadline.isoformat(),
+                    },
+                )
+
+            missed = ticket.missed_count or 0
+            if missed >= settings.MAX_MISSED_COUNT:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "MAX_MISSED_COUNT_REACHED",
+                        "message": (
+                            f"Vous avez été absent {missed} fois : la reprise n'est plus "
+                            "possible. Prenez un nouveau ticket."
+                        ),
+                        "missed_count": missed,
+                        "max_missed_count": settings.MAX_MISSED_COUNT,
+                    },
+                )
+
+            # Garde-fou : un autre ticket actif rendrait la règle « un seul ticket
+            # actif global » fausse. On exclut CE ticket, qui est lui-même actif.
+            autre = (await self.db.execute(
+                select(Ticket.id).where(
+                    Ticket.user_id == ticket.user_id,
+                    Ticket.id != ticket.id,
+                    Ticket.status.in_(ACTIVE_STATUSES),
+                ).limit(1)
+            )).scalar_one_or_none()
+            if autre is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "ACTIVE_TICKET_ALREADY_EXISTS",
+                        "message": "Vous avez déjà un autre ticket en cours.",
+                        "active_ticket_id": autre,
+                    },
+                )
+
         await self._transition(
             ticket, TicketStatus.WAITING,
             actor_id=user_id or (actor.id if actor else None),
             actor_role=UserRole.CLIENT.value if user_id else (actor.role.value if actor else None),
+            extra={"missed_count": ticket.missed_count or 0},
         )
-        # Pénalité : retour en fin de file, priorité standard
-        ticket.priority = TicketPriority.STANDARD
+        # La priorité est CONSERVÉE (spécification §4.3). Le retour en fin de
+        # tranche suffit : `add_to_queue` avec created_ms=None place le ticket
+        # derrière tous ceux de même priorité déjà en file.
+        ticket.requeued_at = datetime.now(timezone.utc)
+        ticket.recovery_expires_at = None
+        ticket.grace_expires_at = None
         await self.db.commit()
 
         # Constat P1-11 : `add_to_queue` n'était pas protégé. Une panne Redis
@@ -781,7 +854,7 @@ class TicketService:
         try:
             await add_to_queue(
                 ticket.org_id, ticket.agency_id, ticket.service_id, ticket.id,
-                PRIORITY_SCORES[TicketPriority.STANDARD],
+                PRIORITY_SCORES[ticket.priority],
             )
         except Exception as exc:  # noqa: BLE001
             queue_degraded = True
@@ -792,7 +865,31 @@ class TicketService:
 
         if not queue_degraded:
             await self._publish_queue_snapshot(ticket.org_id, ticket.agency_id, ticket.service_id)
-        return {"success": True, "ticket_id": ticket.id, "queue_degraded": queue_degraded}
+        return {
+            "success": True,
+            "ticket_id": ticket.id,
+            "queue_degraded": queue_degraded,
+            "priority": ticket.priority.value,
+            "missed_count": ticket.missed_count or 0,
+        }
+
+    def _recovery_deadline(self, ticket: Ticket) -> datetime | None:
+        """
+        Fin de la fenêtre de reprise d'un ticket ABSENT.
+
+        `recovery_expires_at` est la donnée de référence, ancrée sur l'ABSENCE.
+        Repli sur `last_missed_at` puis `called_at` pour les tickets antérieurs à
+        la migration 011 : mieux vaut une échéance approchée qu'un ticket
+        immortel. Retourne None si aucune date n'est exploitable — auquel cas la
+        reprise est autorisée, pour ne pas punir un client à cause d'un champ
+        manquant.
+        """
+        if ticket.recovery_expires_at is not None:
+            return as_utc(ticket.recovery_expires_at)
+        anchor = ticket.last_missed_at or ticket.called_at
+        if anchor is None:
+            return None
+        return as_utc(anchor) + timedelta(minutes=settings.ABSENT_RETURN_WINDOW_MINUTES)
 
     # ══ Actions du guichetier ══════════════════════════════════════════════════
 
@@ -1054,6 +1151,14 @@ class TicketService:
         #    que le client arrive).
         await self._schedule_absent_deadlines(ticket)
 
+        #    Le délai de GRÂCE repart aussi : l'agent vient de réannoncer, il ne
+        #    peut pas déclarer absent dans la seconde. Sans cela, relancer puis
+        #    déclarer absent immédiatement aurait été un contournement du contrôle.
+        ticket.grace_expires_at = datetime.now(timezone.utc) + timedelta(
+            seconds=settings.GRACE_PERIOD_SECONDS
+        )
+        await self.db.commit()
+
         # 2. Le client : téléphone (your_turn) puis SMS / push.
         await publish_event(ticket.org_id, {
             "type": EventType.YOUR_TURN.value,
@@ -1208,16 +1313,94 @@ class TicketService:
         Le client ne s'est pas présenté après timeout (manuel : par l'agent).
         Transition : CALLED → ABSENT
 
+        Le délai de grâce (spécification §3.1) est vérifié ici : un agent ne peut
+        pas déclarer absent un client qu'il vient d'appeler. Sans ce contrôle, le
+        bouton « Client absent » était cliquable immédiatement après l'annonce —
+        et un client qui traversait la salle se retrouvait derrière tout le monde
+        pour avoir marché trop lentement.
+
+        Un superviseur et au-dessus peut passer outre : c'est la dérogation prévue
+        par la spécification, et elle est auditée avec son motif. Un agent, non —
+        il n'a pas autorité pour raccourcir le délai qu'on lui impose.
+
         Raises:
             HTTPException 400: Transition interdite (ticket non CALLED)
             HTTPException 403: Ticket d'un autre guichet / d'une autre branch
             HTTPException 404: Ticket introuvable
+            HTTPException 409: Délai de grâce non écoulé (agent)
         """
         ticket = await self._get_ticket_for_staff(ticket_id, actor)
         await self._assert_staff_can_handle(actor, ticket)
-        await self._set_absent(ticket, actor_id=actor.id, actor_role=actor.role.value)
-        logger.info(f"Ticket absent: {ticket.number}")
-        return {"success": True, "ticket_id": ticket.id}
+
+        deadline = self._grace_deadline(ticket)
+        override = False
+        seconds_left = 0
+        if deadline is not None:
+            now = datetime.now(timezone.utc)
+            if now < deadline:
+                seconds_left = int((deadline - now).total_seconds()) + 1
+                if actor.role not in ANY_COUNTER_ROLES:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "code": "GRACE_PERIOD_NOT_ELAPSED",
+                            "message": (
+                                "Le client vient d'être appelé : attendez la fin du délai "
+                                "de grâce avant de le déclarer absent."
+                            ),
+                            "seconds_left": seconds_left,
+                            "grace_period_seconds": settings.GRACE_PERIOD_SECONDS,
+                        },
+                    )
+                override = True
+                logger.warning(
+                    f"Dérogation : {actor.role.value} {actor.id} déclare absent "
+                    f"{ticket.number} avec {seconds_left}s de grâce restantes"
+                )
+                await AuditService(self.db).log(
+                    org_id=ticket.org_id,
+                    action=AuditAction.TICKET_ABSENT_OVERRIDE,
+                    actor_id=actor.id,
+                    actor_role=actor.role.value,
+                    target_type="ticket",
+                    target_id=ticket.id,
+                    extra={
+                        "ticket_number": ticket.number,
+                        "seconds_left": seconds_left,
+                        "grace_period_seconds": settings.GRACE_PERIOD_SECONDS,
+                    },
+                )
+
+        await self._set_absent(
+            ticket, actor_id=actor.id, actor_role=actor.role.value,
+            extra={"override_grace": True, "grace_seconds_left": seconds_left} if override else None,
+        )
+        logger.info(f"Ticket absent: {ticket.number}{' (dérogation)' if override else ''}")
+        return {
+            "success": True,
+            "ticket_id": ticket.id,
+            "missed_count": ticket.missed_count,
+            "recovery_allowed": ticket.missed_count < settings.MAX_MISSED_COUNT,
+            "recovery_expires_at": (
+                ticket.recovery_expires_at.isoformat() if ticket.recovery_expires_at else None
+            ),
+        }
+
+    def _grace_deadline(self, ticket: Ticket) -> datetime | None:
+        """
+        Fin du délai de grâce de l'appel en cours.
+
+        `grace_expires_at` est la donnée de référence (migration 011). Les tickets
+        appelés avant cette migration ne l'ont pas : on la reconstitue depuis
+        `called_at`, qui est exactement la valeur qu'utilisait le code précédent.
+        Retourne None si le ticket n'a jamais été appelé — auquel cas il n'y a
+        rien à protéger, et la machine à états refusera la transition de toute façon.
+        """
+        if ticket.grace_expires_at is not None:
+            return as_utc(ticket.grace_expires_at)
+        if ticket.called_at is None:
+            return None
+        return as_utc(ticket.called_at) + timedelta(seconds=settings.GRACE_PERIOD_SECONDS)
 
     async def transfer_ticket(
         self,
@@ -1573,24 +1756,34 @@ class TicketService:
         # Règle principale : plus personne ne peut être servi, l'agence est fermée.
         counts["waiting"] += await self._expire_waiting_of_closed_branches(now, batch)
 
-        rules: list[tuple[str, TicketStatus, TicketStatus, datetime, object]] = [
+        rules: list[tuple[str, TicketStatus, TicketStatus, datetime, object, list]] = [
             # Filet de sécurité : agence qui ne ferme jamais (horaires mal réglés).
             ("waiting", TicketStatus.WAITING, TicketStatus.CANCELLED,
-             now - timedelta(hours=settings.WAITING_TICKET_TTL_HOURS), Ticket.created_at),
+             now - timedelta(hours=settings.WAITING_TICKET_TTL_HOURS), Ticket.created_at, []),
+            # Fenêtre de récupération : DONNÉE persistée, ancrée sur l'ABSENCE
+            # (migration 011). Avant, elle était recalculée depuis `called_at`,
+            # donc décalée de 180 s et repoussée par tout nouvel appel.
             ("absent", TicketStatus.ABSENT, TicketStatus.CANCELLED,
-             now - timedelta(minutes=settings.ABSENT_RETURN_WINDOW_MINUTES), Ticket.called_at),
+             now, Ticket.recovery_expires_at, []),
+            # Filet pour un ABSENT dont `recovery_expires_at` serait resté NULL
+            # (ligne héritée d'avant la migration) : sans cette règle, il serait
+            # immortel et bloquerait son client indéfiniment.
+            ("absent", TicketStatus.ABSENT, TicketStatus.CANCELLED,
+             now - timedelta(minutes=settings.ABSENT_RETURN_WINDOW_MINUTES), Ticket.called_at,
+             [Ticket.recovery_expires_at.is_(None)]),
             ("serving", TicketStatus.SERVING, TicketStatus.INCOMPLETE,
-             now - timedelta(hours=settings.SERVING_TICKET_TTL_HOURS), Ticket.served_at),
+             now - timedelta(hours=settings.SERVING_TICKET_TTL_HOURS), Ticket.served_at, []),
             ("incomplete", TicketStatus.INCOMPLETE, TicketStatus.CANCELLED,
-             now - timedelta(hours=settings.INCOMPLETE_TICKET_TTL_HOURS), Ticket.served_at),
+             now - timedelta(hours=settings.INCOMPLETE_TICKET_TTL_HOURS), Ticket.served_at, []),
         ]
 
-        for name, from_status, to_status, cutoff, column in rules:
+        for name, from_status, to_status, cutoff, column, extra_filters in rules:
             result = await self.db.execute(
                 select(Ticket.id).where(
                     Ticket.status == from_status,
                     column.isnot(None),
                     column < cutoff,
+                    *extra_filters,
                 ).limit(batch)
             )
             # Identifiants seulement : un rollback (sur une erreur) expire tous les objets
@@ -2155,6 +2348,14 @@ class TicketService:
                     .values(
                         status=TicketStatus.CALLED,
                         called_at=now,
+                        # Délai de grâce : pendant ce temps, l'agent ne peut pas
+                        # encore déclarer le client absent (il vient de l'appeler).
+                        # Persisté et non recalculé, pour que l'échéance reste
+                        # vérifiable même après un redémarrage ou une reprise.
+                        grace_expires_at=now + timedelta(seconds=settings.GRACE_PERIOD_SECONDS),
+                        # Un ticket appelé n'est plus en récupération : l'échéance
+                        # de reprise est effacée, une future absence en reposera une.
+                        recovery_expires_at=None,
                         counter_id=counter_id,
                         counter_name=counter_name,
                     )
@@ -2209,9 +2410,37 @@ class TicketService:
         except Exception as exc:  # noqa: BLE001
             logger.error(f"Échéances non programmées pour {ticket.number}: {exc}")
 
-    async def _set_absent(self, ticket: Ticket, *, actor_id: str | None, actor_role: str) -> None:
+    async def _set_absent(
+        self,
+        ticket: Ticket,
+        *,
+        actor_id: str | None,
+        actor_role: str,
+        extra: dict | None = None,
+    ) -> None:
         """CALLED → ABSENT : libère le guichet, annule les échéances, notifie le client."""
-        await self._transition(ticket, TicketStatus.ABSENT, actor_id=actor_id, actor_role=actor_role)
+        # Les trois valeurs qui portent l'algorithme d'absence. Elles étaient
+        # recalculées à la volée depuis `called_at` : la fenêtre de récupération
+        # partait donc de l'APPEL (180 s d'écart), et un nouvel appel écrasait
+        # `called_at`, repoussant silencieusement l'échéance. Une échéance est une
+        # donnée, pas un calcul refait à chaque lecture.
+        now = datetime.now(timezone.utc)
+        missed_count = (ticket.missed_count or 0) + 1
+        recovery_expires_at = now + timedelta(minutes=settings.ABSENT_RETURN_WINDOW_MINUTES)
+        ticket.missed_count = missed_count
+        ticket.last_missed_at = now
+        ticket.recovery_expires_at = recovery_expires_at
+        ticket.grace_expires_at = None  # la grâce concerne l'appel, pas l'absence
+
+        await self._transition(
+            ticket, TicketStatus.ABSENT, actor_id=actor_id, actor_role=actor_role,
+            extra={
+                "missed_count": missed_count,
+                "recovery_expires_at": recovery_expires_at.isoformat(),
+                "recovery_allowed": missed_count < settings.MAX_MISSED_COUNT,
+                **(extra or {}),
+            },
+        )
         await self._release_counter(ticket)
         await self.db.commit()
         await clear_deadlines(ticket.org_id, ticket.id)
@@ -2229,6 +2458,11 @@ class TicketService:
             "agency_id": ticket.agency_id,
             "message": "Vous avez été déclaré absent. Vous pouvez revenir en file.",
             "return_window_minutes": settings.ABSENT_RETURN_WINDOW_MINUTES,
+            # Le client doit savoir s'il lui reste une chance : au-delà du
+            # plafond, revenir est refusé et il devra prendre un nouveau ticket.
+            "missed_count": missed_count,
+            "recovery_allowed": missed_count < settings.MAX_MISSED_COUNT,
+            "recovery_expires_at": recovery_expires_at.isoformat(),
         })
 
     async def _leave_queue(self, ticket: Ticket) -> None:
@@ -2315,6 +2549,9 @@ class TicketService:
             called_at=ticket.called_at,
             served_at=ticket.served_at,
             done_at=ticket.done_at,
+            grace_expires_at=ticket.grace_expires_at,
+            recovery_expires_at=ticket.recovery_expires_at,
+            missed_count=ticket.missed_count or 0,
         )
 
     async def _current_called_number(self, service_id: str) -> str | None:

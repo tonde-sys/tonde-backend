@@ -33,6 +33,11 @@ class AuditAction:
     # (coût réel) et parce qu'un agent qui relance dix fois le même client est un
     # signal d'exploitation, pas un détail.
     TICKET_RECALLED = "ticket_recalled"
+    # Dérogation au délai de grâce : un superviseur (ou au-dessus) a déclaré
+    # absent un client encore dans sa fenêtre de grâce. C'est un acte
+    # d'autorité — il raccourcit un délai imposé à l'agent — donc il se journalise
+    # avec le temps restant, pas seulement dans l'historique du ticket.
+    TICKET_ABSENT_OVERRIDE = "ticket_absent_override"
     # Connexions (constat P3-17) — « qui s'est connecté, quand, depuis où ».
     LOGIN_SUCCEEDED = "login_succeeded"
     LOGIN_FAILED = "login_failed"

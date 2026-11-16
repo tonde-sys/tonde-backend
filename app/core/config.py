@@ -117,6 +117,24 @@ class Settings(BaseSettings):
     ABSENT_TIMEOUT_SECONDS: int = 180
     # Avertissement « dépêchez-vous » envoyé avant l'expiration.
     ABSENT_WARNING_SECONDS: int = 120
+    # Délai de GRÂCE : pendant ces secondes après l'appel, l'agent ne peut pas
+    # encore déclarer le client absent — il vient de l'appeler, laissons-lui le
+    # temps de regarder la salle. À l'échéance, le bouton « Client absent »
+    # s'ouvre. Au-delà, `ABSENT_TIMEOUT_SECONDS` reste le filet : si l'agent a
+    # quitté son poste, le système rattrape, sinon le ticket CALLED bloquerait
+    # `call_next` (COUNTER_BUSY) et figerait toute la file de ce guichet.
+    # Doit rester STRICTEMENT inférieur à ABSENT_TIMEOUT_SECONDS.
+    GRACE_PERIOD_SECONDS: int = 90
+    # Nombre d'absences au-delà duquel la reprise est refusée. Sans plafond, un
+    # client pouvait revenir indéfiniment : deux SMS et 180 s de guichet par cycle.
+    MAX_MISSED_COUNT: int = 2
+    # Nombre de tickets déjà en attente qui doivent passer avant un ticket repris.
+    # C'est une CIBLE MINIMALE, pas une position absolue : la reprise place le
+    # ticket en fin de sa tranche de priorité, donc derrière TOUS les tickets de
+    # même priorité déjà en file — ce qui satisfait la cible par construction.
+    # Le paramètre documente l'intention ; il n'est pas utilisé pour déplacer
+    # d'autres tickets.
+    REQUEUE_AHEAD_COUNT: int = 2
     # Nombre de RELANCES autorisées pour un ticket déjà appelé.
     # Une relance renvoie un SMS au client : sans plafond, un agent qui s'acharne
     # sur le bouton « Rappeler » fait exploser la facture SMS et harcèle un client
@@ -326,6 +344,16 @@ class Settings(BaseSettings):
         if self.ABSENT_WARNING_SECONDS >= self.ABSENT_TIMEOUT_SECONDS:
             raise ValueError(
                 "ABSENT_WARNING_SECONDS doit être inférieur à ABSENT_TIMEOUT_SECONDS"
+            )
+        # Si la grâce dépassait le filet automatique, le bouton « Client absent »
+        # s'ouvrirait APRÈS que le système a déjà déclaré l'absence : la grâce ne
+        # servirait à rien, et le refus `GRACE_PERIOD_NOT_ELAPSED` deviendrait
+        # inatteignable. On refuse la configuration au démarrage plutôt que de
+        # découvrir l'incohérence en production.
+        if self.GRACE_PERIOD_SECONDS >= self.ABSENT_TIMEOUT_SECONDS:
+            raise ValueError(
+                "GRACE_PERIOD_SECONDS doit être strictement inférieur à "
+                "ABSENT_TIMEOUT_SECONDS (sinon la grâce n'a aucun effet)"
             )
         return self
 
