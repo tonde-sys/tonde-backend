@@ -335,7 +335,7 @@ distribution desktop, facturation — ne se code pas ici.
 | Phase 4 | Mot de passe oublié (SMTP, jeton usage unique) + `daily-report` | `9f2ae62` |
 | Phase 5 | P2-13 + migration `010`, P2-14, 401/403 | `53f9ff5` |
 | Phase 5 bis | SMTP visible dans `/health/detailed`, sondes en `HEAD` | `a69b37d` |
-| Phase 6 | Canal guichet : autorisation WS multi-organisations, `POST /recall`, événements de file vers les écrans | à venir |
+| Phase 6 | Canal guichet : autorisation WS multi-organisations, `POST /recall`, événements de file vers les écrans | `f380e39` |
 
 ### Ce que les phases 3 et 4 ont appris
 
