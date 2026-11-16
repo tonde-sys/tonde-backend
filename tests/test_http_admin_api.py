@@ -27,7 +27,9 @@ async def test_me_returns_profile_and_requires_auth(api, db_session):
 
     assert ok.status_code == 200
     assert ok.json()["data"]["id"] == user.id and ok.json()["data"]["name"] == "Jean"
-    assert anonymous.status_code in (401, 403)
+    # 401 et non 403 : un jeton ABSENT n'est pas une interdiction (cf. test_phase5_auth_status.py)
+    assert anonymous.status_code == 401
+    assert anonymous.json()["detail"]["code"] == "MISSING_TOKEN"
 
 
 @pytest.mark.asyncio

@@ -21,8 +21,15 @@ from app.models.user import User, UserRole
 
 logger = logging.getLogger(__name__)
 
-# Schéma Bearer Token pour Swagger + clients HTTP
-bearer_scheme = HTTPBearer()
+# Schéma Bearer Token pour Swagger + clients HTTP.
+#
+# `auto_error=False` est délibéré : avec la valeur par défaut (True), FastAPI lève
+# lui-même un 403 quand l'en-tête `Authorization` est absent — ce qui empêche un
+# client de distinguer « pas authentifié » (401, il faut se connecter) de
+# « authentifié mais interdit » (403, se connecter ne changera rien). Un client
+# qui reçoit 403 sur un jeton absent ne sait pas qu'il doit rafraîchir son jeton,
+# et l'écran de connexion ne s'affiche pas. On lève donc nous-mêmes le 401.
+bearer_scheme = HTTPBearer(auto_error=False)
 
 # Hiérarchie des rôles — ordre croissant de permissions
 ROLE_HIERARCHY = [
@@ -76,7 +83,7 @@ def _require_role(minimum_role: UserRole):
 
 # ── Dépendance principale ─────────────────────────────────────────────────────
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
     """
@@ -88,8 +95,22 @@ async def get_current_user(
             return current_user
 
     Raises:
-        HTTPException 401: Token invalide, expiré ou utilisateur introuvable
+        HTTPException 401: En-tête absent, token invalide/expiré, ou utilisateur introuvable
     """
+    if credentials is None:
+        # Absence d'en-tête = non authentifié (401), pas « interdit » (403).
+        # `WWW-Authenticate: Bearer` est ce qui autorise un client HTTP à savoir
+        # qu'il doit présenter un jeton ; sans lui, certains clients n'affichent
+        # même pas d'invite de connexion.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "MISSING_TOKEN",
+                "message": "En-tête Authorization manquant. Format attendu : 'Bearer <jeton>'",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     token = credentials.credentials
     user_id = verify_token(token, token_type="access")
 

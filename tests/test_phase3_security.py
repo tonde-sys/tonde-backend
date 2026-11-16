@@ -465,12 +465,14 @@ async def test_search_filtre_par_organisation_et_par_action(db_session):
     assert total_all == 3 and len(rows_all) == 3
 
 
-def test_la_migration_d_audit_est_la_tete_unique():
+def test_la_migration_d_audit_est_dans_la_chaine_et_la_tete_reste_unique():
     """
-    Garde-fou : une seule tête Alembic, et c'est la migration 009.
+    Garde-fou : une seule tête Alembic, et la migration 009 est bien dans la
+    chaîne (pas seulement présente sur le disque).
 
     Deux têtes font échouer `alembic upgrade head` en production — donc un
-    déploiement cassé au moment où on en a le moins besoin.
+    déploiement cassé au moment où on en a le moins besoin. La tête elle-même
+    avance à chaque lot ; c'est l'unicité qui compte, pas son nom.
     """
     from alembic.config import Config
     from alembic.script import ScriptDirectory
@@ -478,4 +480,6 @@ def test_la_migration_d_audit_est_la_tete_unique():
     config = Config("alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["009_audit_org_nullable"]
+    heads = script.get_heads()
+    assert len(heads) == 1, f"têtes multiples : {heads}"
+    assert script.get_revision("009_audit_org_nullable") is not None

@@ -66,11 +66,14 @@ qu'aucun utilisateur ne peut changer lui-même.
 
 ### État d'avancement
 
-Vue unique, à jour au 15/11/2026 18:40. ✅ = corrigé **et** couvert par des
+Vue unique, à jour au 16/11/2026 12:45. ✅ = corrigé **et** couvert par des
 tests ; ⬜ = rien n'a été fait, le constat reste vrai.
 
-**17 constats sur 20 sont traités.** Restent P2-13 et P2-14 ; l'observation
-401/403, hors constat numéroté, reste également ouverte.
+**Les 20 constats sont traités, et l'observation 401/403 est corrigée.** Ce
+n'est pas une déclaration de perfection : c'est la liste des points que cet
+audit avait lui-même relevés, et il n'en reste aucun ouvert. Ce qui reste est
+ailleurs — dans ce que l'audit n'a pas regardé, et dans les fonctions produit
+qui manquent encore (voir la dernière section).
 
 | # | Constat | État | Preuve |
 |---|---|---|---|
@@ -86,8 +89,8 @@ tests ; ⬜ = rien n'a été fait, le constat reste vrai.
 | 10 | `websocket_counter` : aucun contrôle d'affectation | ✅ | `tests/test_phase3_security.py` (5) |
 | 11 | `return_to_queue` sans repli si Redis échoue | ✅ | `tests/test_phase1_corrections.py` (3) |
 | 12 | `GET /tickets/history` renvoie `position: 0` | ✅ | `tests/test_phase0_corrections.py` (2) |
-| 13 | Préfixe de service unique seulement entre services actifs | ⬜ | — |
-| 14 | `get_branch_display` : N+1 requêtes | ⬜ | — |
+| 13 | Préfixe de service unique seulement entre services actifs | ✅ | `tests/test_phase5_service_prefix.py` (10) + migration `010` |
+| 14 | `get_branch_display` : N+1 requêtes | ✅ | `tests/test_phase5_branch_display.py` (8) |
 | 15 | Création : `get_queue_size` dans le même `try` que `add_to_queue` | ✅ | `tests/test_phase1_corrections.py` (2) |
 | 16 | `queue_score` : marge de priorité de 104 jours | ✅ | `tests/test_queue_score_geometry.py` (9) |
 | 17 | Aucune trace d'audit des connexions | ✅ | `tests/test_phase3_security.py` (8) + migration `009` |
@@ -95,10 +98,9 @@ tests ; ⬜ = rien n'a été fait, le constat reste vrai.
 | 19 | Aucun endpoint de changement de mot de passe | ✅ | `tests/test_change_password.py` (11) + `tests/test_cli_reset_password.py` (5) |
 | 20 | Mot de passe partagé par 4 comptes, écrit en clair | ✅ | rotation exécutée le 15/11 15:03, 4 mots de passe distincts |
 
-**17 constats sur 20 sont traités, 3 restent ouverts.** Les trois derniers —
-P2-13, P2-14 et l'observation 401/403 — sont de la dette assumée : aucun ne
-bloque le test partenaire, tous sont documentés avec leur correctif. La séquence
-d'exécution est dans `docs/PLAN-DEV.md`.
+**20 constats sur 20 sont traités.** L'observation 401/403, hors constat
+numéroté, l'est aussi. La séquence d'exécution et les lots livrés sont dans
+`docs/PLAN-DEV.md`.
 
 Deux remarques sur ce tableau :
 
@@ -621,17 +623,34 @@ gestionnaire, puis supprimer `docs/oganisation-ulbu.txt`, et retirer
 
 ## P2 — dette technique
 
-**13. Préfixe unique seulement entre services actifs** —
-`service_service.py:44-51` filtre `is_active == True`. Désactiver « Caisse » (C),
-créer « Crédit » (C), puis réactiver « Caisse » donne deux services actifs avec
-le même préfixe, donc deux files qui produisent des `C-001` différents le même
-jour. Ajouter la vérification dans `update` lors d'une réactivation.
+**13. Préfixe unique seulement entre services actifs** — ✅ corrigé.
+`service_service.py:44-51` filtrait `is_active == True`, et `update` ne
+vérifiait rien. Désactiver « Caisse » (C), créer « Crédit » (C), puis réactiver
+« Caisse » donnait deux services actifs avec le même préfixe, donc deux files
+qui produisent des `C-001` différents le même jour. Le préfixe étant immuable
+(`UpdateServiceRequest` a `extra="forbid"`), la **réactivation** était le seul
+chemin encore ouvert. **Correctif :** `_ensure_prefix_available()` est appelé à
+la création **et** lors d'une réactivation, avec un message qui nomme le service
+en conflit ; la migration `010_unique_active_service_prefix` ajoute un index
+unique **partiel** (`WHERE is_active`) qui rend l'invariant vrai même si un
+futur chemin de code oublie l'appel. Partiel et non global : un service
+désactivé doit libérer sa lettre, sinon un préfixe serait brûlé à vie.
 
-**14. `get_branch_display` : N+1** — une requête par guichet
-(`public_service.py:122-125`) et trois par service (`:139-146`). Pour 12 guichets
-et 6 services, ~30 requêtes par appel, appelé toutes les 7 s par chaque poste
-desktop. Un `selectinload`/jointure et un cache Redis de 2 s ramèneraient cela à
-2 requêtes.
+**14. `get_branch_display` : N+1** — ✅ corrigé.
+Une requête par guichet et trois par service : ~30 requêtes pour 12 guichets et
+6 services, sur un endpoint **public** interrogé toutes les 7 s par chaque poste
+(~85 requêtes/s pour une seule agence). **Correctif :** les numéros en cours,
+les derniers appelés et les durées moyennes glissantes sont lus en une requête
+groupée chacun (`row_number()` plutôt qu'un `LIMIT 1` par service), et le repli
+PostgreSQL en cas de panne Redis est lui aussi groupé — sinon une panne Redis se
+transformait en N+1 sur la base, au pire moment. Résultat : **6 requêtes
+constantes**, quel que soit le nombre de guichets et de services.
+
+Le cache Redis de 2 s suggéré ici n'a pas été ajouté, volontairement : un écran
+qui se rafraîchit toutes les 7 s ne gagne rien à être mis en cache 2 s, et un
+cache par instance se paie en invalidation et en tests. Le regroupement suffit
+tant que l'agence reste sous la centaine de postes ; le jour où ce n'est plus
+vrai, c'est le cache qu'il faudra, pas une nouvelle jointure.
 
 **15. `get_queue_size` dans le `try` de `add_to_queue`** — ✅ corrigé.
 `ticket_service.py:310-330`. Si l'ajout réussit mais que la taille échoue, le
@@ -708,8 +727,8 @@ du `super_admin` (org NULL) :
 ```
 
 Contrôles négatifs vérifiés sur la même instance : un jeton d'agent sur
-`/audit/logs` → **403**, et une requête sans jeton → **403** (l'observation
-401/403 ci-dessous, toujours ouverte).
+`/audit/logs` → **403** (rôle insuffisant, correct), et une requête sans jeton →
+**403** à l'époque — c'est précisément l'observation 401/403, corrigée depuis.
 
 **18. `/health/ready` n'inspecte pas le scheduler** — ✅ corrigé.
 `health_service.py` vérifiait la base et Redis. Si la boucle de fond mourait, les
@@ -743,13 +762,25 @@ panne bruyante, puis une panne réparée.
                          "stale_after_seconds": 120}}}
 ```
 
-**Observation hors constat — 401 vs 403.** Une requête sans jeton sur une route
-protégée reçoit `403`, pas `401` : c'est le comportement de `HTTPBearer()` avec
-`auto_error=True` (FastAPI renvoie « Not authenticated » en 403). C'est cohérent
-sur toutes les routes et aucun client ne s'en plaint, mais un audit de sécurité
-bancaire le relèvera : « pas de jeton » devrait être `401`, « jeton valide mais
-rôle insuffisant » `403`. Le corriger touche toutes les routes à la fois
-(`auto_error=False` + 401 explicite) — à planifier, pas à glisser dans un lot.
+**Observation hors constat — 401 vs 403** — ✅ corrigée.
+Une requête sans jeton sur une route protégée recevait `403`, pas `401` : c'est
+le comportement de `HTTPBearer()` avec `auto_error=True`, qui lève lui-même
+l'erreur avant que la dépendance ne s'exécute. Le client ne pouvait donc pas
+distinguer « je ne sais pas qui tu es » (401 → se connecter, ou rafraîchir le
+jeton) de « je sais qui tu es, mais c'est interdit » (403 → se connecter ne
+changera rien). Un mobile qui reçoit 403 sur un jeton expiré n'affiche pas son
+écran de connexion : l'utilisateur reste bloqué, et le support reçoit un appel.
+
+**Correctif :** `HTTPBearer(auto_error=False)` et un `401 MISSING_TOKEN` explicite
+avec `WWW-Authenticate: Bearer`, conforme à la RFC 7235. Le 403 reste réservé au
+rôle insuffisant. Le schéma OpenAPI est préservé — vérifié par un test, parce
+qu'un correctif qui fait disparaître le bouton « Authorize » de Swagger casserait
+tous les essais manuels.
+
+La crainte initiale (« touche toutes les routes ») était fausse : toutes les
+routes protégées passent par `get_current_user`, donc par une seule dépendance.
+Deux tests existants qui toléraient `in (401, 403)` ont été resserrés à `401` —
+une tolérance qui laisse passer les deux valeurs ne vérifie rien.
 
 ---
 
@@ -783,6 +814,45 @@ autres, que la lecture du code n'avait pas vues :
    jusqu'à son expiration. Deux liens actifs au lieu d'un, donc deux fois la
    surface d'interception. Corrigé : l'ancien jeton est supprimé **avant**
    l'écriture du nouveau.
+
+---
+
+## Livraison de la phase 5 — la dette et le 401
+
+Trois lots de dette, livrés le 16/11. Aucun n'était bloquant pour le pilote ;
+tous étaient des questions qu'un évaluateur technique pose.
+
+| Lot | Livré | Tests |
+|---|---|---|
+| P2-13 | Réactivation refusée si le préfixe a été repris + index unique partiel (migration `010`) | `test_phase5_service_prefix.py` (10) |
+| P2-14 | `get_branch_display` : 6 requêtes constantes au lieu de 3 + 2N + M | `test_phase5_branch_display.py` (8) |
+| 401/403 | Jeton absent → `401 MISSING_TOKEN` + `WWW-Authenticate`, 403 réservé au rôle | `test_phase5_auth_status.py` (13) |
+
+### Ce que le test du N+1 mesure vraiment
+
+Le test n'affirme pas « moins de 10 requêtes » — une telle assertion passerait
+aujourd'hui et sauterait à la première agence un peu grande. Il compare le
+nombre de requêtes pour **2 services puis pour 8 services dans la même agence**
+et exige l'égalité. C'est la seule formulation qui échoue dès qu'un N+1 revient,
+quel que soit le nombre de services ajoutés ensuite.
+
+Le même test est rejoué avec Redis en panne, parce que le repli SQL était
+lui-même un N+1 : une panne Redis se transformait en surcharge PostgreSQL, au
+moment précis où la base est le seul recours.
+
+### Le préfixe : pourquoi un index partiel et pas un index unique
+
+Un index unique global sur `(branch_id, ticket_prefix)` aurait interdit de
+réutiliser la lettre d'un service désactivé — c'est-à-dire de remplacer « Retrait »
+par « Retrait express » en gardant le préfixe R, qui est le cas normal d'un
+guichet qui change de prestation. L'index est donc partiel (`WHERE is_active`) :
+seuls les services actifs se disputent la lettre, et l'invariant « au plus un
+service actif par préfixe » devient vrai en base, pas seulement dans le service.
+
+Comme pour la migration `008`, l'index n'est pas créé si des doublons existent
+déjà : faire échouer la migration rendrait indéployable la base qu'on cherche à
+réparer. Le message de warning donne la requête SQL pour trouver les branches
+concernées.
 
 La leçon est la même que pour la CI en phase 1 : ce qui n'est pas vérifié par un
 test n'est pas vérifié du tout, y compris quand le commentaire affirme le
@@ -892,9 +962,11 @@ production, déployée depuis `main` :
    affectation guichet, audit des connexions.
 7. ~~**Email sortant, mot de passe oublié, rapport quotidien**~~ — **fait**
    (phase 4).
-8. **P2-13, P2-14** — dette assumée, mesurable avant d'être optimisée.
-9. **401 vs 403** — à traiter comme un lot à part : la correction touche toutes
-   les routes protégées à la fois.
+8. ~~**P2-13, P2-14**~~ — **fait** (phase 5) : unicité du préfixe à la
+   réactivation + index partiel, et N+1 de l'écran de salle ramené à 6 requêtes
+   constantes.
+9. ~~**401 vs 403**~~ — **fait** (phase 5). La crainte « touche toutes les
+   routes » était fausse : elles passent toutes par une seule dépendance.
 
 Le détail séquencé, avec les décisions à prendre et les dépendances, est dans
 **`docs/PLAN-DEV.md`** — ce document-ci reste le constat, l'autre est le

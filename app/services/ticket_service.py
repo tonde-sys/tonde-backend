@@ -1706,7 +1706,6 @@ class TicketService:
         (lissage) : un seul service très long ne fausse pas tout l'ETA. Borné entre
         ETA_MIN_SERVICE_SECONDS et ETA_MAX_SERVICE_SECONDS.
         """
-        default_seconds = max(1, default_minutes) * 60
         samples: list[int] = []
         if service_id:
             result = await self.db.execute(
@@ -1715,15 +1714,85 @@ class TicketService:
                     Ticket.service_id == service_id,
                     Ticket.status == TicketStatus.DONE,
                     Ticket.service_seconds.isnot(None),
+                    # Un ticket DONE sans done_at ne peut pas être ordonné : il est
+                    # exclu, sinon PostgreSQL le place EN TÊTE du tri descendant
+                    # (NULLS FIRST par défaut) et la fenêtre glissante est fausse.
+                    Ticket.done_at.isnot(None),
                 )
                 .order_by(Ticket.done_at.desc())
                 .limit(ETA_SAMPLE_SIZE)
             )
             samples = [s for (s,) in result.all()]
 
+        return self._blend_service_seconds(samples, default_minutes)
+
+    @staticmethod
+    def _blend_service_seconds(samples: list[int], default_minutes: int) -> int:
+        """
+        Mélange les durées observées avec la durée configurée (lissage).
+
+        Avec n < ETA_SAMPLE_SIZE échantillons, la durée configurée complète la
+        moyenne : un seul service très long ne fausse pas tout l'ETA. Borné entre
+        ETA_MIN_SERVICE_SECONDS et ETA_MAX_SERVICE_SECONDS.
+        """
+        default_seconds = max(1, default_minutes) * 60
         padding = max(0, ETA_SAMPLE_SIZE - len(samples))
         average = (sum(samples) + default_seconds * padding) / ETA_SAMPLE_SIZE
         return int(min(ETA_MAX_SERVICE_SECONDS, max(ETA_MIN_SERVICE_SECONDS, average)))
+
+    async def avg_service_seconds_batch(self, services: list[Service]) -> dict[str, int]:
+        """
+        Variante GROUPÉE de `_avg_service_seconds` : une requête pour N services.
+
+        `_avg_service_seconds` interroge la base une fois par service. Sur l'écran
+        de salle — appelé toutes les 7 s par chaque poste de l'agence — cela fait
+        N requêtes par appel et par poste. La fenêtre glissante est reconstruite
+        avec `row_number()` (SQLite ≥ 3.25 et PostgreSQL savent le faire), ce qui
+        ramène le coût à une seule requête quel que soit le nombre de services.
+
+        Args:
+            services: Services à évaluer (chacun fournit sa durée par défaut)
+
+        Returns:
+            dict service_id → durée moyenne en secondes
+        """
+        if not services:
+            return {}
+
+        ids = [s.id for s in services]
+        ranked = (
+            select(
+                Ticket.service_id.label("service_id"),
+                Ticket.service_seconds.label("service_seconds"),
+                func.row_number().over(
+                    partition_by=Ticket.service_id,
+                    order_by=Ticket.done_at.desc(),
+                ).label("rn"),
+            )
+            .where(
+                Ticket.service_id.in_(ids),
+                Ticket.status == TicketStatus.DONE,
+                Ticket.service_seconds.isnot(None),
+                Ticket.done_at.isnot(None),
+            )
+            .subquery()
+        )
+
+        rows = (await self.db.execute(
+            select(ranked.c.service_id, ranked.c.service_seconds)
+            .where(ranked.c.rn <= ETA_SAMPLE_SIZE)
+        )).all()
+
+        samples: dict[str, list[int]] = {service_id: [] for service_id in ids}
+        for service_id, seconds in rows:
+            samples[service_id].append(seconds)
+
+        return {
+            service.id: self._blend_service_seconds(
+                samples[service.id], service.avg_duration_minutes
+            )
+            for service in services
+        }
 
     # ══ Machine à états ════════════════════════════════════════════════════════
 
@@ -2050,6 +2119,44 @@ class TicketService:
             .limit(1)
         )
         return result.scalar_one_or_none()
+
+    async def current_called_numbers(self, service_ids: list[str]) -> dict[str, str | None]:
+        """
+        Variante GROUPÉE de `_current_called_number` : une requête pour N services.
+
+        Le dernier numéro appelé est celui de la ligne de rang 1 dans chaque
+        service, triée par `called_at` décroissant — donc une fenêtre
+        `row_number()` plutôt qu'un `LIMIT 1` par service.
+
+        Args:
+            service_ids: Services à interroger
+
+        Returns:
+            dict service_id → numéro appelé (None si le service n'a rien appelé)
+        """
+        if not service_ids:
+            return {}
+
+        ranked = (
+            select(
+                Ticket.service_id.label("service_id"),
+                Ticket.number.label("number"),
+                func.row_number().over(
+                    partition_by=Ticket.service_id,
+                    order_by=Ticket.called_at.desc(),
+                ).label("rn"),
+            )
+            .where(Ticket.service_id.in_(service_ids), Ticket.called_at.isnot(None))
+            .subquery()
+        )
+
+        rows = (await self.db.execute(
+            select(ranked.c.service_id, ranked.c.number).where(ranked.c.rn == 1)
+        )).all()
+
+        numbers: dict[str, str | None] = {service_id: None for service_id in service_ids}
+        numbers.update({service_id: number for service_id, number in rows})
+        return numbers
 
     async def _get_service_row(self, service_id: str) -> Service | None:
         """Récupère un service par ID (sans contrôle de tenant : usage interne uniquement)."""

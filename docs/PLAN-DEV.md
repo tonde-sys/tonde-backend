@@ -211,16 +211,20 @@ du pilote.
 
 ---
 
-## Phase 5 — Dette assumée
+## Phase 5 — Dette assumée — ✅ LIVRÉE
 
 | # | Action | Taille |
 |---|---|---|
-| 14 | `get_branch_display` : N+1 → 2 requêtes + cache 2 s | M |
+| 14 | `get_branch_display` : N+1 → nombre constant de requêtes | M |
 | 13 | Unicité du préfixe de service à la réactivation | S |
+| — | 401 vs 403 : jeton absent → `401`, 403 réservé au rôle | S |
 
-Le n° 14 devient urgent dès 12 postes desktop qui interrogent l'écran de salle
-toutes les 7 secondes : ~30 requêtes par appel, par poste. À mesurer avant
-d'optimiser — l'audit ne l'a pas fait.
+Le n° 14 devenait urgent dès 12 postes desktop interrogeant l'écran de salle
+toutes les 7 secondes : ~30 requêtes par appel, par poste. Mesuré puis corrigé —
+**6 requêtes constantes**, contre 3 + 2N + M auparavant. Le cache Redis de 2 s
+envisagé dans l'audit n'a pas été retenu : un écran rafraîchi toutes les 7 s n'y
+gagne rien, et un cache par instance coûte en invalidation. Il sera rouvert le
+jour où une agence dépassera la centaine de postes, pas avant.
 
 ---
 
@@ -262,12 +266,13 @@ d'optimiser — l'audit ne l'a pas fait.
 ## Séquence recommandée, en une ligne
 
 **~~CI Redis → P0-7/5/12 → P1-4~~ (fait) → ~~P1-11/15/16/18 → P1-8~~ (fait) →
-~~P3-10/9/17 → mot de passe oublié + rapport quotidien~~ (fait) → back-office →
-desktop signé → facturation.**
+~~P3-10/9/17 → mot de passe oublié + rapport quotidien~~ (fait) →
+~~P2-13/14 + 401/403~~ (fait) → back-office → desktop signé → facturation.**
 
 Tout ce qui relève de ce dépôt est livré : P0, fiabilité du moteur, supervision,
-sécurité/conformité et les deux fonctions produit qui manquaient. Ce qui reste
-— back-office, distribution desktop, facturation — ne se code pas ici.
+sécurité/conformité, les deux fonctions produit qui manquaient, et la dette
+technique. Ce qui reste — back-office, distribution desktop, facturation — ne se
+code pas ici.
 
 ## Journal d'avancement
 
@@ -280,6 +285,7 @@ sécurité/conformité et les deux fonctions produit qui manquaient. Ce qui rest
 | Phase 2 | P1-8 — `GET /tickets/queue` | `790a01a` |
 | Phase 3 | P3-10, P3-9, P3-17 + migration `009_audit_org_nullable` + `GET /audit/logs` | `9f2ae62` |
 | Phase 4 | Mot de passe oublié (SMTP, jeton usage unique) + `daily-report` | `9f2ae62` |
+| Phase 5 | P2-13 + migration `010`, P2-14, 401/403 | `PENDING` |
 
 ### Ce que les phases 3 et 4 ont appris
 
@@ -297,3 +303,23 @@ commentaire n'est pas une garantie — seul un test l'est.
 
 Suite locale : **429 passés, 132 ignorés, 0 échec**. CI : **run #33 verte**
 (2 min 38 s, PostgreSQL 15 + Redis 7 réels), soit 72 tests de plus qu'en phase 2.
+
+### Ce que la phase 5 a appris
+
+- **Une tolérance de test ne vérifie rien.** Deux tests existants acceptaient
+  `status_code in (401, 403)` pour une requête sans jeton. Ils sont passés au
+  vert pendant que le comportement était faux, et n'auraient pas bougé si on
+  l'avait cassé davantage. Resserrés à `401` avec le code d'erreur attendu.
+- **« Ça touche toutes les routes » est une intuition, pas un fait.** Le
+  correctif 401/403 redouté comme un lot transverse a tenu en une dépendance :
+  toutes les routes protégées passent par `get_current_user`.
+- **Un test de performance doit être un test d'invariance.** Compter les requêtes
+  pour 2 services puis pour 8 et exiger l'égalité échoue dès qu'un N+1 revient ;
+  « moins de 10 requêtes » n'aurait rien empêché.
+- **Le repli d'une panne ne doit pas être plus coûteux que la panne.** Le `except`
+  Redis de l'écran de salle faisait une requête par service : la panne Redis
+  devenait une surcharge PostgreSQL. Regroupé.
+- **Un index partiel, pas un index unique global.** Rendre le préfixe unique sur
+  toute la table aurait interdit de réutiliser la lettre d'un service désactivé —
+  le cas normal d'un guichet qui change de prestation. La contrainte devait
+  épouser la règle métier, pas la simplifier.

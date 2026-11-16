@@ -9,6 +9,7 @@ Règle absolue : AUCUNE donnée personnelle. Ni nom, ni téléphone, ni identifi
 d'utilisateur ; uniquement des numéros de ticket, des guichets et des durées.
 """
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
@@ -96,6 +97,14 @@ class PublicQueueService:
         service actif : nombre de personnes en attente, attente estimée pour un
         nouvel arrivant et dernier numéro appelé.
 
+        Coût : un nombre CONSTANT de requêtes, quel que soit le nombre de guichets
+        et de services. Cet endpoint est public et interrogé toutes les 7 s par
+        chaque poste de l'agence : la version précédente faisait une requête par
+        guichet et trois par service (≈ 30 requêtes pour 12 guichets et 6 services,
+        soit ~85 requêtes/s pour une seule agence). Les numéros en cours, les
+        derniers appelés et les durées moyennes sont désormais lus en une requête
+        groupée chacun.
+
         Args:
             branch_id: Identifiant de la branch (visible dans le QR code de l'agence)
 
@@ -116,35 +125,43 @@ class PublicQueueService:
             select(Counter).where(Counter.agency_id == branch_id, Counter.is_active == True)  # noqa: E712
             .order_by(Counter.name)
         )).scalars().all()
-        counter_rows = []
-        for counter in counters:
-            number = None
-            if counter.current_ticket_id:
-                number = (await self.db.execute(
-                    select(Ticket.number).where(Ticket.id == counter.current_ticket_id)
-                )).scalar_one_or_none()
-            counter_rows.append({
+
+        # Une seule requête pour tous les numéros en cours, au lieu d'une par guichet.
+        serving_numbers = await self._counter_numbers(counters)
+        counter_rows = [
+            {
                 "id": counter.id,
                 "name": counter.name,
                 "is_open": counter.is_open,
-                "now_serving": number,
-            })
+                "now_serving": serving_numbers.get(counter.current_ticket_id or ""),
+            }
+            for counter in counters
+        ]
 
         services = (await self.db.execute(
             select(Service).where(Service.branch_id == branch_id, Service.is_active == True)  # noqa: E712
             .order_by(Service.ticket_prefix)
         )).scalars().all()
-        service_rows = []
-        for service in services:
-            waiting = await self._waiting_count(branch, service)
-            service_rows.append({
+
+        service_ids = [service.id for service in services]
+        waiting_counts = await self._waiting_counts(branch, services)
+        avg_seconds = await ticket_service.avg_service_seconds_batch(list(services))
+        last_called = await ticket_service.current_called_numbers(service_ids)
+
+        service_rows = [
+            {
                 "id": service.id,
                 "name": service.name,
                 "ticket_prefix": service.ticket_prefix,
-                "waiting": waiting,
-                "estimated_wait_minutes": await ticket_service.estimate_wait_minutes(service, waiting + 1),
-                "last_called_number": await ticket_service._current_called_number(service.id),
-            })
+                "waiting": waiting_counts.get(service.id, 0),
+                "estimated_wait_minutes": self._eta_minutes(
+                    waiting_counts.get(service.id, 0) + 1,
+                    avg_seconds.get(service.id, 0),
+                ),
+                "last_called_number": last_called.get(service.id),
+            }
+            for service in services
+        ]
 
         return {
             "branch": {"id": branch.id, "name": branch.name, "is_open": is_branch_open_now(branch)},
@@ -153,21 +170,61 @@ class PublicQueueService:
             "generated_at": datetime.now(timezone.utc),
         }
 
-    async def _waiting_count(self, branch: Branch, service: Service) -> int:
+    async def _counter_numbers(self, counters: list[Counter]) -> dict[str, str]:
         """
-        Personnes en attente dans un service : Redis (rapide), PostgreSQL en secours.
+        Numéros en cours de traitement, pour tous les guichets en une requête.
 
-        Si Redis est indisponible, l'écran de salle continue de fonctionner.
+        `Counter.current_ticket_id` peut pointer sur un ticket supprimé ou déjà
+        terminé : on ne renvoie que les tickets réellement présents en base.
         """
+        ticket_ids = [c.current_ticket_id for c in counters if c.current_ticket_id]
+        if not ticket_ids:
+            return {}
+        rows = (await self.db.execute(
+            select(Ticket.id, Ticket.number).where(Ticket.id.in_(ticket_ids))
+        )).all()
+        return {ticket_id: number for ticket_id, number in rows}
+
+    async def _waiting_counts(self, branch: Branch, services: list[Service]) -> dict[str, int]:
+        """
+        Personnes en attente par service : Redis (rapide), PostgreSQL en secours.
+
+        Si Redis est indisponible, l'écran de salle continue de fonctionner — et le
+        repli est UNE requête groupée, pas une par service : une panne Redis ne doit
+        pas se transformer en N+1 sur PostgreSQL.
+        """
+        if not services:
+            return {}
         try:
-            return await get_queue_size(branch.org_id, branch.id, service.id)
+            return {
+                service.id: await get_queue_size(branch.org_id, branch.id, service.id)
+                for service in services
+            }
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Redis indisponible pour l'écran de salle ({exc}) : repli sur la base")
-            return (await self.db.execute(
-                select(func.count(Ticket.id)).where(
-                    Ticket.service_id == service.id, Ticket.status == TicketStatus.WAITING
+            rows = (await self.db.execute(
+                select(Ticket.service_id, func.count(Ticket.id))
+                .where(
+                    Ticket.service_id.in_([service.id for service in services]),
+                    Ticket.status == TicketStatus.WAITING,
                 )
-            )).scalar() or 0
+                .group_by(Ticket.service_id)
+            )).all()
+            counts = {service_id: count for service_id, count in rows}
+            return {service.id: counts.get(service.id, 0) for service in services}
+
+    @staticmethod
+    def _eta_minutes(position: int, avg_seconds: int) -> int:
+        """
+        Attente estimée pour une position (1 = prochain), en minutes.
+
+        Même formule que `TicketService.estimate_wait_minutes`, appliquée à une
+        durée moyenne déjà calculée en lot : on évite ainsi une requête par service
+        juste pour relire la durée moyenne.
+        """
+        if position <= 1 or avg_seconds <= 0:
+            return 0
+        return math.ceil((position - 1) * avg_seconds / 60)
 
     @staticmethod
     def _is_staff_of(viewer: User | None, org_id: str) -> bool:

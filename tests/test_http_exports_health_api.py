@@ -408,7 +408,7 @@ async def test_detailed_health_is_admin_only_and_complete(api, db_session):
     admin_org = await make_staff(db_session, org.id, UserRole.ADMIN_ORG)
     await api.post("/api/v1/tickets", json={"agency_id": branch.id, "service_id": service.id}, headers=auth(client))
 
-    assert (await api.get("/health/detailed")).status_code in (401, 403)
+    assert (await api.get("/health/detailed")).status_code == 401, "jeton absent → 401, pas 403"
     assert (await api.get("/health/detailed", headers=auth(client))).status_code == 403
     assert (await api.get("/health/detailed", headers=auth(agent))).status_code == 403
 

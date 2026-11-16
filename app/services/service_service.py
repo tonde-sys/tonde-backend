@@ -42,21 +42,7 @@ class ServiceService:
 
         # Vérifier l'unicité du préfixe dans la branch (déjà normalisé en majuscules)
         prefix = data.ticket_prefix
-        existing = await self.db.execute(
-            select(Service).where(
-                Service.branch_id == branch_id,
-                Service.ticket_prefix == prefix,
-                Service.is_active == True,  # noqa: E712
-            )
-        )
-        if existing.scalar_one_or_none():
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "PREFIX_TAKEN",
-                    "message": f"Le préfixe '{prefix}' est déjà utilisé par un service actif dans cette branch",
-                },
-            )
+        await self._ensure_prefix_available(branch_id, prefix)
 
         service = Service(
             id=str(uuid.uuid4()),
@@ -152,6 +138,7 @@ class ServiceService:
 
         Raises:
             HTTPException 404: Service introuvable
+            HTTPException 409: Réactivation avec un préfixe déjà porté par un autre service actif
         """
         result = await self.db.execute(
             select(Service).where(
@@ -167,7 +154,19 @@ class ServiceService:
                 detail={"code": "SERVICE_NOT_FOUND", "message": "Service introuvable"},
             )
 
-        for field, value in data.model_dump(exclude_unset=True).items():
+        changes = data.model_dump(exclude_unset=True)
+
+        # P2-13 : le préfixe n'est pas modifiable (extra="forbid"), mais `is_active`
+        # l'est. Réactiver un service dont le préfixe a été repris entre-temps par un
+        # autre service actif recréerait deux files produisant les mêmes numéros
+        # (C-001 dans deux files le même jour). On refuse donc la réactivation, avec
+        # un message qui dit quoi faire, plutôt que de laisser l'ambiguïté s'installer.
+        if changes.get("is_active") is True:
+            await self._ensure_prefix_available(
+                branch_id, service.ticket_prefix, exclude_service_id=service.id
+            )
+
+        for field, value in changes.items():
             setattr(service, field, value)
 
         await self.db.commit()
@@ -204,6 +203,54 @@ class ServiceService:
         await self.db.commit()
 
     # ── Helpers privés ────────────────────────────────────────────────────────
+    async def _ensure_prefix_available(
+        self,
+        branch_id: str,
+        prefix: str,
+        *,
+        exclude_service_id: str | None = None,
+    ) -> None:
+        """
+        Vérifie qu'aucun AUTRE service actif de la branch ne porte déjà ce préfixe.
+
+        La règle est « au plus un service actif par préfixe et par branch », pas
+        « un préfixe par branch » : un service désactivé libère son préfixe, qui
+        peut être réutilisé par un nouveau service. C'est la réactivation tardive
+        qui est dangereuse, et c'est le seul chemin qui reste après que
+        `UpdateServiceRequest` a rendu le préfixe immuable.
+
+        Args:
+            branch_id: Branch concernée
+            prefix: Préfixe normalisé en majuscules
+            exclude_service_id: Service à ignorer (lui-même, en mise à jour)
+
+        Raises:
+            HTTPException 409: Un autre service actif porte déjà ce préfixe
+        """
+        query = select(Service).where(
+            Service.branch_id == branch_id,
+            Service.ticket_prefix == prefix,
+            Service.is_active == True,  # noqa: E712
+        )
+        if exclude_service_id:
+            query = query.where(Service.id != exclude_service_id)
+
+        conflict = (await self.db.execute(query)).scalars().first()
+        if conflict is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "PREFIX_TAKEN",
+                    "message": (
+                        f"Le préfixe '{prefix}' est déjà utilisé par le service actif "
+                        f"'{conflict.name}' dans cette branch. Deux services actifs avec "
+                        "le même préfixe produiraient les mêmes numéros de ticket."
+                    ),
+                    "conflicting_service_id": conflict.id,
+                    "conflicting_service_name": conflict.name,
+                },
+            )
+
     async def _verify_branch(self, branch_id: str, org_id: str) -> None:
         """Vérifie que la branch existe et appartient à l'org."""
         result = await self.db.execute(
