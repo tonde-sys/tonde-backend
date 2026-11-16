@@ -285,7 +285,7 @@ code pas ici.
 | Phase 2 | P1-8 — `GET /tickets/queue` | `790a01a` |
 | Phase 3 | P3-10, P3-9, P3-17 + migration `009_audit_org_nullable` + `GET /audit/logs` | `9f2ae62` |
 | Phase 4 | Mot de passe oublié (SMTP, jeton usage unique) + `daily-report` | `9f2ae62` |
-| Phase 5 | P2-13 + migration `010`, P2-14, 401/403 | `PENDING` |
+| Phase 5 | P2-13 + migration `010`, P2-14, 401/403 | `53f9ff5` |
 
 ### Ce que les phases 3 et 4 ont appris
 
