@@ -51,7 +51,10 @@ async def liveness():
     return {"status": "alive"}
 
 
-@router.get("/health/status", summary="État riche de l'API (base + Redis)")
+@router.api_route(
+    "/health/status", methods=["GET", "HEAD"],
+    summary="État riche de l'API (base + Redis)",
+)
 async def health_status(request: Request):
     """
     État complet pour les tableaux de bord et l'exploitation.
@@ -77,13 +80,17 @@ async def health_status(request: Request):
     )
 
 
-@router.get("/health/ready", summary="Readiness probe")
+@router.api_route("/health/ready", methods=["GET", "HEAD"], summary="Readiness probe")
 async def readiness(request: Request):
     """
     Prêt à recevoir du trafic ? 503 tant que la base ou Redis ne répond pas,
     ou si la boucle de fond est arrêtée/bloquée (constat P2-18 : sans ce
     contrôle, un scheduler mort laissait les tickets `CALLED` sans passage
     automatique en `ABSENT`, sans alerte).
+
+    `HEAD` est accepté pour la même raison que `/health` : les moniteurs
+    externes (UptimeRobot) sondent en `HEAD`, et une route déclarée `GET` seule
+    leur répond 405 — le moniteur passe DOWN alors que le service va bien.
     """
     ready, checks = await health_service.readiness(
         scheduler=getattr(request.app.state, "scheduler", None)

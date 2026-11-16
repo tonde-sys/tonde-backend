@@ -417,3 +417,31 @@ async def test_history_garde_le_total_de_pagination(db_session, mock_queue):
     assert history.total == 3
     assert len(history.items) == 3
     assert history.has_next is False
+
+
+# ══ Sondes de santé : les moniteurs externes sondent en HEAD ═════════════════
+
+def test_les_sondes_de_sante_acceptent_head():
+    """
+    UptimeRobot et la plupart des moniteurs sondent d'abord en `HEAD`. FastAPI
+    n'ajoute pas `HEAD` aux routes `GET` : une sonde déclarée `@router.get`
+    répond 405 et le moniteur bascule DOWN alors que le service va bien.
+
+    L'invariant est vérifié sur la table de routage, sans requête HTTP — donc il
+    tient aussi dans les environnements sans Redis. Il couvre désormais
+    `/health/ready` et `/health/status`, qui sont les deux sondes qu'on veut
+    réellement surveiller (une panne de base ou un scheduler mort s'y voient,
+    alors que `/health` ne teste rien par construction).
+    """
+    from app.main import app
+
+    attendues = {"/health", "/health/live", "/health/ready", "/health/status"}
+    methodes = {}
+    for route in app.routes:
+        chemin = getattr(route, "path", None)
+        if chemin in attendues:
+            methodes.setdefault(chemin, set()).update(getattr(route, "methods", set()) or set())
+
+    for chemin in attendues:
+        assert "HEAD" in methodes.get(chemin, set()), f"{chemin} refuse HEAD : {methodes.get(chemin)}"
+        assert "GET" in methodes[chemin], chemin

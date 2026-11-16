@@ -75,6 +75,29 @@ def check_push_gateway() -> dict:
     return {"status": "configured" if configured else "not_configured", "latency_ms": None}
 
 
+def check_email_gateway() -> dict:
+    """
+    État de configuration du SMTP sortant (aucun appel réseau).
+
+    Utile parce que l'absence de SMTP est INVISIBLE côté utilisateur : « mot de
+    passe oublié » répond 200 avec un message neutre dans tous les cas, pour ne
+    pas révéler l'existence d'un compte. Sans ce contrôle, une production sans
+    SMTP ne se distingue d'une production correcte qu'en regardant les logs
+    d'erreur — ou en recevant l'appel de l'agent qui n'a jamais reçu son lien.
+    """
+    from app.services.email_gateway import is_configured
+
+    if settings.is_development:
+        return {"status": "simulated", "latency_ms": None}
+    configured = is_configured()
+    return {
+        "status": "configured" if configured else "not_configured",
+        "latency_ms": None,
+        "host": settings.SMTP_HOST or None,
+        "port": settings.SMTP_PORT if configured else None,
+    }
+
+
 def check_scheduler(scheduler=None, now_ts: float | None = None) -> dict:
     """
     La boucle de fond tourne-t-elle encore ? (constat P2-18 de l'audit)
@@ -188,6 +211,7 @@ async def detailed_report(scheduler=None, session_factory: SessionFactory = Asyn
     ready, checks = await readiness(session_factory, scheduler)
     checks["sms_gateway"] = check_sms_gateway()
     checks["push_gateway"] = check_push_gateway()
+    checks["email_gateway"] = check_email_gateway()
 
     queue_size = None
     if checks["redis"]["status"] == "healthy":

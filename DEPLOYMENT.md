@@ -107,8 +107,11 @@ Deux fonctions en dépendent : la réinitialisation de mot de passe par email
    `forgot-password` répond **200 avec la réponse neutre** — mais aucun email
    ne part. C'est volontaire : la réponse ne doit pas révéler l'existence d'un
    compte, donc elle ne peut pas non plus signaler une panne SMTP. La panne est
-   visible dans les logs (`Email de réinitialisation non envoyé pour …`) et par
-   `daily-report --send`, qui échoue avec un code de sortie non nul.
+   visible dans les logs (`Email de réinitialisation non envoyé pour …`), par
+   `daily-report --send` (code de sortie non nul) et dans
+   `GET /health/detailed` → `email_gateway.status` (`configured` /
+   `not_configured` / `simulated`). **C'est le seul contrôle qui répond à
+   « le SMTP est-il branché ? » sans attendre qu'un agent se plaigne.**
 3. Le rapport quotidien se lance depuis un **cron externe** (Render Cron Job sur
    plan payant, ou n'importe quel planificateur qui sait lancer une commande
    dans le conteneur) :
@@ -120,9 +123,16 @@ Deux fonctions en dépendent : la réinitialisation de mot de passe par email
    ```
 
    Sans `--send`, la commande affiche le rapport sans rien envoyer. Le
-   destinataire par défaut est `branches.email` ; `--to` le remplace. La journée
-   est calculée en **heure locale** (`REPORT_LOCAL_UTC_OFFSET_HOURS`, défaut 2
-   pour le Burundi), pas en UTC.
+   destinataire par défaut est `branches.email` ; `--to` le remplace. **Une
+   agence sans `email` renseigné produit `no_recipient` et aucun envoi** — à
+   vérifier avant de brancher le cron :
+
+   ```sql
+   SELECT id, name, email FROM branches WHERE email IS NULL OR email = '';
+   ```
+
+   La journée est calculée en **heure locale** (`REPORT_LOCAL_UTC_OFFSET_HOURS`,
+   défaut 2 pour le Burundi), pas en UTC.
 4. Le plan gratuit Render n'offre pas de cron : sur ce plan, le rapport se lance
    à la main. C'est une raison de plus de passer au plan payant pour le pilote
    de longue durée (voir §2).
@@ -398,9 +408,19 @@ Un seul moniteur UptimeRobot suffit :
 > **UptimeRobot sonde en `HEAD`, pas en `GET`.** FastAPI n'ajoute pas `HEAD`
 > automatiquement aux routes `GET` : une route déclarée avec `@router.get`
 > répond 405 à un `HEAD`, et le moniteur passe DOWN alors que le service va
-> très bien. C'est pourquoi `/health` et `/health/live` sont déclarés avec
-> `@router.api_route(..., methods=["GET", "HEAD"])`. Ne pas revenir à
-> `@router.get` sans revérifier : `curl -I https://…/health` doit renvoyer 200.
+> très bien. C'est pourquoi `/health`, `/health/live`, `/health/ready` et
+> `/health/status` sont déclarés avec `@router.api_route(..., methods=["GET",
+> "HEAD"])`. Ne pas revenir à `@router.get` sans revérifier :
+> `curl -I https://…/health/ready` doit renvoyer 200 (ou 503 si l'API est
+> réellement dégradée, jamais 405).
+
+**Deuxième moniteur, le seul qui détecte une vraie panne.** `/health` ne teste
+rien par construction : il garde le service éveillé, mais répond 200 même si
+PostgreSQL et Redis sont morts. Ajouter un second moniteur sur
+`https://…/health/ready` (même intervalle, 60 s) : il renvoie **503** dès que la
+base, Redis ou le scheduler est en panne, et son corps indique lequel des trois.
+Sans ce second moniteur, le pilote peut être en panne fonctionnelle avec toutes
+les voyelles au vert.
 
 Pourquoi `/health` et pas `/health/ready` : `/health` répond depuis le processus
 FastAPI sans ouvrir de connexion PostgreSQL ou Redis. Un ping toutes les 5 minutes
