@@ -442,6 +442,49 @@ impossible. Un test (`test_reprise_refusee_si_un_autre_ticket_est_actif`) ne
 testait plus qu'une branche devenue inatteignable : il vérifie maintenant que
 c'est la BASE qui refuse, là où le refus se produit réellement.
 
+### Preuve locale sur un vrai PostgreSQL 18
+
+Jusqu'ici les trois lots n'étaient prouvés que par la CI et par la restitution
+SQL hors ligne — le PostgreSQL local refusait les connexions. Un cluster
+jetable (`initdb` dans un répertoire temporaire, port 55432, authentification
+`trust`, supprimé après usage) a permis de rejouer la chaîne complète depuis une
+base vide : **`alembic upgrade head` applique les 21 migrations jusqu'à
+`014_event_outbox`**, sans erreur.
+
+Le schéma réellement produit confirme le piège documenté :
+
+```
+CREATE UNIQUE INDEX uq_tickets_active_per_user ON public.tickets
+  USING btree (user_id)
+  WHERE (status = ANY (ARRAY['WAITING'::ticketstatus, 'CALLED'::ticketstatus,
+    'SERVING'::ticketstatus, 'ABSENT'::ticketstatus,
+    'TRANSFERRED'::ticketstatus, 'INCOMPLETE'::ticketstatus]))
+```
+
+`ticketstatus = WAITING, CALLED, SERVING, DONE, ABSENT, TRANSFERRED, CANCELLED,
+INCOMPLETE` — les libellés sont bien les noms de membres en majuscules. Un
+prédicat écrit en minuscules aurait compilé et n'aurait filtré aucun ticket.
+
+Cinq assertions fonctionnelles ont ensuite été jouées sur cette base :
+
+| # | Assertion | Résultat |
+|---|---|---|
+| 1 | un ticket `WAITING` s'insère | accepté |
+| 2 | un 2e ticket actif pour le même client | **refusé par la base** (`unique_violation`) |
+| 3 | le premier passe en `DONE` | accepté |
+| 4 | un nouveau ticket actif ensuite | accepté — l'index est bien partiel |
+| 5 | un ticket `CANCELLED` ne bloque pas le client | accepté |
+| 6 | `nextval` de `ticket_queue_sequence_seq` | 1 puis 2 |
+
+**Défaut latent trouvé au passage.** `queue_sequence` a pour défaut serveur `0`,
+et la séquence n'est consommée que par `TicketService`. Les trois lignes
+insérées par le test sont arrivées avec `queue_sequence = 0` alors que la
+séquence valait déjà 2 : tout ticket créé hors du service (script de
+maintenance, jeu de données, futur point d'entrée) passe donc **devant** les
+clients déjà en file. Le correctif tient en une migration `015` donnant à la
+colonne le défaut `nextval('ticket_queue_sequence_seq')` ; le modèle garderait
+`0` pour rester portable sur SQLite, où la séquence n'existe pas.
+
 ---
 
 ## Ce que ce plan ne couvre pas
