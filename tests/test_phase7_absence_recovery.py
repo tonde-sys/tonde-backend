@@ -573,3 +573,36 @@ def test_la_migration_011_ferme_la_chaine():
     revision = script.get_revision("011_ticket_absence_recovery")
     assert revision is not None
     assert revision.down_revision == "010_unique_active_service_prefix"
+
+
+def test_le_sql_des_migrations_utilise_les_libelles_d_enum_en_majuscules():
+    """
+    Les libellés des types enum PostgreSQL sont les NOMS des membres du modèle,
+    en MAJUSCULES (migration 007 les a alignés ainsi). Écrire `status = 'absent'`
+    dans une migration échoue avec « invalid input value for enum ticketstatus ».
+
+    Ce défaut est INVISIBLE en local : SQLite construit son schéma depuis les
+    modèles et n'exécute jamais les migrations. Il n'a été vu qu'en CI. Ce test
+    rend le SQL hors ligne (aucune connexion) pour que la prochaine fois, il
+    tombe en local.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    from alembic import command
+    from alembic.config import Config
+
+    # On ne rend QUE la plage 010 → 011 : la migration 008 appelle `sa.inspect()`,
+    # qui n'a pas de sens en mode hors ligne. Rendre la chaîne entière échouerait
+    # pour une raison sans rapport avec ce qu'on vérifie ici.
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        command.upgrade(
+            Config("alembic.ini"),
+            "010_unique_active_service_prefix:011_ticket_absence_recovery",
+            sql=True,
+        )
+    sql = buffer.getvalue()
+
+    assert "status = 'ABSENT'" in sql, "le backfill doit viser le libellé réel"
+    assert "status = 'absent'" not in sql, "libellé minuscule : échec garanti sur PostgreSQL"

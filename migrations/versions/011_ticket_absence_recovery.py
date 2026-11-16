@@ -89,12 +89,19 @@ def upgrade() -> None:
     # les modèles et n'exécute pas les migrations). Cette garde évite qu'un
     # `alembic upgrade head` accidentel sur SQLite casse sur la syntaxe
     # `INTERVAL`, alors que les colonnes, elles, ont bien été ajoutées.
+    #
+    # ATTENTION AUX LIBELLÉS D'ENUM : `status` est un type PostgreSQL natif dont
+    # les libellés sont les NOMS des membres du modèle, en MAJUSCULES (migration
+    # 007 les a alignés ainsi). Écrire `status = 'absent'` échoue avec
+    # « invalid input value for enum ticketstatus: "absent" » — ce qui a été
+    # détecté par la CI, pas par les tests locaux, puisque SQLite construit son
+    # schéma depuis les modèles sans passer par cette migration.
     if op.get_bind().dialect.name == "postgresql":
         op.execute(
             """
             UPDATE tickets
             SET recovery_expires_at = called_at + INTERVAL '30 minutes'
-            WHERE status = 'absent'
+            WHERE status = 'ABSENT'
               AND recovery_expires_at IS NULL
               AND called_at IS NOT NULL
             """
