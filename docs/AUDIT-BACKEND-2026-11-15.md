@@ -854,6 +854,25 @@ déjà : faire échouer la migration rendrait indéployable la base qu'on cherch
 réparer. Le message de warning donne la requête SQL pour trouver les branches
 concernées.
 
+**Vérification.** Suite locale : **460 passés, 138 ignorés, 0 échec**. CI :
+**run #37 verte** (2 min 18 s). Point important : la CI exécute
+`alembic upgrade head` sur une base PostgreSQL 15 vide, donc la migration `010`
+y est réellement jouée — c'est le seul endroit où le SQL de l'index partiel est
+validé, SQLite construisant son schéma depuis les modèles.
+
+### Deux angles morts d'exploitation, trouvés en écrivant la procédure
+
+- **L'absence de SMTP était invisible.** `forgot-password` répond 200 avec un
+  message neutre que le compte existe ou non — c'est voulu, mais cela rend une
+  production sans SMTP indiscernable d'une production correcte. `/health/detailed`
+  expose maintenant `email_gateway.status`, comme il le faisait déjà pour SMS et
+  push.
+- **`/health/ready` refusait `HEAD`.** FastAPI n'ajoute pas `HEAD` aux routes
+  `GET`, et les moniteurs sondent en `HEAD` : un moniteur sur la readiness aurait
+  reçu 405 et serait passé DOWN alors que le service allait bien. C'est le piège
+  déjà documenté pour `/health` ; il restait ouvert sur les deux sondes qui
+  détectent réellement une panne.
+
 La leçon est la même que pour la CI en phase 1 : ce qui n'est pas vérifié par un
 test n'est pas vérifié du tout, y compris quand le commentaire affirme le
 contraire.

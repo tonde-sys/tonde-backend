@@ -286,6 +286,7 @@ code pas ici.
 | Phase 3 | P3-10, P3-9, P3-17 + migration `009_audit_org_nullable` + `GET /audit/logs` | `9f2ae62` |
 | Phase 4 | Mot de passe oublié (SMTP, jeton usage unique) + `daily-report` | `9f2ae62` |
 | Phase 5 | P2-13 + migration `010`, P2-14, 401/403 | `53f9ff5` |
+| Phase 5 bis | SMTP visible dans `/health/detailed`, sondes en `HEAD` | `a69b37d` |
 
 ### Ce que les phases 3 et 4 ont appris
 
@@ -323,3 +324,10 @@ Suite locale : **429 passés, 132 ignorés, 0 échec**. CI : **run #33 verte**
   toute la table aurait interdit de réutiliser la lettre d'un service désactivé —
   le cas normal d'un guichet qui change de prestation. La contrainte devait
   épouser la règle métier, pas la simplifier.
+- **Une panne invisible est une panne qui dure.** Le SMTP non configuré ne se
+  voyait nulle part, parce que la réponse neutre de « mot de passe oublié » est
+  précisément ce qui empêche de signaler quoi que ce soit. D'où
+  `email_gateway.status` dans `/health/detailed`.
+
+Suite locale : **460 passés, 138 ignorés, 0 échec**. CI : **run #37 verte**
+(2 min 18 s), `alembic upgrade head` inclus sur PostgreSQL 15.
