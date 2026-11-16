@@ -340,7 +340,9 @@ La cause profonde reste traitée : `_fakeredis_local.py` (plugin pytest, activé
 par `-p _fakeredis_local`) branche `aioredis.from_url` sur fakeredis et rejoue
 les 138 tests « vrai Redis » sans Docker. Il ne remplace pas la CI — la
 sémantique de fakeredis n'est pas celle de Redis 7 — mais il ferme le trou dans
-lequel je suis tombé deux fois.
+lequel je suis tombé deux fois. Suite locale : **649 passés, 0 ignoré** ;
+**CI #43 verte**, toutes les étapes comprises (migrations depuis une base vide et
+tests).
 
 Reste de la spécification, dans cet ordre : index unique « un ticket actif
 global » (`012`), `queue_sequence BIGINT` (`013`), Outbox (`014`).
@@ -409,7 +411,7 @@ distribution desktop, facturation — ne se code pas ici.
 | Phase 5 bis | SMTP visible dans `/health/detailed`, sondes en `HEAD` | `a69b37d` |
 | Phase 6 | Canal guichet : autorisation WS multi-organisations, `POST /recall`, événements de file vers les écrans | `f380e39` |
 | Phase 7 (1+2) | Absence/reprise : échéances persistées (migration `011`), grâce, plafond d'absences, priorité conservée | `37b7b03` + `b11ee83` |
-| Phase 7 (tests) | Cinq tests d'absence antidatent la grâce ; pont fakeredis pour rejouer les tests « vrai Redis » en local | à venir |
+| Phase 7 (tests) | Cinq tests d'absence antidatent la grâce ; pont fakeredis pour rejouer les tests « vrai Redis » en local | `6106d8b` (CI #43 verte) |
 
 ### Ce que les phases 3 et 4 ont appris
 
