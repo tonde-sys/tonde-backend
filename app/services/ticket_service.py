@@ -19,6 +19,8 @@ avec soin : c'est le cœur du système.
 import json
 import logging
 import math
+import uuid
+from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
@@ -52,6 +54,12 @@ from app.models.branch import Branch, Service
 from app.models.counter import Counter
 from app.models.employee import Employee, EmployeeStatus
 from app.models.queue_log import QueueLog, QueueLogAction
+from app.models.qape import AbuseEvent, AbusePolicy
+from app.models.qape_operation import OperationState, QapeCreateOperation
+from app.services.qape_data import EventRepository
+from app.services.qape_fencing import lock_for_creation_commit, lock_for_creation_commit_or_recovery
+from app.services.qape_idempotency import payload_hash, CANONICALIZATION_VERSION
+from app.services.qape_engine import QapeDecisionEngine, Decision, DecisionCode
 from app.models.ticket import (
     ALLOWED_TRANSITIONS,
     PRIORITY_SCORES,
@@ -232,6 +240,28 @@ class TicketService:
                                création déjà en cours pour cet utilisateur (double envoi)
             HTTPException 503: File d'attente indisponible (le ticket est annulé proprement)
         """
+        # Existing durable intentions take precedence over policy activation,
+        # service availability and the historical path. A disabled policy must
+        # never turn a prior REVIEW_REQUIRED/DENIED into a new legacy creation.
+        prior_operation = None
+        if data.client_action_id:
+            prior_operation = (await self.db.scalars(select(QapeCreateOperation).where(
+                QapeCreateOperation.user_id == user_id,
+                QapeCreateOperation.operation_type == 'CREATE_TICKET',
+                QapeCreateOperation.client_action_id == data.client_action_id))).first()
+        if prior_operation is not None:
+            return await self._create_qape_ticket(data, user_id, prior_operation.org_id,
+                                                   None, prior_operation=prior_operation)
+
+        # QAPE is opt-in by effective policy. Never fall back to legacy creation
+        # after a QAPE decision or infrastructure failure.
+        branch = await self._get_agency_for_creation(data.agency_id, org_id)
+        ticket_org = org_id or branch.org_id
+        service_row = await self._get_service(data.service_id, data.agency_id, ticket_org)
+        policy = await QapeDecisionEngine(self.db).effective_policy(ticket_org, service_row.id) if ticket_org else None
+        if policy is not None:
+            return await self._create_qape_ticket(data, user_id, ticket_org, policy)
+
         # Verrou court par utilisateur : deux requêtes simultanées (double tap,
         # retry réseau) ne peuvent pas passer toutes deux le contrôle
         # « 1 seul ticket actif » avant que l'une ait créé son ticket.
@@ -270,12 +300,185 @@ class TicketService:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Verrou de création non libéré pour user={user_id}: {exc}")
 
+    async def _replay_qape_committed(self, operation: QapeCreateOperation) -> TicketResponse:
+        """Rehydrate only the immutable QR credential; never recalculate status/ETA."""
+        ticket = await self.db.get(Ticket, operation.ticket_id) if operation.ticket_id else None
+        if ticket is None or ticket.user_id != operation.user_id or not operation.response_snapshot:
+            raise HTTPException(503, detail={'code': 'QAPE_REPLAY_RECOVERY_REQUIRED'})
+        return TicketResponse.model_validate({**operation.response_snapshot, 'qr_token': ticket.qr_token})
+
+    async def _create_qape_ticket(self, data, user_id, org_id, policy,
+                                  prior_operation=None) -> TicketResponse:
+        """Durable intent first, Redis reservation second, one fenced creation commit.
+
+        A replay of a nonterminal operation never starts a second independent
+        attempt. Unknown Lua/commit outcomes are not interpreted as denials.
+        """
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        key = data.client_action_id
+        if not key:
+            raise HTTPException(400, detail={"code": "IDEMPOTENCY_KEY_REQUIRED"})
+        digest = payload_hash(data.agency_id, data.service_id, data.priority)
+        if prior_operation is not None:
+            if (prior_operation.payload_hash != digest or
+                prior_operation.canonicalization_version != CANONICALIZATION_VERSION):
+                raise HTTPException(409, detail={'code': 'IDEMPOTENCY_PAYLOAD_CONFLICT'})
+            if prior_operation.state == OperationState.COMMITTED.value and prior_operation.response_snapshot:
+                return await self._replay_qape_committed(prior_operation)
+            # Retain the exact original decision when a policy was disabled.
+            # No automatic re-evaluation until a compatible active policy exists.
+            policy = await self.db.get(AbusePolicy, prior_operation.policy_id) if prior_operation.policy_id else None
+            if policy is None or not policy.enabled:
+                raise HTTPException(prior_operation.response_status or 409,
+                    detail=prior_operation.response_snapshot or {
+                        'code': prior_operation.decision_code or 'QAPE_POLICY_INACTIVE',
+                        'operation_id': prior_operation.id})
+        # Pre-existing offline keys have no operation/snapshot: compare the
+        # immutable creation attributes and return the legacy ticket, not a new
+        # QAPE reservation. No synthetic audit decision is invented.
+        existing_operation = (await self.db.scalars(select(QapeCreateOperation.id).where(
+            QapeCreateOperation.user_id == user_id,
+            QapeCreateOperation.operation_type == 'CREATE_TICKET',
+            QapeCreateOperation.client_action_id == key))).first()
+        old_ticket = None if existing_operation else await self._find_by_client_action(user_id, key)
+        if old_ticket is not None:
+            requested = old_ticket.requested_priority.value if old_ticket.requested_priority else 'standard'
+            if (old_ticket.agency_id, old_ticket.service_id, requested) != (data.agency_id, data.service_id, data.priority):
+                raise HTTPException(409, detail={"code": "IDEMPOTENCY_PAYLOAD_CONFLICT"})
+            return await self._build_response(old_ticket)
+
+        values = dict(user_id=user_id, operation_type='CREATE_TICKET', client_action_id=key,
+                      payload_hash=digest, canonicalization_version=CANONICALIZATION_VERSION,
+                      org_id=org_id, agency_id=data.agency_id, service_id=data.service_id,
+                      state=OperationState.PENDING.value, policy_version=policy.version,
+                      policy_id=policy.id, attempt_generation=0, lease_generation=0)
+        dialect = self.db.bind.dialect.name
+        insert_op = pg_insert if dialect == 'postgresql' else sqlite_insert
+        await self.db.execute(insert_op(QapeCreateOperation).values(**values).on_conflict_do_nothing(
+            index_elements=['user_id', 'operation_type', 'client_action_id']))
+        await self.db.commit()  # durable intent BEFORE contacting Redis
+        op = (await self.db.scalars(select(QapeCreateOperation).where(
+            QapeCreateOperation.user_id == user_id,
+            QapeCreateOperation.operation_type == 'CREATE_TICKET',
+            QapeCreateOperation.client_action_id == key).with_for_update())).one()
+        if op.payload_hash != digest or op.canonicalization_version != CANONICALIZATION_VERSION:
+            raise HTTPException(409, detail={"code": "IDEMPOTENCY_PAYLOAD_CONFLICT"})
+        if op.state == OperationState.COMMITTED.value and op.response_snapshot:
+            return await self._replay_qape_committed(op)
+        if op.state in (OperationState.PENDING.value, OperationState.DENIED.value) and op.policy_id != policy.id:
+            raise HTTPException(409, detail={'code': 'QAPE_POLICY_CHANGED', 'operation_id': op.id})
+        if (op.state == OperationState.DENIED.value and op.retry_after is not None and
+            as_utc(op.retry_after) <= datetime.now(timezone.utc) and
+            op.decision_code in {'RATE_LIMITED', 'ACTIVE_RESTRICTION',
+                                 'DAILY_QUOTA_REACHED', 'REDIS_UNAVAILABLE'}):
+            # A new attempt of the SAME intent, with a NEW Redis reservation;
+            # the old denial consumed neither bucket nor window.
+            op.attempt_generation += 1
+            op.lease_owner = None
+            op.lease_expires_at = None
+            op.transition(OperationState.PENDING)
+            op.response_status = None
+            op.response_snapshot = None
+            op.retry_after = None
+            await self.db.flush()
+        if op.state != OperationState.PENDING.value or op.lease_owner is not None:
+            raise HTTPException(op.response_status or 409, detail=op.response_snapshot or
+                                {"code": op.decision_code or "QAPE_OPERATION_PENDING", "operation_id": op.id})
+
+        engine = QapeDecisionEngine(self.db)
+        initial = await engine.preflight(policy=policy, org_id=org_id,
+                                         service_id=data.service_id, user_id=user_id)
+        if initial.code != DecisionCode.ALLOW:
+            op.transition(OperationState.REVIEW_REQUIRED if initial.code == DecisionCode.REVIEW_REQUIRED
+                          else OperationState.DENIED)
+            op.decision_code = initial.reason_codes[0]
+            op.retry_after = initial.retry_after
+            op.response_status = 202 if initial.code == DecisionCode.REVIEW_REQUIRED else 429
+            op.response_snapshot = {'code': op.decision_code, 'operation_id': op.id,
+                                    'reason_codes': list(initial.reason_codes)}
+            await engine.record(op, initial)
+            await self.db.commit()
+            raise HTTPException(op.response_status, detail=op.response_snapshot)
+
+        owner = str(uuid.uuid4())
+        op.lease_owner = owner
+        op.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        op.reservation_id = str(uuid.uuid4())
+        op.reservation_deadline = datetime.now(timezone.utc) + timedelta(hours=24)
+        limits = policy.config['limits']
+        op.reservation_capacity = limits['bucket_capacity']
+        reservation_id, generation, epoch, op_id = op.reservation_id, op.attempt_generation, op.lease_generation, op.id
+        await self.db.commit()  # reservation identity durable BEFORE sending Lua
+
+        try:
+            decision = await engine.admit(policy=policy, org_id=org_id,
+                service_id=data.service_id, user_id=user_id,
+                reservation_id=reservation_id, attempt_generation=generation)
+        except Exception as exc:
+            # An EVAL acknowledgement may have been lost: the engine retried
+            # the SAME reservation; unresolved outcomes require recovery.
+            logger.error('QAPE Redis outcome unknown operation=%s', op_id, exc_info=True)
+            op = await lock_for_creation_commit_or_recovery(self.db, op_id, owner, epoch)
+            op.transition(OperationState.RECOVERY_REQUIRED)
+            op.decision_code = 'REDIS_OUTCOME_UNKNOWN'
+            op.response_status = 503
+            op.response_snapshot = {'code': 'RECOVERY_REQUIRED', 'operation_id': op_id}
+            await self.db.commit()
+            raise HTTPException(503, detail=op.response_snapshot) from exc
+        op = await lock_for_creation_commit_or_recovery(self.db, op_id, owner, epoch)
+        if decision.code != DecisionCode.ALLOW:
+            op.transition(OperationState.REVIEW_REQUIRED if decision.code == DecisionCode.REVIEW_REQUIRED
+                          else OperationState.DENIED)
+            op.decision_code = decision.reason_codes[0]
+            op.retry_after = decision.retry_after
+            if op.decision_code == 'REDIS_UNAVAILABLE':
+                # PING failed before any Lua invocation. No reservation exists.
+                op.reservation_id = None
+            op.response_status = (202 if decision.code == DecisionCode.REVIEW_REQUIRED else
+                                  503 if op.decision_code == 'REDIS_UNAVAILABLE' else 429)
+            op.response_snapshot = {'code': (decision.code.value if decision.code == DecisionCode.REVIEW_REQUIRED
+                                             else op.decision_code), 'operation_id': op_id,
+                                    'reason_codes': list(decision.reason_codes)}
+            if decision.retry_after:
+                op.response_snapshot['retry_after_seconds'] = max(0, (
+                    decision.retry_after - datetime.now(timezone.utc)).total_seconds())
+            await engine.record(op, decision)
+            await self.db.commit()
+            raise HTTPException(op.response_status, detail=op.response_snapshot)
+        op.transition(OperationState.RESERVED)
+        if 'REDIS_UNAVAILABLE_BYPASS' in decision.reason_codes:
+            op.reservation_id = None  # no Lua call; durable proof of bypass
+            op.decision_code = 'REDIS_UNAVAILABLE_BYPASS'
+        await self.db.commit()
+        try:
+            return await self._create_ticket(data, user_id, org_id, qape_operation=(op_id, owner, epoch, policy.id))
+        except HTTPException as exc:
+            # Preserve the first business refusal for replay. Compensation is
+            # deferred until the worker fences all writers and verifies the DB.
+            await self.db.rollback()
+            op = await lock_for_creation_commit_or_recovery(self.db, op_id, owner, epoch)
+            op.transition(OperationState.DENIED if op.reservation_id is None
+                          else OperationState.RECOVERY_REQUIRED)
+            detail = exc.detail if isinstance(exc.detail, dict) else {'code': 'BUSINESS_DENIED'}
+            op.decision_code = detail.get('code', 'BUSINESS_DENIED')
+            op.response_status = exc.status_code
+            op.response_snapshot = detail
+            await self.db.commit()
+            raise
+        except Exception:
+            # Unknown commit acknowledgement: no reimbursement on Python error.
+            logger.exception('QAPE creation outcome uncertain operation=%s', op_id)
+            raise
+
     async def _create_ticket(
-        self, data: CreateTicketRequest, user_id: str, org_id: str | None
+        self, data: CreateTicketRequest, user_id: str, org_id: str | None,
+        qape_operation: tuple[str, str, int, str] | None = None,
     ) -> TicketResponse:
         """Logique de création (appelée sous verrou par create_ticket)."""
         # ── Idempotence : même action déjà traitée → on renvoie son résultat ──
-        if data.client_action_id:
+        if data.client_action_id and qape_operation is None:
             replay = await self._find_by_client_action(user_id, data.client_action_id)
             if replay is not None:
                 logger.info(f"Création rejouée (idempotence): {replay.number} | user={user_id}")
@@ -348,14 +551,61 @@ class TicketService:
             client_action_id=data.client_action_id,
             status=TicketStatus.WAITING,
         )
+        if qape_operation is not None:
+            op_id, owner, epoch, policy_id = qape_operation
+            operation = await lock_for_creation_commit(self.db, operation_id=op_id,
+                owner=owner, lease_generation=epoch)
+            # Serialize quota decisions for this policy across concurrent users.
+            policy_row = (await self.db.scalars(select(AbusePolicy).where(
+                AbusePolicy.id == policy_id).with_for_update())).one()
+            if (policy_row.org_id != ticket_org_id or operation.policy_id != policy_row.id or
+                operation.policy_version != policy_row.version):
+                raise HTTPException(409, detail={'code': 'QAPE_POLICY_CHANGED'})
+            maximum = policy_row.config['limits']['max_tickets_per_day']
+            tz = ZoneInfo(policy_row.config['counting']['timezone'])
+            local_now = datetime.now(tz)
+            start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+            end = (local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+                   + timedelta(days=1)).astimezone(timezone.utc)
+            count = await EventRepository(self.db).count_created(
+                ticket_org_id, data.service_id, start, end, user_id=user_id)
+            if count >= maximum:
+                raise HTTPException(429, detail={'code': 'QAPE_DAILY_LIMIT_REACHED'})
         self.db.add(ticket)
         try:
-            await self.db.flush()   # obtenir ticket.id avant commit
+            await self.db.flush()   # obtenir ticket.id et created_at avant commit
+            if qape_operation is not None:
+                operation.ticket_id = ticket.id
+                operation.transition(OperationState.COMMITTED)
+                reasons = (('REDIS_UNAVAILABLE_BYPASS',)
+                           if operation.decision_code == 'REDIS_UNAVAILABLE_BYPASS' else ())
+                await QapeDecisionEngine(self.db).record(operation, Decision(DecisionCode.ALLOW, reasons))
+                self.db.add(AbuseEvent(org_id=ticket.org_id, service_id=ticket.service_id,
+                    user_id=ticket.user_id, ticket_id=ticket.id,
+                    request_id=operation.id, event_type='TICKET_CREATED',
+                    provenance='LIVE', decision='ALLOW',
+                    reason_codes=list(reasons),
+                    policy_version=operation.policy_version, created_at=ticket.created_at,
+                    details={'origin_service_id': ticket.service_id}))
+                await self._log_action(ticket=ticket, action=QueueLogAction.TICKET_CREATED,
+                    from_status=None, to_status=TicketStatus.WAITING, actor_id=user_id,
+                    actor_role=UserRole.CLIENT.value, elapsed_seconds=0)
+                event = counter_activity_event(agency_id=ticket.agency_id,
+                    service_id=ticket.service_id, reason='ticket_created',
+                    ticket_number=ticket.number, status=ticket.status.value,
+                    counter_id=ticket.counter_id, counter_name=ticket.counter_name)
+                event['ticket_id'] = ticket.id
+                event['qape_operation_id'] = operation.id
+                await OutboxService(self.db).enqueue(org_id=ticket.org_id,
+                    event_type=event.get('type', 'ticket_created'), payload=event)
+                snapshot = self._to_response(ticket, position=0, total=0, eta=None)
+                operation.response_status = 200
+                operation.response_snapshot = snapshot.model_dump(mode='json', exclude={'qr_token'})
             await self.db.commit()
         except IntegrityError as exc:
             # Course inter-instances sur (user_id, client_action_id) : le gagnant a déjà créé
             await self.db.rollback()
-            if data.client_action_id:
+            if data.client_action_id and qape_operation is None:
                 replay = await self._find_by_client_action(user_id, data.client_action_id)
                 if replay is not None:
                     return await self._build_response(replay)
@@ -382,6 +632,16 @@ class TicketService:
                 ) from exc
             raise
         await self.db.refresh(ticket)
+        if qape_operation is not None:
+            # PostgreSQL has committed; Redis queue membership is repairable.
+            # Never publish here or mutate the persisted initial snapshot.
+            try:
+                await add_to_queue(ticket.org_id, ticket.agency_id, ticket.service_id,
+                    ticket.id, PRIORITY_SCORES[TicketPriority.STANDARD],
+                    sequence=ticket.queue_sequence)
+            except Exception:
+                logger.exception('QAPE ticket %s committed; queue repair required', ticket.id)
+            return await self._replay_qape_committed(operation)
 
         # ── Audit trail : log la création ─────────────────────────────────────
         await self._log_action(

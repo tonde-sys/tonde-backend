@@ -42,6 +42,7 @@ from app.models import (  # noqa: F401
     queue_log,
     notification,
     audit_log,
+    qape,
 )
 
 # ── Configuration Alembic ─────────────────────────────────────────────────────

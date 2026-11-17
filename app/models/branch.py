@@ -10,12 +10,13 @@ Alembic : migration 003_rename_agencies_to_branches.py
 """
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime, Float, Boolean, Integer, ForeignKey, Text, JSON
+from sqlalchemy import String, DateTime, Float, Boolean, Integer, ForeignKey, Text, JSON, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
 
 class Branch(Base):
+    __table_args__ = (UniqueConstraint("id", "org_id", name="uq_branches_id_org_qape"),)
     """
     Filiale / agence physique d'une organisation.
 
@@ -110,6 +111,8 @@ class Service(Base):
     Chaque service a son propre préfixe de ticket (A, B, C...).
     """
     __tablename__ = "services"
+    # Parent key for QAPE's composite service/organization foreign keys.
+    __table_args__ = (UniqueConstraint("id", "org_id", name="uq_services_id_org_qape"),)
 
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True,

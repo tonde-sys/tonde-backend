@@ -12,7 +12,7 @@ sont publiés par le service, pas par le router.
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,6 +55,7 @@ def _get_org_id(current_user: User) -> str | None:
 @router.post("", summary="Créer un nouveau ticket")
 async def create_ticket(
     body: CreateTicketRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -67,6 +68,11 @@ async def create_ticket(
     - Une priorité demandée (priority, vip, emergency) n'est pas appliquée
       automatiquement : le ticket démarre en standard et un agent confirme la demande.
     """
+    if idempotency_key is not None:
+        if body.client_action_id is not None and body.client_action_id != idempotency_key:
+            raise HTTPException(status_code=400, detail={"code": "IDEMPOTENCY_KEY_MISMATCH"})
+        # Validate the alias through the same field validator as the body.
+        body = CreateTicketRequest.model_validate({**body.model_dump(), "client_action_id": idempotency_key})
     service = TicketService(db)
     return await service.create_ticket(body, current_user.id, _get_org_id(current_user))
 
