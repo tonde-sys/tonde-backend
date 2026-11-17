@@ -3,6 +3,9 @@
 Source : `AUDIT-BACKEND-2026-11-15.md` (20 constats) + fonctions manquantes.
 État de départ : **5 corrigés, 1 outillé, 14 ouverts.**
 État au 15/11 16:00 : **phase 0 livrée, plus P0-4 (expiration à la fermeture).**
+État au 17/11 : **phases 0 à 9 livrées** — moteur, supervision, sécurité, produit,
+guichet, garanties structurelles, et les trois clients (desktop, mobile) branchés
+sur l'API réelle.
 Les quatre décisions bloquantes ont été tranchées (voir la fin du document).
 
 Ce plan n'est pas une liste de courses. Il est ordonné par **ce qui peut casser
@@ -487,6 +490,87 @@ colonne le défaut `nextval('ticket_queue_sequence_seq')` ; le modèle garderait
 
 ---
 
+## Phase 9 — Brancher le mobile sur le vrai backend — ✅ LIVRÉE
+
+Le dépôt `tonde-mobile` (Flutter) existait déjà, complet et vert, mais tous ses
+services étaient simulés. Le brancher n'a pas été un travail de plomberie : il a
+révélé que le mobile **devinait** trois choses que l'API ne disait pas. Le choix
+retenu a été d'ajouter les routes manquantes côté serveur plutôt que de laisser
+le client s'en accommoder.
+
+### Les trois besoins sans route
+
+| Ce que le mobile voulait savoir | Ce qu'il faisait faute de route |
+|---|---|
+| « ai-je un ticket en cours ? » | retenait l'identifiant en local (perdu à la réinstallation, périmé dès la clôture) ou filtrait `/history`, dont la pagination peut masquer le ticket actif |
+| « quelles organisations puis-je rejoindre ? » | rien — `/organizations` répond **403** à un client, l'écran de découverte restait vide |
+| « quelles agences a cette organisation ? » | rien — `/{org_id}/branches` exige un rôle administrateur |
+
+Or prendre un ticket n'exige aucune appartenance : seule l'agence compte. Les
+routes ajoutées sont donc **publiques** (`/public/organizations`,
+`/public/organizations/{id}/branches`), sans une seule donnée personnelle — ni
+e-mail, ni téléphone, ni code d'invitation.
+
+`GET /tickets/active` renvoie une **enveloppe**, pas un 404 quand il n'y a rien :
+« aucun ticket » est un état normal, et un 404 serait lu par le client comme une
+panne réseau. Elle s'appuie sur `ACTIVE_STATUSES` — la même liste que l'invariant
+« un seul ticket actif ». Deux définitions divergentes produiraient un mobile qui
+propose de prendre un ticket que le serveur refusera en 409.
+
+Elle est déclarée **avant** `/{ticket_id}` : FastAPI résout dans l'ordre de
+déclaration, et une route littérale placée après le paramètre serait lue comme un
+identifiant.
+
+### Des noms, pas des UUID
+
+`TicketResponse` ne portait aucun libellé : le mobile ne pouvait afficher que
+`agency_id`, sans moyen de le traduire. `_fill_context_names` les remplit en une
+requête `LEFT JOIN` sur les chemins qui servent **un** ticket (création, détail,
+actif). `LEFT` et non `INNER` : `services.org_id` / `branches.org_id` sont
+nullables, un `INNER` transformerait une donnée incomplète en 404. Volontairement
+absent de `get_history`, qui renvoie une page — trois jointures par ligne feraient
+un N+1.
+
+`GET /branches/{id}/services` a été enrichi **sur place** (`waiting_count`, lu en
+base et non dans Redis : un service ne doit pas disparaître de la liste quand la
+file est momentanément indisponible). Enrichir ne doit pas appauvrir : `created_at`
+que `ServiceService.list` exposait a été conservé, et un test le verrouille.
+
+### Deux défauts réels trouvés côté client
+
+- **`QueueStatus` ignorait `done`.** Un ticket terminé retombait sur « en
+  attente » : le badge mentait et `isTerminal` ne se déclenchait jamais — le
+  client restait bloqué sur un ticket qui ne comptait plus.
+- **Les `queue_update` poussés ne portent pas de `status`.** Sans mémoire du
+  statut précédent, chaque mise à jour de position ramenait un ticket « appelé » à
+  « en attente ». `QueueSnapshot.fromJson(previous:)` le corrige ; un test le
+  verrouille.
+
+### Transport
+
+`ApiClient` devient le point d'entrée HTTP unique : jeton d'accès, rafraîchissement
+**une seule fois** sur 401 puis rejeu, traduction des erreurs. Le rafraîchissement
+partage une `Future` en vol, sinon cinq appels concurrents en 401 déclencheraient
+cinq rotations d'un jeton à usage unique et quatre se feraient délier. Un échec
+**réseau** pendant le rafraîchissement conserve le jeton ; seule une réponse 4xx
+du serveur le supprime — sinon une coupure déconnecterait le client.
+
+Le suivi temps réel est réécrit sur les événements réels (`queue_update`,
+`your_turn`, `ticket_called`, `ticket_absent`, `ticket_done`) et non plus sur une
+déduction à partir du numéro appelé. Ping applicatif toutes les 25 s : les proxys
+coupent les connexions inactives entre 30 et 60 s.
+
+**Rétrocompatibilité :** tout reste derrière `config.isApiConfigured`. Sans
+`TONDE_API_BASE_URL`, la démo approuvée se comporte exactement comme avant.
+
+**Preuve :** `tests/test_phase9_mobile_contract.py` (18) côté serveur —
+**suite complète 683 passés**. Côté mobile : `api_contract_test.dart` (23, avec un
+adaptateur HTTP bouchonné qui inspecte les requêtes émises) et
+`auth_helpers_test.dart` (7) — **suite complète 169 passés**, `flutter analyze`
+sans erreur.
+
+---
+
 ## Ce que ce plan ne couvre pas
 
 - **Charge réelle** : aucune mesure sous 12 postes simultanés. Le N+1 est une
@@ -531,8 +615,9 @@ desktop signé → facturation.**
 
 Tout ce qui relève de ce dépôt est livré : P0, fiabilité du moteur, supervision,
 sécurité/conformité, les deux fonctions produit qui manquaient, la dette
-technique, et le canal temps réel du guichet. Ce qui reste — back-office,
-distribution desktop, facturation — ne se code pas ici.
+technique, le canal temps réel du guichet, et le contrat qui permet au mobile de
+fonctionner contre l'API réelle. Ce qui reste — back-office, distribution desktop,
+facturation — ne se code pas ici.
 
 ## Journal d'avancement
 
@@ -552,6 +637,8 @@ distribution desktop, facturation — ne se code pas ici.
 | Phase 7 (tests) | Cinq tests d'absence antidatent la grâce ; pont fakeredis pour rejouer les tests « vrai Redis » en local | `6106d8b` (CI #43 verte) |
 | Phase 8 | `012` index unique ticket actif + création indépendante de Redis, `013` `queue_sequence`, `014` Outbox | `3712a46` (CI #45 verte, 665 tests) |
 | Poste (8b) | Le guichet suit le moteur d'absence : corps d'erreur conservé, grâce respectée avant l'état local, tri par `queue_sequence` | `8736684` — dépôt `tonde-desktop` (CI verte) |
+| Phase 9 (API) | Contrat mobile : `GET /tickets/active`, découverte publique des organisations/agences, noms d'affichage dans `TicketResponse`, `waiting_count` par service | `ef555fc` (683 tests) |
+| Phase 9 (mobile) | Services réels derrière `isApiConfigured` : `ApiClient` (401 → rafraîchir une fois → rejouer), suivi WS sur les événements réels, `done` ajouté aux statuts | `0da2267` — dépôt `tonde_mobile` (169 tests, analyze propre) |
 
 ### Ce que les phases 3 et 4 ont appris
 
