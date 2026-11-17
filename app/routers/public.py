@@ -15,6 +15,48 @@ from app.services.public_service import PublicQueueService
 router = APIRouter()
 
 
+@router.get("/public/organizations", summary="Organisations actives (public — mobile)")
+@limiter.limit("60/minute")
+async def list_public_organizations(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Organisations actives, sans authentification.
+
+    Sous `/public/` et non à la racine : `/organizations` est déjà pris par le
+    router d'administration, qui répond 403 à un client. Deux routes de même
+    chemin ne peuvent pas coexister, et la première déclarée gagne — la version
+    publique serait silencieusement inatteignable.
+
+    Aucune donnée personnelle : ni e-mail, ni téléphone, ni code d'invitation.
+    """
+    return {"success": True, "data": await PublicQueueService(db).list_organizations()}
+
+
+@router.get(
+    "/public/organizations/{org_id}/branches",
+    summary="Agences actives d'une organisation (public — mobile)",
+)
+@limiter.limit("60/minute")
+async def list_public_branches(
+    request: Request,
+    org_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Agences actives d'une organisation, avec le nombre de personnes en attente.
+
+    Même raison d'être que la route ci-dessus : `/{org_id}/branches` exige un
+    rôle administrateur, donc l'écran « choisir une agence » du mobile restait
+    vide pour un client.
+
+    `waiting_count` est un agrégat lu en base — aucune donnée de ticket, aucun
+    numéro, aucune position ne sort ici.
+    """
+    return {"success": True, "data": await PublicQueueService(db).list_branches(org_id)}
+
+
 @router.get("/branches/{branch_id}/display", summary="Écran de salle d'attente (public)")
 @limiter.limit("120/minute")
 async def branch_display(

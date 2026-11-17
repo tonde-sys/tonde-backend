@@ -49,6 +49,23 @@ class TicketResponse(BaseModel):
     requested_priority: Optional[str] = None  # Priorité demandée, en attente de confirmation par un agent
     agency_id: str
     service_id: str
+
+    # ── Contexte d'affichage ─────────────────────────────────
+    # Noms lisibles du triplet (organisation, agence, service).
+    #
+    # Facultatifs à dessein : `get_history` renvoie une PAGE de tickets, et
+    # joindre trois tables par ligne transformerait une requête en N+1. Les
+    # chemins qui servent UN ticket (création, détail, ticket actif) les
+    # remplissent — ce sont ceux que le mobile affiche.
+    #
+    # Sans eux, le mobile ne pouvait afficher que des UUID : il n'a aucun moyen
+    # de traduire `agency_id` en nom, et `/history` est paginé (le ticket actif
+    # peut ne pas être sur la première page).
+    organization_id: Optional[str] = None
+    organization_name: Optional[str] = None
+    agency_name: Optional[str] = None
+    service_name: Optional[str] = None
+
     qr_token: str                            # Pour le QR Code affiché sur le mobile
     position: int                            # Position actuelle dans la file (0 si hors file)
     total_in_queue: int                      # Nombre total de tickets en file

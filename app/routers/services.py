@@ -127,6 +127,11 @@ async def list_services_public(
     Liste les services actifs d'une branch.
     Accessible sans authentification — utilisé par le mobile
     pour afficher les services disponibles avant de prendre un ticket.
+
+    Passe par `PublicQueueService` et non par `ServiceService` : le mobile a
+    besoin du nombre de personnes en attente par service pour annoncer
+    l'attente avant l'entrée en file, et ce compte se lit en base.
     """
-    items = await ServiceService(db).list(branch_id=branch_id, org_id=None, active_only=True)
-    return {"success": True, "data": items}
+    from app.services.public_service import PublicQueueService
+
+    return {"success": True, "data": await PublicQueueService(db).list_services(branch_id)}

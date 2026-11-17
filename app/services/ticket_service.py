@@ -51,6 +51,7 @@ from app.models.audit_log import AuditAction, AuditLog
 from app.models.branch import Branch, Service
 from app.models.counter import Counter
 from app.models.employee import Employee, EmployeeStatus
+from app.models.organization import Organization
 from app.models.queue_log import QueueLog, QueueLogAction
 from app.models.ticket import (
     ALLOWED_TRANSITIONS,
@@ -453,6 +454,7 @@ class TicketService:
 
         response = self._to_response(ticket, position=position, total=total, eta=eta)
         response.queue_degraded = queue_degraded
+        await self._fill_context_names(response, ticket.service_id)
         return response
 
     # ══ Consultation ═══════════════════════════════════════════════════════════
@@ -505,6 +507,33 @@ class TicketService:
             ticket = await self._get_ticket_for_staff(ticket_id, viewer)
             await self._assert_staff_in_branch(viewer, ticket)
 
+        return await self._build_response(ticket)
+
+    async def get_active_ticket(self, user_id: str) -> TicketResponse | None:
+        """
+        Ticket encore actif du client, ou None s'il est libre.
+
+        Miroir public de `_get_active_ticket`, exposé au mobile. Sans cette
+        route, le poste devait deviner son état de deux manières également
+        fausses : garder l'identifiant du ticket localement (perdu à la
+        réinstallation, et périmé dès que le guichet clôture) ou filtrer
+        `/history` (dont la pagination peut masquer le ticket actif s'il n'est
+        pas sur la première page).
+
+        Le statut retenu est celui de `ACTIVE_STATUSES` — la MÊME liste que
+        l'invariant « un seul ticket actif ». Deux définitions divergentes
+        produiraient un mobile qui propose de prendre un ticket que le serveur
+        refusera en 409.
+
+        Args:
+            user_id: Propriétaire dont on cherche le ticket.
+
+        Returns:
+            Le ticket avec position et attente estimée, ou None.
+        """
+        ticket = await self._get_active_ticket(user_id)
+        if ticket is None:
+            return None
         return await self._build_response(ticket)
 
     async def get_ws_snapshot(self, ticket_id: str, user_id: str) -> dict | None:
@@ -2568,7 +2597,9 @@ class TicketService:
                 total = await self._count_waiting_in_db(ticket.service_id)
                 eta = await self.estimate_wait_minutes(service, total + 1)
 
-        return self._to_response(ticket, position=max(0, position), total=total, eta=eta)
+        response = self._to_response(ticket, position=max(0, position), total=total, eta=eta)
+        await self._fill_context_names(response, ticket.service_id)
+        return response
 
     async def _count_waiting_in_db(self, service_id: str) -> int:
         """Nombre de tickets WAITING d'un service, lu en base (repli quand Redis est absent)."""
@@ -2661,6 +2692,43 @@ class TicketService:
         """Récupère un service par ID (sans contrôle de tenant : usage interne uniquement)."""
         result = await self.db.execute(select(Service).where(Service.id == service_id))
         return result.scalar_one_or_none()
+
+    async def _fill_context_names(self, response: TicketResponse, service_id: str) -> None:
+        """
+        Renseigne les noms lisibles (organisation, agence, service) d'une réponse.
+
+        Une seule requête, en LEFT JOIN : `services.org_id` et `branches.org_id`
+        sont nullables. Un INNER JOIN ferait disparaître les tickets rattachés à
+        une agence sans organisation — cas hérité, mais qui existe en base.
+
+        N'échoue jamais : un nom manquant dégrade l'affichage (le mobile retombe
+        sur son cache local), il ne doit pas empêcher la consultation du ticket.
+        """
+        try:
+            row = (await self.db.execute(
+                select(
+                    Service.name,
+                    Branch.name,
+                    Organization.id,
+                    Organization.name,
+                )
+                .select_from(Service)
+                .outerjoin(Branch, Branch.id == Service.branch_id)
+                .outerjoin(Organization, Organization.id == Branch.org_id)
+                .where(Service.id == service_id)
+            )).first()
+        except Exception as exc:  # noqa: BLE001 — l'affichage ne casse pas la lecture
+            logger.warning(
+                f"Noms d'affichage indisponibles pour le service {service_id} : {exc}"
+            )
+            return
+        if row is None:
+            return
+        service_name, branch_name, org_id, org_name = row
+        response.service_name = service_name
+        response.agency_name = branch_name
+        response.organization_id = org_id
+        response.organization_name = org_name
 
     async def _enforce_daily_limit(self, branch: Branch) -> None:
         """

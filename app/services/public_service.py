@@ -20,6 +20,7 @@ from app.core.config import settings
 from app.core.redis import get_queue_size
 from app.models.branch import Branch, Service
 from app.models.counter import Counter
+from app.models.organization import Organization
 from app.models.ticket import Ticket, TicketStatus
 from app.models.user import User, UserRole
 from app.services.ticket_service import TicketService, as_utc, is_branch_open_now
@@ -88,6 +89,151 @@ class PublicQueueService:
             data["agency_id"] = ticket.agency_id
             data["service_id"] = ticket.service_id
         return data
+
+    async def list_organizations(self) -> list[dict]:
+        """
+        Organisations actives, pour la découverte côté mobile.
+
+        Pourquoi une route PUBLIQUE alors que `/organizations` existe : celle-ci
+        est réservée aux administrateurs (`SUPER_ADMIN` / `ADMIN_ORG`) et répond
+        403 à un client. Un client n'a pourtant pas besoin d'être membre pour
+        prendre un ticket — seule l'agence et le service comptent. Sans cette
+        route, l'application ne pouvait lister aucune organisation et l'écran de
+        prise de ticket restait vide.
+
+        Champs strictement publics : ni e-mail, ni téléphone, ni code
+        d'invitation, ni statistiques d'usage.
+        """
+        organizations = (await self.db.execute(
+            select(Organization)
+            .where(Organization.is_active == True)  # noqa: E712
+            .order_by(Organization.name)
+        )).scalars().all()
+        return [
+            {
+                "id": org.id,
+                "name": org.name,
+                "sector": org.sector,
+                "city": org.city,
+                "logo_url": org.logo_url,
+            }
+            for org in organizations
+        ]
+
+    async def list_branches(self, org_id: str) -> list[dict]:
+        """
+        Agences actives d'une organisation, avec le monde en attente.
+
+        `waiting_count` est lu en BASE et non dans Redis : une agence dont la
+        file Redis est indisponible doit rester visible dans la liste (avec un
+        compte peut-être décalé) plutôt que disparaître — un client qui ne voit
+        plus son agence croit qu'elle a fermé.
+
+        Une seule requête groupée pour toutes les agences : la liste est
+        publique et appelée à chaque ouverture de l'écran de découverte.
+
+        Raises:
+            HTTPException 404: Organisation inexistante ou désactivée.
+        """
+        org = (await self.db.execute(
+            select(Organization).where(
+                Organization.id == org_id,
+                Organization.is_active == True,  # noqa: E712
+            )
+        )).scalar_one_or_none()
+        if org is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "ORGANIZATION_NOT_FOUND", "message": "Organisation introuvable"},
+            )
+
+        branches = (await self.db.execute(
+            select(Branch)
+            .where(Branch.org_id == org_id, Branch.is_active == True)  # noqa: E712
+            .order_by(Branch.name)
+        )).scalars().all()
+
+        waiting: dict[str, int] = {}
+        if branches:
+            rows = (await self.db.execute(
+                select(Ticket.agency_id, func.count(Ticket.id))
+                .where(
+                    Ticket.agency_id.in_([branch.id for branch in branches]),
+                    Ticket.status == TicketStatus.WAITING,
+                )
+                .group_by(Ticket.agency_id)
+            )).all()
+            waiting = {agency_id: count for agency_id, count in rows}
+
+        return [
+            {
+                "id": branch.id,
+                "name": branch.name,
+                "address": branch.address,
+                "city": branch.city,
+                "sector": branch.sector,
+                "latitude": branch.latitude,
+                "longitude": branch.longitude,
+                "opens_at": branch.opens_at,
+                "closes_at": branch.closes_at,
+                # Calculé (horaires + interrupteur manuel), pas la colonne brute :
+                # une agence peut être « ouverte » à 22 h si l'admin l'a forcée.
+                "is_open": is_branch_open_now(branch),
+                "waiting_count": waiting.get(branch.id, 0),
+            }
+            for branch in branches
+        ]
+
+    async def list_services(self, branch_id: str) -> list[dict]:
+        """
+        Services actifs d'une agence, avec le monde en attente par service.
+
+        Enrichit la route publique existante plutôt que d'en créer une seconde :
+        `ServiceService.list` ne renvoie que les colonnes du service, et le
+        mobile affiche « N personnes devant vous » dès l'écran de choix. Sans ce
+        compte, il annoncerait zéro personne à un client qui en a douze devant
+        lui, ou devrait appeler la file complète pour un simple entier.
+
+        Le compte est lu en base et non dans Redis, pour la même raison que dans
+        `list_branches` : un service ne doit pas disparaître de la liste quand la
+        file est momentanément indisponible.
+        """
+        services = (await self.db.execute(
+            select(Service)
+            .where(Service.branch_id == branch_id, Service.is_active == True)  # noqa: E712
+            .order_by(Service.ticket_prefix)
+        )).scalars().all()
+
+        waiting: dict[str, int] = {}
+        if services:
+            rows = (await self.db.execute(
+                select(Ticket.service_id, func.count(Ticket.id))
+                .where(
+                    Ticket.service_id.in_([service.id for service in services]),
+                    Ticket.status == TicketStatus.WAITING,
+                )
+                .group_by(Ticket.service_id)
+            )).all()
+            waiting = {service_id: count for service_id, count in rows}
+
+        return [
+            {
+                "id": service.id,
+                "org_id": service.org_id,
+                "branch_id": service.branch_id,
+                "name": service.name,
+                "description": service.description,
+                "ticket_prefix": service.ticket_prefix,
+                "avg_duration_minutes": service.avg_duration_minutes,
+                "is_active": service.is_active,
+                # Conservé tel quel : cette route remplace `ServiceService.list`,
+                # qui exposait déjà `created_at`. Le retirer casserait un
+                # consommateur existant pour un champ que personne ne lit ici.
+                "created_at": service.created_at.isoformat() if service.created_at else None,
+                "waiting_count": waiting.get(service.id, 0),
+            }
+            for service in services
+        ]
 
     async def get_branch_display(self, branch_id: str) -> dict:
         """

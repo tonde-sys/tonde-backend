@@ -136,6 +136,32 @@ async def get_ticket_by_qr(
     return await PublicQueueService(db).get_ticket_by_qr(qr_token, viewer)
 
 
+@router.get("/active", summary="Ticket actif du client")
+async def get_active_ticket(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Ticket encore actif du client connecté, ou `null` s'il n'en a pas.
+
+    Déclarée AVANT `/{ticket_id}` : FastAPI résout les routes dans l'ordre de
+    déclaration, et une route littérale placée après le paramètre serait lue
+    comme un identifiant — `GET /tickets/active` chercherait le ticket nommé
+    « active » et répondrait 404.
+
+    Renvoie une enveloppe (`success`/`data`) plutôt que l'objet nu comme ses
+    voisines : « aucun ticket » est un état NORMAL, pas une erreur, et un 404
+    serait interprété par le mobile comme une panne réseau. Le client doit
+    pouvoir distinguer les trois cas — ticket actif, aucun ticket, serveur
+    injoignable — avec un seul appel.
+    """
+    ticket = await TicketService(db).get_active_ticket(current_user.id)
+    return {
+        "success": True,
+        "data": ticket.model_dump(mode="json") if ticket is not None else None,
+    }
+
+
 @router.get("/{ticket_id}", summary="Détail d'un ticket")
 async def get_ticket(
     ticket_id: str,
