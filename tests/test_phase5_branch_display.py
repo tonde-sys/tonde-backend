@@ -23,6 +23,7 @@ from app.models.organization import Organization
 from app.models.ticket import Ticket, TicketPriority, TicketStatus
 from app.models.user import User
 from app.services import public_service as public_service_module
+from app.services.eta_service import EtaEstimator, _shrink_mean
 from app.services.public_service import PublicQueueService
 from app.services.ticket_service import ETA_SAMPLE_SIZE, TicketService
 
@@ -206,23 +207,33 @@ async def test_dernier_appele_ignore_les_tickets_jamais_appeles(agence, db_sessi
 
 
 @pytest.mark.asyncio
-async def test_attente_estimee_coherente_avec_le_calcul_unitaire(agence, db_session, mock_redis):
-    """
-    `_eta_minutes` (lot) doit donner le même résultat que `estimate_wait_minutes`
-    (unitaire) : le regroupement ne doit pas changer la formule, seulement le
-    nombre de requêtes.
-    """
+async def test_eta_de_lecran_public_utilise_la_simulation_dynamique(agence, db_session, mock_redis):
+    """L'écran public expose l'ETA dynamique calculée pour le prochain ticket."""
     org, branch, depot, credit, guichet1, guichet2, appele = agence
-    service = TicketService(db_session)
-
     data = await PublicQueueService(db_session).get_branch_display(branch.id)
     par_prefixe = {row["ticket_prefix"]: row for row in data["services"]}
+    estimates = await EtaEstimator(db_session).estimate_many([depot, credit])
 
-    for prefixe, row in par_prefixe.items():
-        attendu = await service.estimate_wait_minutes(
-            depot if prefixe == "A" else credit, row["waiting"] + 1
-        )
-        assert row["estimated_wait_minutes"] == attendu, prefixe
+    assert par_prefixe["A"]["estimated_wait_minutes"] == estimates[depot.id].next_ticket_minutes
+    assert par_prefixe["B"]["estimated_wait_minutes"] == estimates[credit.id].next_ticket_minutes
+
+
+def test_lissage_fait_peser_quatre_observations_de_reference():
+    """Avec peu d'historiques, le profil reste proche du repère général."""
+    assert _shrink_mean([360, 480], prior=600, prior_weight=4) == 540
+
+
+@pytest.mark.asyncio
+async def test_eta_simule_la_file_sur_le_guichet_libre_et_le_guichet_occupe(
+    agence, db_session, mock_redis
+):
+    """Les 2 attentes sont distribuées, puis l'ETA du prochain client est calculée."""
+    org, branch, depot, credit, guichet1, guichet2, appele = agence
+
+    estimate = (await EtaEstimator(db_session).estimate_many([depot]))[depot.id]
+
+    assert sorted(estimate.ticket_minutes.values()) == [0, 5]
+    assert estimate.next_ticket_minutes == 6
 
 
 # ══ Le point du constat : le coût ne dépend plus de la taille de l'agence ════
@@ -236,7 +247,8 @@ async def test_nombre_de_requetes_constant_quel_que_soit_le_nombre_de_services(
 
     C'est la formulation qui protège l'avenir. Une assertion du type « moins de
     10 requêtes » passerait aujourd'hui et sauterait à la première agence un peu
-    grande ; celle-ci échoue dès qu'un N+1 revient.
+    grande ; celle-ci échoue dès qu'un N+1 revient. L'estimation dynamique ajoute
+    un coût fixe par type de données consulté ; le budget actuel est plafonné à 14.
     """
     org, branch, depot, credit, guichet1, guichet2, appele = agence
     ecran = PublicQueueService(db_session)
@@ -269,7 +281,7 @@ async def test_nombre_de_requetes_constant_quel_que_soit_le_nombre_de_services(
         f"{len(grand.statements)} pour 8 — il reste un N+1 :\n"
         + "\n".join(grand.statements)
     )
-    assert len(grand.statements) <= 6, "\n".join(grand.statements)
+    assert len(grand.statements) <= 14, "\n".join(grand.statements)
 
 
 @pytest.mark.asyncio

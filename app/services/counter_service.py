@@ -16,7 +16,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.branch import Branch
+from app.models.branch import Branch, Service
 from app.models.counter import Counter
 from app.models.ticket import Ticket
 from app.schemas.counter import (
@@ -268,6 +268,7 @@ class CounterService:
         await self.db.commit()
         await self.db.refresh(counter)
         await self._announce(counter, EventType.COUNTER_OPEN)
+        await self._refresh_branch_queue_etas(counter)
         return CounterResponse.model_validate(counter)
 
     async def close(
@@ -306,6 +307,7 @@ class CounterService:
         await self.db.commit()
         await self.db.refresh(counter)
         await self._announce(counter, EventType.COUNTER_CLOSE)
+        await self._refresh_branch_queue_etas(counter)
         return CounterResponse.model_validate(counter)
 
     async def _release_called_ticket(self, counter: Counter) -> None:
@@ -358,6 +360,7 @@ class CounterService:
         await self.db.commit()
         if was_open:
             await self._announce(counter, EventType.COUNTER_CLOSE)
+            await self._refresh_branch_queue_etas(counter)
 
     async def _announce(self, counter: Counter, event_type: EventType) -> None:
         """Diffuse l'ouverture/fermeture d'un guichet à la salle d'attente. Ne lève jamais."""
@@ -367,3 +370,19 @@ class CounterService:
             "counter_id": counter.id,
             "counter_name": counter.name,
         })
+
+    async def _refresh_branch_queue_etas(self, counter: Counter) -> None:
+        """Rediffuse les prévisions après un changement de capacité de l'agence."""
+        try:
+            service_ids = (await self.db.execute(
+                select(Service.id).where(Service.branch_id == counter.agency_id)
+            )).scalars().all()
+            ticket_service = TicketService(self.db)
+            for service_id in service_ids:
+                await ticket_service._publish_queue_snapshot(
+                    counter.org_id, counter.agency_id, service_id
+                )
+        except Exception as exc:  # noqa: BLE001 — l'ouverture du guichet ne doit pas échouer
+            logger.warning(
+                f"Mise à jour des ETA échouée après changement du guichet {counter.id}: {exc}"
+            )

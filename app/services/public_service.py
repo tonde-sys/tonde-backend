@@ -291,7 +291,16 @@ class PublicQueueService:
 
         service_ids = [service.id for service in services]
         waiting_counts = await self._waiting_counts(branch, services)
-        avg_seconds = await ticket_service.avg_service_seconds_batch(list(services))
+        try:
+            dynamic_estimates = await ticket_service.estimate_service_queues(list(services))
+        except Exception as exc:  # noqa: BLE001 — l'écran public garde son ETA de repli
+            logger.warning(f"ETA dynamique indisponible pour l'agence {branch_id} ({exc})")
+            dynamic_estimates = {}
+        avg_seconds = (
+            await ticket_service.avg_service_seconds_batch(list(services))
+            if services and not dynamic_estimates
+            else {}
+        )
         last_called = await ticket_service.current_called_numbers(service_ids)
 
         service_rows = [
@@ -300,9 +309,13 @@ class PublicQueueService:
                 "name": service.name,
                 "ticket_prefix": service.ticket_prefix,
                 "waiting": waiting_counts.get(service.id, 0),
-                "estimated_wait_minutes": self._eta_minutes(
-                    waiting_counts.get(service.id, 0) + 1,
-                    avg_seconds.get(service.id, 0),
+                "estimated_wait_minutes": (
+                    dynamic_estimates[service.id].next_ticket_minutes
+                    if service.id in dynamic_estimates
+                    else self._eta_minutes(
+                        waiting_counts.get(service.id, 0) + 1,
+                        avg_seconds.get(service.id, 0),
+                    )
                 ),
                 "last_called_number": last_called.get(service.id),
             }

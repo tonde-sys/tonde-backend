@@ -69,6 +69,7 @@ from app.schemas.ticket import (
     TicketResponse,
 )
 from app.services.audit_service import AuditService
+from app.services.eta_service import EtaEstimator, ServiceQueueEstimate
 from app.services.outbox import OutboxService
 from app.websocket.events import EventType
 from app.websocket.publisher import counter_activity_event, publish_event, queue_snapshot_event
@@ -428,7 +429,7 @@ class TicketService:
         # devait nettoyer plus tard. On dégrade l'affichage, pas la prise de ticket.
         if queue_degraded:
             total = await self._count_waiting_in_db(ticket.service_id)
-            eta = await self.estimate_wait_minutes(service, total + 1)
+            fallback_position = total + 1
         else:
             try:
                 total = await get_queue_size(ticket.org_id, ticket.agency_id, ticket.service_id)
@@ -437,7 +438,10 @@ class TicketService:
                     f"Taille de file indisponible pour {ticket.number} (affichage dégradé) : {exc}"
                 )
                 total = position
-            eta = await self.estimate_wait_minutes(service, position)
+            fallback_position = position if position > 0 else total + 1
+        eta = await self.estimate_ticket_wait_minutes(
+            ticket, service, fallback_position=fallback_position
+        )
         ticket.estimated_wait_minutes = eta
         await self.db.commit()
 
@@ -610,11 +614,17 @@ class TicketService:
                         f"File indisponible pour l'historique du ticket {t.number} ({exc}) "
                         ": position laissée à 0"
                     )
-            items.append(
-                self._to_response(
-                    t, position=position, total=queue_total, eta=t.estimated_wait_minutes
+            eta = t.estimated_wait_minutes
+            if t.status == TicketStatus.WAITING:
+                service = await self._get_service_row(t.service_id)
+                eta = await self.estimate_ticket_wait_minutes(
+                    t,
+                    service,
+                    fallback_position=position if position > 0 else queue_total + 1,
                 )
-            )
+            items.append(self._to_response(
+                t, position=position, total=queue_total, eta=eta
+            ))
 
         return TicketHistoryResponse(
             items=items,
@@ -1303,6 +1313,7 @@ class TicketService:
         ticket.served_at = datetime.now(timezone.utc)
         await self.db.commit()
         await clear_deadlines(ticket.org_id, ticket.id)  # présenté : plus d'absence possible
+        await self._publish_queue_snapshot(ticket.org_id, ticket.agency_id, ticket.service_id)
         return {"success": True, "ticket_id": ticket.id}
 
     async def complete_ticket(self, ticket_id: str, actor: User) -> dict:
@@ -1348,6 +1359,7 @@ class TicketService:
             "ticket_number": ticket.number,
             "agency_id": ticket.agency_id,
         })
+        await self._publish_queue_snapshot(ticket.org_id, ticket.agency_id, ticket.service_id)
         return {"success": True, "ticket_id": ticket.id}
 
     async def mark_incomplete(self, ticket_id: str, actor: User, reason: str | None = None) -> dict:
@@ -2088,12 +2100,23 @@ class TicketService:
             avg_seconds = await self._avg_service_seconds(
                 service_id, service.avg_duration_minutes if service else 5
             )
+            estimated_waits: dict[str, int] = {}
+            if service is not None:
+                try:
+                    estimate = (await EtaEstimator(self.db).estimate_many([service])).get(service_id)
+                    if estimate is not None:
+                        estimated_waits = estimate.ticket_minutes
+                except Exception as exc:  # noqa: BLE001 — conserver le snapshot historique
+                    logger.warning(
+                        f"ETA dynamique indisponible pour le snapshot {service_id} ({exc})"
+                    )
             await publish_event(org_id, queue_snapshot_event(
                 agency_id=agency_id,
                 service_id=service_id,
                 positions={tid: index + 1 for index, tid in enumerate(ids)},
                 current_called_number=await self._current_called_number(service_id),
                 eta_seconds_per_position=avg_seconds,
+                estimated_wait_minutes_by_ticket=estimated_waits,
             ))
         except Exception as exc:  # noqa: BLE001 — jamais bloquant
             logger.error(f"Snapshot de file non publié (service={service_id}): {exc}")
@@ -2121,6 +2144,47 @@ class TicketService:
         service_id = service.id if service else None
         avg_seconds = await self._avg_service_seconds(service_id, default_minutes)
         return math.ceil((position - 1) * avg_seconds / 60)
+
+    async def estimate_service_queues(
+        self, services: list[Service]
+    ) -> dict[str, ServiceQueueEstimate]:
+        """Retourne les ETA dynamiques groupées, avec repli géré par l'appelant."""
+        return await EtaEstimator(self.db).estimate_many(services)
+
+    async def estimate_ticket_wait_minutes(
+        self,
+        ticket: Ticket,
+        service: Service | None,
+        *,
+        fallback_position: int,
+    ) -> int:
+        """Prévoit l'ETA d'un ticket à partir de la simulation terrain.
+
+        Si les données dynamiques sont temporairement indisponibles, l'ancienne
+        estimation par position reste le filet de sécurité.
+        """
+        if ticket.status != TicketStatus.WAITING or service is None:
+            return ticket.estimated_wait_minutes or 0
+        try:
+            estimate = (await EtaEstimator(self.db).estimate_many([service])).get(service.id)
+            if estimate is not None:
+                return estimate.ticket_minutes.get(
+                    ticket.id, estimate.next_ticket_minutes
+                )
+        except Exception as exc:  # noqa: BLE001 — ETA ne doit jamais casser le ticket
+            logger.warning(
+                f"ETA dynamique indisponible pour {ticket.number} ({exc}); repli sur la formule actuelle"
+            )
+        position = max(1, fallback_position)
+        try:
+            return await self.estimate_wait_minutes(service, position)
+        except Exception as exc:  # noqa: BLE001 — dernier repli, sans autre lecture DB
+            configured_minutes = max(1, service.avg_duration_minutes)
+            logger.warning(
+                f"Historique ETA indisponible pour {ticket.number} ({exc}); "
+                "repli sur la durée configurée"
+            )
+            return max(0, (position - 1) * configured_minutes)
 
     async def _avg_service_seconds(self, service_id: str | None, default_minutes: int) -> int:
         """
@@ -2587,7 +2651,11 @@ class TicketService:
                     )
                     logger.warning(f"Ticket {ticket.number} absent de Redis : remis en file (auto-réparation)")
                 total = await get_queue_size(ticket.org_id, ticket.agency_id, ticket.service_id)
-                eta = await self.estimate_wait_minutes(service, position)
+                eta = await self.estimate_ticket_wait_minutes(
+                    ticket,
+                    service,
+                    fallback_position=(position if position > 0 else total + 1),
+                )
             except Exception as exc:  # noqa: BLE001 — Redis ne doit jamais casser une lecture
                 logger.warning(
                     f"File indisponible pour {ticket.number} ({exc}) : position inconnue, "
@@ -2595,7 +2663,9 @@ class TicketService:
                 )
                 position = 0
                 total = await self._count_waiting_in_db(ticket.service_id)
-                eta = await self.estimate_wait_minutes(service, total + 1)
+                eta = await self.estimate_ticket_wait_minutes(
+                    ticket, service, fallback_position=total + 1
+                )
 
         response = self._to_response(ticket, position=max(0, position), total=total, eta=eta)
         await self._fill_context_names(response, ticket.service_id)

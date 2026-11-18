@@ -414,6 +414,9 @@ class QueueWebSocketManager:
         """
         positions: dict[str, int] = event.get("positions", {})
         eta_per_position = int(event.get("eta_seconds_per_position", 0))
+        estimated_waits: dict[str, int] = event.get(
+            "estimated_wait_minutes_by_ticket", {}
+        )
         total = int(event.get("total_in_queue", len(positions)))
 
         for ticket_id in list(self.connections_by_ticket.keys()):
@@ -421,12 +424,15 @@ class QueueWebSocketManager:
             if position is None:
                 continue
             ahead = max(0, position - 1)
+            eta_minutes = estimated_waits.get(ticket_id)
+            if eta_minutes is None:
+                eta_minutes = -(-ahead * eta_per_position // 60)
             await self.send_to_ticket(ticket_id, {
                 "type": EventType.QUEUE_UPDATE.value,
                 "ticket_id": ticket_id,
                 "position": position,
                 "total_in_queue": total,
-                "estimated_wait_minutes": -(-ahead * eta_per_position // 60),  # arrondi supérieur
+                "estimated_wait_minutes": eta_minutes,
                 "current_called_number": event.get("current_called_number", ""),
             })
 

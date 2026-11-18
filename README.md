@@ -197,9 +197,93 @@ sortie, et les tickets bloqués sont clos automatiquement (voir *Expirations*).
 | Numéros uniques, sans trou | Compteur Redis `INCR` par jour (heure du Burundi, UTC+2), format `A-007` |
 | Pas de double ticket (double tap, retry réseau) | Verrou `SET NX` par utilisateur + idempotence `client_action_id` |
 | Redis est un accélérateur, **PostgreSQL est la vérité** | Reconstruction des files au démarrage, à la consultation d'un ticket absent, et à l'appel d'une file vide |
-| ETA réaliste | Moyenne glissante des 10 derniers services **réels** (`service_seconds`), lissée par la durée configurée |
+| ETA dynamique | Simulation des tickets en attente sur les guichets ouverts, avec durées récentes par service, guichet et agent |
 | Priorité jamais auto-attribuée | Le client *demande* ; un agent confirme (`POST /tickets/{id}/priority`), l'ancienneté est conservée |
 | L'agent n'agit que sur SES tickets | Guichet affecté (`Employee.counter_id`), branche pour superviseurs/admins d'agence |
+
+### Estimation dynamique du temps d'attente
+
+L'objectif est de prévoir une attente qui évolue avec le rythme constaté du
+service et la charge des guichets. Il s'agit d'un estimateur statistique
+déterministe : il apprend des durées enregistrées, mais n'utilise pas de modèle
+d'IA opaque et ne change jamais l'ordre réel de la file.
+
+#### 1. Apprendre une durée de service
+
+Une observation est le temps réel d'un ticket terminé, mesuré entre le début du
+service (`served_at`) et sa fin (`done_at`, stocké dans `service_seconds`).
+L'estimateur consulte les tickets terminés des 90 derniers jours, jusqu'à 100
+observations par service. Les durées aberrantes sont bornées entre 30 secondes
+et 3 600 secondes afin qu'une erreur de saisie ne déforme pas toutes les
+prévisions.
+
+Le repère général du service utilise au plus les 10 observations les plus
+récentes. S'il y en a moins de 10, les places manquantes sont remplies avec la
+durée moyenne configurée du service. En pratique :
+
+    repère = (somme des durées observées + durée configurée × places manquantes) / 10
+
+Cela permet de démarrer avec la configuration existante, puis de s'adapter au
+rythme réel à mesure que des tickets sont terminés.
+
+#### 2. S'adapter au guichet et à l'agent
+
+Quand l'historique le permet, le calcul affine le repère par guichet, puis par
+agent. Pour éviter qu'un ou deux cas particuliers dominent, chaque moyenne
+spécifique est lissée vers son repère parent :
+
+    moyenne lissée = (somme des durées observées + repère × 4) / (nombre d'observations + 4)
+
+Le poids 4 équivaut à quatre observations de référence. Avec peu de données, le
+résultat reste donc proche du repère général ; avec davantage d'observations, il
+se rapproche du rythme propre au guichet ou à l'agent. Le calcul utilise au plus
+10 observations récentes pour chaque profil.
+
+Le profil d'agent est utilisé pour un guichet occupé si l'agent qui sert le
+ticket est identifiable dans les journaux. Pour prévoir les prochains tickets,
+il n'est utilisé que lorsqu'un seul agent actif est affecté au guichet. Si
+plusieurs agents y sont affectés, le système ne peut pas savoir lequel travaille
+à cet instant et utilise le profil du guichet.
+
+#### 3. Simuler la file et les guichets
+
+Pour chaque service demandé, l'estimateur :
+
+1. prend les guichets actifs et ouverts de la branche ;
+2. estime le temps avant leur disponibilité : durée restante observée pour un
+   ticket déjà en service, ou petite marge de prise en charge puis durée prévue
+   pour un ticket appelé ;
+3. trie les tickets en attente de ce service selon la priorité puis l'ordre de
+   file existant ;
+4. affecte virtuellement chaque ticket au guichet qui devrait se libérer le
+   plus tôt, puis ajoute la durée prévue de son service à la charge de ce
+   guichet ;
+5. arrondit l'attente à la minute supérieure. L'estimation du prochain client
+   est calculée après les tickets déjà en attente.
+
+Pour un ticket déjà en service, les durées historiques comparables permettent
+d'estimer le temps restant, plutôt que de recommencer le chronomètre à zéro. Si
+le service n'a pas encore d'historique, la durée configurée sert de base. S'il
+n'y a aucun guichet ouvert, une voie virtuelle séquentielle conserve une ETA
+utile au lieu de renvoyer une erreur.
+
+#### 4. Où l'estimation est utilisée
+
+Le même calcul alimente les réponses de ticket, l'écran public et les messages
+WebSocket. L'estimation ne change pas l'affectation réelle des tickets. Si le
+calcul dynamique échoue ou manque de données, l'ancienne formule reste le
+repli afin de ne pas bloquer la prise en charge.
+
+#### Limites actuelles
+
+Le modèle ne décrit pas encore les services autorisés pour chaque guichet, les
+pauses temporaires, ni l'identité de l'agent qui prendra le prochain ticket.
+Chaque estimation simule la file du service demandé sur les guichets ouverts de
+la branche et tient compte des tickets déjà appelés ou en cours sur ces
+guichets. Les tickets en attente d'autres services ne sont pas simulés ensemble
+dans cette première version. L'ETA reste donc une prévision, pas une promesse :
+une pause, une absence, un dossier inhabituellement long ou un changement de
+personnel peut la faire varier.
 
 ### Tâches planifiées (`QueueScheduler`, sans Celery)
 
