@@ -23,12 +23,6 @@ from app.services.qape_reservation import reserve, reservation_state
 from tests.test_qape_data import config
 
 
-@pytest_asyncio.fixture(autouse=True)
-async def redis_lifecycle():
-    yield
-    await close_redis()
-
-
 @pytest.mark.asyncio
 async def test_redis_unknown_and_fenced_compensation():
     if not os.getenv('PG_TEST_URL') or not os.getenv('QAPE_REDIS_TEST'):
