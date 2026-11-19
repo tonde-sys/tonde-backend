@@ -493,3 +493,175 @@ async def test_temporary_block_outage_expires_and_retries_same_intent():
         assert await db.scalar(select(func.count(AbuseEvent.id)).where(
             AbuseEvent.event_type == 'TICKET_CREATED', AbuseEvent.ticket_id == created.id)) == 1
     await engine.dispose()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lost_ack_after_quota_commit', [False, True])
+async def test_final_quota_refusal_is_durable_audited_and_compensated(lost_ack_after_quota_commit):
+    """Force the race between preflight and the locked final quota check."""
+    if not os.getenv('PG_TEST_URL') or not os.getenv('QAPE_REDIS_TEST'):
+        pytest.skip('requires disposable PostgreSQL 15 and real Redis 7')
+    from app.services.qape_engine import Decision, DecisionCode
+    engine = create_async_engine(os.environ['PG_TEST_URL'])
+    sf = async_sessionmaker(engine, expire_on_commit=False)
+    async with sf() as db:
+        org = Organization(name='final quota', slug=uuid.uuid4().hex, sector='other')
+        db.add(org); await db.flush()
+        branch = Branch(name='test', slug=uuid.uuid4().hex, sector='other', org_id=org.id,
+                        is_open=True, opens_at='00:00', closes_at='23:59')
+        db.add(branch); await db.flush()
+        svc = Service(name='test', org_id=org.id, branch_id=branch.id)
+        user = User(phone='+257' + str(uuid.uuid4().int % 10**8).zfill(8))
+        db.add_all([svc, user]); await db.flush()
+        cfg = config()
+        cfg['limits']['max_tickets_per_day'] = 1
+        cfg['limits']['bucket_capacity'] = 3
+        cfg['limits']['max_requests_per_10m'] = 10
+        db.add(AbusePolicy(org_id=org.id, service_id=svc.id, version=1,
+                           enabled=True, config=cfg))
+        await db.commit()
+        first = await TicketService(db).create_ticket(CreateTicketRequest(
+            agency_id=branch.id, service_id=svc.id,
+            client_action_id='quota_first_' + uuid.uuid4().hex), user.id, None)
+        ticket = await db.get(Ticket, first.id)
+        ticket.status = TicketStatus.DONE
+        await db.commit()
+        data = CreateTicketRequest(agency_id=branch.id, service_id=svc.id,
+                                   client_action_id='quota_final_' + uuid.uuid4().hex)
+        org_id, svc_id, user_id = org.id, svc.id, user.id
+        # Simulate the concurrent first commit becoming visible AFTER preflight.
+        # The second case interrupts Python after the refusal transaction commits
+        # but before the caller receives the response; it is NOT a real SIGKILL.
+        committed = db.commit
+        interrupted = False
+        async def commit_then_interrupt():
+            nonlocal interrupted
+            quota_refusal = any(isinstance(row, QapeCreateOperation) and
+                row.decision_code == 'DAILY_QUOTA_REACHED' for row in db.identity_map.values())
+            await committed()
+            if lost_ack_after_quota_commit and quota_refusal and not interrupted:
+                interrupted = True
+                raise RuntimeError('simulated lost quota-refusal commit acknowledgment')
+        with patch('app.services.qape_engine.QapeDecisionEngine.preflight',
+                   new_callable=AsyncMock, return_value=Decision(DecisionCode.ALLOW)):
+            with patch.object(db, 'commit', commit_then_interrupt):
+                if lost_ack_after_quota_commit:
+                    with pytest.raises(RuntimeError, match='simulated lost quota'):
+                        await TicketService(db).create_ticket(data, user_id, None)
+                else:
+                    with pytest.raises(HTTPException) as refused:
+                        await TicketService(db).create_ticket(data, user_id, None)
+        if not lost_ack_after_quota_commit:
+            assert refused.value.status_code == 429
+            assert refused.value.detail['code'] == 'DAILY_QUOTA_REACHED'
+        op = (await db.scalars(select(QapeCreateOperation).where(
+            QapeCreateOperation.client_action_id == data.client_action_id))).one()
+        op_id, rid, generation = op.id, op.reservation_id, op.attempt_generation
+        assert op.state == OperationState.RECOVERY_REQUIRED.value
+        assert op.retry_after is not None
+        expected_detail = op.response_snapshot
+        assert expected_detail['code'] == 'DAILY_QUOTA_REACHED'
+        if not lost_ack_after_quota_commit:
+            assert expected_detail == refused.value.detail
+        audit_query = select(AbuseEvent).where(AbuseEvent.event_type == 'QAPE_DECISION',
+            AbuseEvent.details['operation_id'].as_string() == op_id)
+        audit = (await db.scalars(audit_query)).one()
+        assert audit.decision == 'TEMPORARY_BLOCK'
+        assert audit.reason_codes == ['DAILY_QUOTA_REACHED']
+        assert audit.policy_version == 1
+        assert await db.scalar(select(func.count(Ticket.id)).where(
+            Ticket.client_action_id == data.client_action_id)) == 0
+        assert await db.scalar(select(func.count(AbuseEvent.id)).where(
+            AbuseEvent.event_type == 'TICKET_CREATED', AbuseEvent.request_id == op_id)) == 0
+        from app.models.event_outbox import EventOutbox
+        assert await db.scalar(select(func.count(EventOutbox.id)).where(
+            EventOutbox.payload['qape_operation_id'].as_string() == op_id)) == 0
+        # Another session emulates a process restart; the same intent replays
+        # its durable refusal, not a second reservation or audit event.
+    async with sf() as db:
+        with pytest.raises(HTTPException) as replay:
+            await TicketService(db).create_ticket(data, user_id, None)
+        assert replay.value.detail == expected_detail
+        op = await db.get(QapeCreateOperation, op_id)
+        assert op.reservation_id == rid and op.attempt_generation == generation
+        assert len((await db.scalars(audit_query)).all()) == 1
+        from app.services.qape_reservation import reservation_state
+        state, _, _ = await reservation_state(org_id=org_id, service_id=svc_id,
+            user_id=user_id, reservation_id=rid, attempt_generation=generation)
+        assert state == 'ACTIVE'
+        op.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await db.commit()
+        claim = await claim_expired(db, owner='quota-recovery', operation_id=op_id)
+        assert len(claim) == 1
+        assert await reconcile_one(db, op_id, 'quota-recovery', claim[0][1]) == 'COMPENSATED'
+        assert await reconcile_one(db, op_id, 'quota-recovery', claim[0][1]) == 'COMPENSATED'
+        state, _, _ = await reservation_state(org_id=org_id, service_id=svc_id,
+            user_id=user_id, reservation_id=rid, attempt_generation=generation)
+        assert state == 'COMPENSATED'
+        assert len((await db.scalars(audit_query)).all()) == 1
+        with pytest.raises(HTTPException) as again:
+            await TicketService(db).create_ticket(data, user_id, None)
+        assert again.value.detail == expected_detail
+    await engine.dispose()
+
+@pytest.mark.asyncio
+async def test_sigkill_after_durable_final_quota_refusal():
+    if not os.getenv('PG_TEST_URL') or not os.getenv('QAPE_REDIS_TEST'):
+        pytest.skip('requires disposable PostgreSQL 15 and real Redis 7')
+    import sys
+    engine = create_async_engine(os.environ['PG_TEST_URL'])
+    sf = async_sessionmaker(engine, expire_on_commit=False)
+    async with sf() as db:
+        org = Organization(name='quota sigkill', slug=uuid.uuid4().hex, sector='other')
+        db.add(org); await db.flush()
+        branch = Branch(name='test', slug=uuid.uuid4().hex, sector='other', org_id=org.id,
+                        is_open=True, opens_at='00:00', closes_at='23:59')
+        db.add(branch); await db.flush()
+        svc = Service(name='test', org_id=org.id, branch_id=branch.id)
+        user = User(phone='+257' + str(uuid.uuid4().int % 10**8).zfill(8))
+        db.add_all([svc, user]); await db.flush()
+        cfg = config()
+        cfg['limits']['max_tickets_per_day'] = 1
+        cfg['limits']['bucket_capacity'] = 3
+        cfg['limits']['max_requests_per_10m'] = 10
+        db.add(AbusePolicy(org_id=org.id, service_id=svc.id, version=1,
+                           enabled=True, config=cfg))
+        await db.commit()
+        first = await TicketService(db).create_ticket(CreateTicketRequest(
+            agency_id=branch.id, service_id=svc.id,
+            client_action_id='seed_' + uuid.uuid4().hex), user.id, None)
+        ticket = await db.get(Ticket, first.id)
+        ticket.status = TicketStatus.DONE
+        await db.commit()
+        org_id, agency_id, service_id, user_id = org.id, branch.id, svc.id, user.id
+    key = 'quota_kill_' + uuid.uuid4().hex
+    proc = await asyncio.create_subprocess_exec(sys.executable,
+        'tests/qape_crash_worker.py', 'quota_after_commit', os.environ['PG_TEST_URL'],
+        agency_id, service_id, user_id, key, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, env={**os.environ, 'PYTHONPATH': os.getcwd()})
+    try:
+        line = await asyncio.wait_for(proc.stdout.readline(), timeout=15)
+        assert line.strip() == b'READY:QUOTA_AFTER_COMMIT', (line, await proc.stderr.read())
+    finally:
+        proc.kill()
+        await proc.wait()
+    async with sf() as db:
+        op = (await db.scalars(select(QapeCreateOperation).where(
+            QapeCreateOperation.user_id == user_id,
+            QapeCreateOperation.client_action_id == key))).one()
+        assert op.state == OperationState.RECOVERY_REQUIRED.value
+        assert op.decision_code == 'DAILY_QUOTA_REACHED'
+        assert (await db.scalar(select(func.count(AbuseEvent.id)).where(
+            AbuseEvent.event_type == 'QAPE_DECISION',
+            AbuseEvent.details['operation_id'].as_string() == op.id))) == 1
+        assert await db.scalar(select(func.count(Ticket.id)).where(Ticket.client_action_id == key)) == 0
+        op.lease_expires_at = datetime.now(timezone.utc)-timedelta(seconds=1)
+        await db.commit()
+        claim = await claim_expired(db, owner='quota-kill-recovery', operation_id=op.id)
+        assert len(claim) == 1
+        assert await reconcile_one(db, op.id, 'quota-kill-recovery', claim[0][1]) == 'COMPENSATED'
+        with pytest.raises(HTTPException) as replay:
+            await TicketService(db).create_ticket(CreateTicketRequest(
+                agency_id=agency_id, service_id=service_id, client_action_id=key), user_id, None)
+        assert replay.value.status_code == 429
+        assert replay.value.detail['code'] == 'DAILY_QUOTA_REACHED'
+    await engine.dispose()

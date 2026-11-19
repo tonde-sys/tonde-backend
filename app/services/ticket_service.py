@@ -459,6 +459,15 @@ class TicketService:
             # deferred until the worker fences all writers and verifies the DB.
             await self.db.rollback()
             op = await lock_for_creation_commit_or_recovery(self.db, op_id, owner, epoch)
+            if (op.state == OperationState.RECOVERY_REQUIRED.value and
+                op.decision_code == 'DAILY_QUOTA_REACHED' and
+                op.response_status == 429):
+                # The final quota refusal and audit were already committed.
+                # Replay the durable response; do not overwrite it or reimburse
+                # until the recovery worker has fenced every potential writer.
+                snapshot = op.response_snapshot
+                await self.db.rollback()
+                raise HTTPException(429, detail=snapshot)
             op.transition(OperationState.DENIED if op.reservation_id is None
                           else OperationState.RECOVERY_REQUIRED)
             detail = exc.detail if isinstance(exc.detail, dict) else {'code': 'BUSINESS_DENIED'}
@@ -570,7 +579,23 @@ class TicketService:
             count = await EventRepository(self.db).count_created(
                 ticket_org_id, data.service_id, start, end, user_id=user_id)
             if count >= maximum:
-                raise HTTPException(429, detail={'code': 'QAPE_DAILY_LIMIT_REACHED'})
+                # The final serialized quota check is authoritative. Persist the
+                # refusal and its audit in ONE transaction while both locks are
+                # held, before any ticket/event/outbox insertion. Redis is not
+                # reimbursed here: the fenced recovery worker proves absence of
+                # a ticket before its idempotent compensation.
+                refusal = Decision(DecisionCode.TEMPORARY_BLOCK,
+                                   ('DAILY_QUOTA_REACHED',), end)
+                operation.transition(OperationState.RECOVERY_REQUIRED)
+                operation.decision_code = 'DAILY_QUOTA_REACHED'
+                operation.retry_after = end
+                operation.response_status = 429
+                operation.response_snapshot = {
+                    'code': 'DAILY_QUOTA_REACHED', 'operation_id': operation.id,
+                    'reason_codes': ['DAILY_QUOTA_REACHED']}
+                await QapeDecisionEngine(self.db).record(operation, refusal)
+                await self.db.commit()
+                raise HTTPException(429, detail=operation.response_snapshot)
         self.db.add(ticket)
         try:
             await self.db.flush()   # obtenir ticket.id et created_at avant commit

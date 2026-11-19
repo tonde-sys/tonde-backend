@@ -23,6 +23,23 @@ async def main():
                 await asyncio.sleep(120)
                 return decision
             engine_module.reserve = hold_after_redis_denial
+        elif stage == 'quota_after_commit':
+            from app.models.qape_operation import QapeCreateOperation
+            from app.services.qape_engine import Decision, DecisionCode
+            async def allow_preflight(*args, **kwargs):
+                # Force the final transactional guard to observe a concurrent
+                # creation that the preflight did not see.
+                return Decision(DecisionCode.ALLOW)
+            engine_module.QapeDecisionEngine.preflight = allow_preflight
+            original_commit = db.commit
+            async def hold_after_quota_refusal_commit():
+                refused = any(isinstance(row, QapeCreateOperation) and
+                    row.decision_code == 'DAILY_QUOTA_REACHED' for row in db.identity_map.values())
+                await original_commit()
+                if refused:
+                    print('READY:QUOTA_AFTER_COMMIT', flush=True)
+                    await asyncio.sleep(120)
+            db.commit = hold_after_quota_refusal_commit
         elif stage == 'reserved':
             original = ticket_module.lock_for_creation_commit
             async def hold_before_final_commit(*args, **kwargs):
