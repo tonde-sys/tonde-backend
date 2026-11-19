@@ -362,7 +362,10 @@ class TicketService:
         op = (await self.db.scalars(select(QapeCreateOperation).where(
             QapeCreateOperation.user_id == user_id,
             QapeCreateOperation.operation_type == 'CREATE_TICKET',
-            QapeCreateOperation.client_action_id == key).with_for_update())).one()
+            QapeCreateOperation.client_action_id == key).with_for_update()
+            .execution_options(populate_existing=True))).one()
+        # A prior nonlocking lookup can be stale after another worker commits.
+        # Refresh the identity-mapped row under the SQL lock before any retry.
         if op.payload_hash != digest or op.canonicalization_version != CANONICALIZATION_VERSION:
             raise HTTPException(409, detail={"code": "IDEMPOTENCY_PAYLOAD_CONFLICT"})
         if op.state == OperationState.COMMITTED.value and op.response_snapshot:

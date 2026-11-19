@@ -36,7 +36,7 @@ TRANSITIONS = {
     OperationState.COMMITTING: {OperationState.COMMITTED, OperationState.RECOVERY_REQUIRED},
     OperationState.COMPENSATING: {OperationState.COMPENSATED, OperationState.RECOVERY_REQUIRED},
     OperationState.DENIED: {OperationState.PENDING},
-    OperationState.REVIEW_REQUIRED: {OperationState.PENDING},  # only explicit human authorization, later phase
+    OperationState.REVIEW_REQUIRED: {OperationState.PENDING, OperationState.DENIED},  # human approval or terminal rejection
     OperationState.RECOVERY_REQUIRED: {OperationState.COMMITTED, OperationState.COMPENSATING, OperationState.COMPENSATED},
     OperationState.COMMITTED: set(),
     OperationState.COMPENSATED: set(),
@@ -88,7 +88,7 @@ class QapeCreateOperation(Base):
         if target not in TRANSITIONS[current]:
             raise ValueError(f"Invalid QAPE transition: {current.value} -> {target.value}")
         if current == OperationState.REVIEW_REQUIRED and not human_authorized:
-            raise ValueError("Human authorization required; Phase 1E owns this workflow")
+            raise ValueError("Human authorization required for a review transition")
         if current == OperationState.DENIED and target == OperationState.PENDING:
             due = self.retry_after
             if due is None or due.replace(tzinfo=due.tzinfo or timezone.utc) > datetime.now(timezone.utc):

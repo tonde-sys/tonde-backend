@@ -38,6 +38,7 @@ from app.routers import (
     notifications,
     organizations,
     public,
+    qape_review,
     sync,
     tickets,
 )
@@ -186,6 +187,7 @@ async def record_request_metrics(request: Request, call_next):
 app.include_router(health.router)  # /health, /health/live, /health/ready, /health/detailed
 app.include_router(auth.router,            prefix="/api/v1/auth",          tags=["🔐 Auth"])
 app.include_router(tickets.router,         prefix="/api/v1/tickets",       tags=["🎫 Tickets"])
+app.include_router(qape_review.router,     prefix="/api/v1/qape",          tags=["QAPE Review"])
 app.include_router(sync.router,            prefix="/api/v1/sync",          tags=["🔄 Sync hors-ligne"])
 app.include_router(notifications.router,   prefix="/api/v1/notifications", tags=["🔔 Notifications"])
 app.include_router(organizations.router,   prefix="/api/v1/organizations", tags=["🏢 Organizations"])
