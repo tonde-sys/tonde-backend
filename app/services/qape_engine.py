@@ -1,7 +1,12 @@
 """QAPE deterministic decision engine. PostgreSQL is authoritative.
 
 Priorities: active restriction / daily quota / Redis hard denial > independent
-soft review signals > allow. Preflight happens before consuming Redis; the
+soft review signals > allow. An ordinary Redis limiter refusal lasts at least
+cooldown_seconds (or longer if the bucket/window requires it); an explicit
+outage block lasts hard_block_seconds. Daily quota
+resets at the next business midnight; persistent restrictions retain their own
+expiry and never get an additional automatic restriction. Preflight happens
+before consuming Redis; the
 transactional daily-quota check in TicketService remains the final race guard.
 No IP, device or shared kiosk is an individual abuse signal. In this release
 there are no business-approved thresholds for cancellations, absences, prior
@@ -99,7 +104,7 @@ class QapeDecisionEngine:
             if mode == 'TEMPORARY_BLOCK':
                 return Decision(DecisionCode.TEMPORARY_BLOCK, ('REDIS_UNAVAILABLE',),
                                 datetime.now(timezone.utc) + timedelta(
-                                    seconds=policy.config['risk']['cooldown_seconds']))
+                                    seconds=policy.config['risk']['hard_block_seconds']))
             return Decision(DecisionCode.REVIEW_REQUIRED, ('REDIS_UNAVAILABLE',))
         limits = policy.config['limits']
         arguments = dict(org_id=org_id, service_id=service_id, user_id=user_id,
@@ -108,6 +113,7 @@ class QapeDecisionEngine:
                          refill_seconds=limits['bucket_refill_seconds'],
                          window_seconds=600,
                          max_requests=limits['max_requests_per_10m'],
+                         # Lua also preserves the longer bucket/window retry.
                          cooldown_seconds=policy.config['risk']['cooldown_seconds'])
         try:
             result = await reserve(**arguments)

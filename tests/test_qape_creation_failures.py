@@ -1,6 +1,7 @@
 """Failure paths on disposable PostgreSQL 15 and Redis 7."""
 import os
 import uuid
+import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 import pytest
@@ -13,7 +14,7 @@ from app.models.organization import Organization
 from app.models.branch import Branch, Service
 from app.models.user import User
 from app.models.ticket import Ticket, TicketStatus
-from app.models.qape import AbusePolicy
+from app.models.qape import AbusePolicy, AbuseEvent
 from app.models.qape_operation import QapeCreateOperation, OperationState
 from app.schemas.ticket import CreateTicketRequest
 from app.services.ticket_service import TicketService
@@ -443,4 +444,52 @@ async def test_sigkill_after_lua_denied_before_postgres_decision():
         assert retried.value.status_code == 429
         await db.refresh(op)
         assert op.attempt_generation == 1
+    await engine.dispose()
+
+@pytest.mark.asyncio
+async def test_temporary_block_outage_expires_and_retries_same_intent():
+    if not os.getenv('PG_TEST_URL') or not os.getenv('QAPE_REDIS_TEST'):
+        pytest.skip('requires disposable PostgreSQL 15 and real Redis 7')
+    engine = create_async_engine(os.environ['PG_TEST_URL'])
+    sf = async_sessionmaker(engine, expire_on_commit=False)
+    async with sf() as db:
+        org = Organization(name='QAPE block test', slug=uuid.uuid4().hex, sector='other')
+        db.add(org); await db.flush()
+        branch = Branch(name='test', slug=uuid.uuid4().hex, sector='other', org_id=org.id,
+                        is_open=True, opens_at='00:00', closes_at='23:59')
+        db.add(branch); await db.flush()
+        svc = Service(name='test', org_id=org.id, branch_id=branch.id)
+        user = User(phone='+257' + str(uuid.uuid4().int % 10**8).zfill(8))
+        db.add_all([svc, user]); await db.flush()
+        cfg = config()
+        cfg['redis_unavailable'] = 'TEMPORARY_BLOCK'
+        cfg['risk']['hard_block_seconds'] = 1
+        cfg['risk']['cooldown_seconds'] = 1
+        db.add(AbusePolicy(org_id=org.id, service_id=svc.id, version=1,
+                           enabled=True, config=cfg))
+        await db.commit()
+        data = CreateTicketRequest(agency_id=branch.id, service_id=svc.id,
+                                   client_action_id='block_' + uuid.uuid4().hex)
+        with patch('app.core.redis.get_redis', new_callable=AsyncMock, side_effect=ConnectionError):
+            with pytest.raises(HTTPException) as denied:
+                await TicketService(db).create_ticket(data, user.id, None)
+        assert denied.value.status_code == 503
+        op = (await db.scalars(select(QapeCreateOperation).where(
+            QapeCreateOperation.client_action_id == data.client_action_id))).one()
+        assert op.state == OperationState.DENIED.value
+        assert op.decision_code == 'REDIS_UNAVAILABLE'
+        assert op.retry_after is not None
+        assert await db.scalar(select(func.count(Ticket.id)).where(Ticket.user_id == user.id)) == 0
+        with pytest.raises(HTTPException) as repeated:
+            await TicketService(db).create_ticket(data, user.id, None)
+        assert repeated.value.detail == denied.value.detail
+        await asyncio.sleep(1.1)
+        created = await TicketService(db).create_ticket(data, user.id, None)
+        assert created.id and op.attempt_generation == 1
+        audits = (await db.scalars(select(AbuseEvent).where(
+            AbuseEvent.event_type == 'QAPE_DECISION',
+            AbuseEvent.details['operation_id'].as_string() == op.id))).all()
+        assert sorted(row.decision for row in audits) == ['ALLOW', 'TEMPORARY_BLOCK']
+        assert await db.scalar(select(func.count(AbuseEvent.id)).where(
+            AbuseEvent.event_type == 'TICKET_CREATED', AbuseEvent.ticket_id == created.id)) == 1
     await engine.dispose()

@@ -75,6 +75,8 @@ async def test_redis_down_modes_and_audit_once(db_session):
                            ('REVIEW_REQUIRED', DecisionCode.REVIEW_REQUIRED),
                            ('TEMPORARY_BLOCK', DecisionCode.TEMPORARY_BLOCK)]:
         cfg = config() | {'redis_unavailable': mode}
+        cfg['risk']['hard_block_seconds'] = 37
+        cfg['risk']['cooldown_seconds'] = 5
         policy = AbusePolicy(org_id=org_id, service_id=service_id, version=1,
                              enabled=True, config=cfg)
         with patch('app.core.redis.get_redis', new_callable=AsyncMock, side_effect=ConnectionError):
@@ -83,7 +85,8 @@ async def test_redis_down_modes_and_audit_once(db_session):
                 attempt_generation=0)
         assert decision.code == expected and not decision.redis_reserved
         if mode == 'TEMPORARY_BLOCK':
-            assert decision.retry_after is not None
+            remaining = (decision.retry_after - datetime.now(timezone.utc)).total_seconds()
+            assert 35 <= remaining <= 37
         op = QapeCreateOperation(org_id=org_id, agency_id=agency_id, service_id=service_id,
             user_id=user_id, client_action_id='audit_' + uuid.uuid4().hex,
             operation_type='CREATE_TICKET', payload_hash='f'*64, attempt_generation=0)
@@ -107,7 +110,11 @@ async def test_real_postgres_and_redis_decision_priority():
     async with async_sessionmaker(engine_db, expire_on_commit=False)() as db:
         org, _, svc, user, _ = await world(db)
         cfg = config()
-        cfg['limits']['max_requests_per_10m'] = 1
+        cfg['limits']['max_requests_per_10m'] = 100
+        cfg['limits']['bucket_capacity'] = 1
+        cfg['limits']['bucket_refill_seconds'] = 5
+        cfg['risk']['hard_block_seconds'] = 37
+        cfg['risk']['cooldown_seconds'] = 5
         policy = AbusePolicy(org_id=org.id, service_id=svc.id, version=1,
                              enabled=True, config=cfg)
         db.add(policy); await db.commit()
@@ -120,4 +127,83 @@ async def test_real_postgres_and_redis_decision_priority():
         assert one.code == DecisionCode.ALLOW and one.redis_reserved
         assert two.code == DecisionCode.TEMPORARY_BLOCK
         assert two.reason_codes == ('RATE_LIMITED',) and two.retry_after
+        ordinary_delay = (two.retry_after - datetime.now(timezone.utc)).total_seconds()
+        assert 4 <= ordinary_delay <= 6  # cooldown=5, NOT hard_block=37
+        # A longer technical sliding-window wait must still win over cooldown.
+        from app.models.user import User
+        window_user = User(phone='+257' + str(uuid.uuid4().int % 10**8).zfill(8))
+        db.add(window_user); await db.flush()
+        window_cfg = config()
+        window_cfg['limits']['bucket_capacity'] = 10
+        window_cfg['limits']['max_requests_per_10m'] = 1
+        window_cfg['risk']['cooldown_seconds'] = 5
+        window_cfg['risk']['hard_block_seconds'] = 37
+        window_policy = AbusePolicy(org_id=org.id, service_id=svc.id,
+            config=window_cfg, version=2, enabled=False)
+        window_base = dict(policy=window_policy, org_id=org.id, service_id=svc.id,
+                           user_id=window_user.id)
+        assert (await decision_engine.admit(**window_base,
+            reservation_id=str(uuid.uuid4()), attempt_generation=0)).code == DecisionCode.ALLOW
+        window_denial = await decision_engine.admit(**window_base,
+            reservation_id=str(uuid.uuid4()), attempt_generation=0)
+        assert window_denial.code == DecisionCode.TEMPORARY_BLOCK
+        assert (window_denial.retry_after - datetime.now(timezone.utc)).total_seconds() > 500
     await engine_db.dispose()
+
+@pytest.mark.asyncio
+async def test_business_day_original_service_and_provenance(db_session):
+    """Quota counts creation evidence, not mutable ticket status/service."""
+    from app.models.branch import Service
+    from app.models.ticket import Ticket, TicketStatus
+    db = db_session
+    org, _, svc, user, branch = await world(db)
+    target = Service(name='Target', org_id=org.id, branch_id=branch.id)
+    db.add(target); await db.flush()
+    cfg = config('Africa/Bujumbura')
+    cfg['limits']['max_tickets_per_day'] = 1
+    policy = AbusePolicy(org_id=org.id, service_id=svc.id, version=1,
+                         enabled=True, config=cfg)
+    db.add(policy)
+    # Jan 1 22:30 UTC belongs to Jan 2 in the institution's business timezone.
+    created = datetime(2026, 1, 1, 22, 30, tzinfo=timezone.utc)
+    ticket = Ticket(org_id=org.id, agency_id=branch.id, service_id=svc.id,
+                    user_id=user.id, number='QAPE-DAY-1', sequence=1,
+                    queue_sequence=1, status=TicketStatus.DONE, created_at=created)
+    db.add(ticket); await db.flush()
+    db.add(AbuseEvent(org_id=org.id, service_id=svc.id, user_id=user.id,
+        ticket_id=ticket.id, request_id=uuid.uuid4().hex, event_type='TICKET_CREATED',
+        provenance='LIVE', decision='ALLOW', reason_codes=[], policy_version=1,
+        created_at=created, details={'origin_service_id': svc.id}))
+    inferred_ticket = Ticket(org_id=org.id, agency_id=branch.id, service_id=svc.id,
+        user_id=user.id, number='QAPE-DAY-2', sequence=2, queue_sequence=2,
+        status=TicketStatus.CANCELLED, created_at=created-timedelta(minutes=10))
+    db.add(inferred_ticket); await db.flush()
+    db.add(AbuseEvent(org_id=org.id, service_id=svc.id, user_id=user.id,
+        ticket_id=inferred_ticket.id, request_id=uuid.uuid4().hex,
+        event_type='TICKET_CREATED', provenance='HISTORICAL_INFERRED',
+        decision=None, reason_codes=[], created_at=created-timedelta(minutes=10), details={}))
+    await db.commit()
+    org_id, source_id, target_id, user_id = org.id, svc.id, target.id, user.id
+    engine = QapeDecisionEngine(db)
+    from app.services.qape_data import EventRepository
+    assert await EventRepository(db).count_created(org_id, source_id,
+        datetime(2026, 1, 1, 22, tzinfo=timezone.utc),
+        datetime(2026, 1, 2, 22, tzinfo=timezone.utc), user_id=user_id) == 1
+    assert (await engine.preflight(policy=policy, org_id=org_id, service_id=source_id,
+        user_id=user_id, now=datetime(2026, 1, 1, 21, 30, tzinfo=timezone.utc))).code == DecisionCode.ALLOW
+    blocked = await engine.preflight(policy=policy, org_id=org_id, service_id=source_id,
+        user_id=user_id, now=datetime(2026, 1, 1, 23, 0, tzinfo=timezone.utc))
+    assert blocked.code == DecisionCode.TEMPORARY_BLOCK
+    assert blocked.reason_codes == ('DAILY_QUOTA_REACHED',)
+    assert blocked.retry_after == datetime(2026, 1, 2, 22, 0, tzinfo=timezone.utc)
+    ticket.service_id = target_id  # transfer changes ticket, never creation evidence
+    ticket.status = TicketStatus.CANCELLED
+    await db.commit()
+    assert (await engine.preflight(policy=policy, org_id=org_id, service_id=source_id,
+        user_id=user_id, now=datetime(2026, 1, 1, 23, 0, tzinfo=timezone.utc))).code == DecisionCode.TEMPORARY_BLOCK
+    target_policy = AbusePolicy(org_id=org_id, service_id=target_id, version=1,
+                                enabled=True, config=cfg)
+    assert (await engine.preflight(policy=target_policy, org_id=org_id, service_id=target_id,
+        user_id=user_id, now=datetime(2026, 1, 1, 23, 0, tzinfo=timezone.utc))).code == DecisionCode.ALLOW
+    assert (await engine.preflight(policy=policy, org_id=org_id, service_id=source_id,
+        user_id=user_id, now=datetime(2026, 1, 2, 22, 0, tzinfo=timezone.utc))).code == DecisionCode.ALLOW
