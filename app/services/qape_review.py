@@ -42,14 +42,14 @@ class QapeReviewService:
         return {'total': total, 'page': page, 'page_size': page_size, 'items': [
             {'operation_id': row.id, 'user_id': row.user_id, 'org_id': row.org_id,
              'agency_id': row.agency_id, 'service_id': row.service_id,
-             'reason_code': row.decision_code,
+             'reason_code': row.decision_code, 'review_generation': row.review_generation,
              'reason_codes': list(row.response_snapshot.get('reason_codes', []))
                  if isinstance(row.response_snapshot, dict) else [],
              'policy_version': row.policy_version, 'created_at': row.created_at}
             for row in rows]}
 
     async def decide(self, actor: User, org_id: str, operation_id: str,
-                     action: str, reason: str) -> dict:
+                     action: str, reason: str, review_generation: int) -> dict:
         if not isinstance(reason, str):
             raise HTTPException(422, detail={'code': 'INVALID_REVIEW_DECISION'})
         reason = reason.strip()
@@ -58,27 +58,31 @@ class QapeReviewService:
         # PostgreSQL row lock serializes staff decisions and client replay.
         row = (await self.db.scalars(select(QapeCreateOperation).where(
             QapeCreateOperation.id == operation_id,
-            QapeCreateOperation.org_id == org_id).with_for_update())).first()
+            QapeCreateOperation.org_id == org_id).with_for_update()
+            .execution_options(populate_existing=True))).first()
         if row is None:
             raise HTTPException(404, detail={'code': 'QAPE_OPERATION_NOT_FOUND'})
         await self._authorize(actor, org_id, row.agency_id)
-        audit_id = hashlib.sha256(f'qape-human-review:v1:{row.id}'.encode()).hexdigest()
+        if actor.id == row.user_id:
+            raise HTTPException(403, detail={'code': 'QAPE_SELF_REVIEW_FORBIDDEN'})
+        if type(review_generation) is not int or review_generation < 1:
+            raise HTTPException(422, detail={'code': 'INVALID_REVIEW_GENERATION'})
+        if review_generation != row.review_generation:
+            raise HTTPException(409, detail={'code': 'STALE_REVIEW_GENERATION'})
+        # Legacy generation 1 keeps its original immutable audit identity.
+        legacy_id = hashlib.sha256(f'qape-human-review:v1:{row.id}'.encode()).hexdigest()
+        audit_id = hashlib.sha256(
+            f'qape-human-review:v2:{row.id}:{review_generation}'.encode()).hexdigest()
         prior = (await self.db.scalars(select(AbuseEvent).where(
             AbuseEvent.org_id == org_id, AbuseEvent.event_type == 'QAPE_HUMAN_REVIEW',
-            AbuseEvent.request_id == audit_id))).first()
+            (AbuseEvent.request_id.in_([audit_id, legacy_id]) if review_generation == 1
+             else AbuseEvent.request_id == audit_id)))).first()
         if prior is not None:
             if prior.decision != action or prior.details.get('actor_id') != actor.id or prior.details.get('reason') != reason:
                 raise HTTPException(409, detail={'code': 'REVIEW_ALREADY_DECIDED'})
-            # If a fresh infrastructure review followed approval, the same
-            # authorized agent can release that review without adding an audit.
-            if action == 'APPROVE' and row.state == OperationState.REVIEW_REQUIRED.value:
-                row.transition(OperationState.PENDING, human_authorized=True)
-                row.response_status = row.response_snapshot = row.decision_code = None
-                row.retry_after = row.lease_owner = row.lease_expires_at = None
-                row.reservation_deadline = row.reservation_capacity = None
-                await self.db.commit()
             return {'operation_id': row.id, 'decision': action, 'state': row.state,
-                    'actor_id': actor.id, 'decided_at': prior.created_at}
+                    'actor_id': actor.id, 'decided_at': prior.created_at,
+                    'review_generation': review_generation}
         if row.state != OperationState.REVIEW_REQUIRED.value or row.reservation_id is not None:
             raise HTTPException(409, detail={'code': 'REVIEW_NOT_PENDING'})
         target = OperationState.PENDING if action == 'APPROVE' else OperationState.DENIED
@@ -96,9 +100,13 @@ class QapeReviewService:
         self.db.add(AbuseEvent(org_id=org_id, service_id=row.service_id,
             user_id=row.user_id, ticket_id=None, request_id=audit_id,
             event_type='QAPE_HUMAN_REVIEW', provenance='LIVE', decision=action,
+            review_audit_version=2, review_operation_id=row.id,
+            review_generation=review_generation,
             reason_codes=['HUMAN_APPROVED' if action == 'APPROVE' else 'HUMAN_REJECTED'],
             policy_version=row.policy_version, created_at=now,
-            details={'operation_id': row.id, 'actor_id': actor.id, 'reason': reason}))
+            details={'operation_id': row.id, 'actor_id': actor.id, 'reason': reason,
+                     'review_generation': review_generation}))
         await self.db.commit()
         return {'operation_id': row.id, 'decision': action, 'state': row.state,
-                'actor_id': actor.id, 'decided_at': now}
+                'actor_id': actor.id, 'decided_at': now,
+                'review_generation': review_generation}

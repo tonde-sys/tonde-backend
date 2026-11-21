@@ -133,9 +133,13 @@ class QapeDecisionEngine:
         """
         from sqlalchemy import select
         event_type = 'QAPE_DECISION'
-        identity = hashlib.sha256(
-            f'{operation.id}:{operation.attempt_generation}:{decision.code.value}'.encode()
-        ).hexdigest()
+        # Review episodes need distinct IDs even without a new Redis attempt.
+        identity_source = (
+            f'qape-decision-review:v2:{operation.id}:{operation.review_generation}:{decision.code.value}'
+            if decision.code == DecisionCode.REVIEW_REQUIRED else
+            f'{operation.id}:{operation.attempt_generation}:{decision.code.value}'
+        )
+        identity = hashlib.sha256(identity_source.encode()).hexdigest()
         exists = (await self.db.scalars(select(AbuseEvent.id).where(
             AbuseEvent.org_id == operation.org_id,
             AbuseEvent.event_type == event_type,
@@ -147,5 +151,6 @@ class QapeDecisionEngine:
             event_type=event_type, provenance='LIVE', decision=decision.code.value,
             reason_codes=list(decision.reason_codes), policy_version=operation.policy_version,
             created_at=datetime.now(timezone.utc),
-            details={'operation_id': operation.id, 'attempt_generation': operation.attempt_generation}))
+            details={'operation_id': operation.id, 'attempt_generation': operation.attempt_generation,
+                     'review_generation': operation.review_generation}))
         await self.db.flush()

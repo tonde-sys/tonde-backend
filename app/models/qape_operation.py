@@ -52,6 +52,7 @@ class QapeCreateOperation(Base):
         ForeignKeyConstraint(["service_id", "org_id"], ["services.id", "services.org_id"], name="fk_qape_operation_service_org"),
         Index("ix_qape_operation_recovery", "state", "lease_expires_at"),
         CheckConstraint("attempt_generation >= 0 AND lease_generation >= 0", name="ck_qape_operation_generation"),
+        CheckConstraint("review_generation >= 0", name="ck_qape_review_generation"),
         CheckConstraint("state IN ('PENDING','RESERVED','REVIEW_REQUIRED','DENIED','COMMITTING','COMMITTED','COMPENSATING','COMPENSATED','RECOVERY_REQUIRED')", name="ck_qape_operation_state"),
         CheckConstraint("state <> 'COMMITTED' OR ticket_id IS NOT NULL", name="ck_qape_committed_ticket"),
     )
@@ -82,6 +83,9 @@ class QapeCreateOperation(Base):
     response_snapshot: Mapped[dict | None] = mapped_column(JSON().with_variant(JSONB(), "postgresql"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    # Kept last: revision 017 builds the table from the live model; existing 017
+    # installations add this column last in 018. Both paths then match exactly.
+    review_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     def transition(self, target: OperationState, *, human_authorized: bool = False) -> None:
         current = OperationState(self.state)
@@ -93,4 +97,6 @@ class QapeCreateOperation(Base):
             due = self.retry_after
             if due is None or due.replace(tzinfo=due.tzinfo or timezone.utc) > datetime.now(timezone.utc):
                 raise ValueError("Denial is not eligible for retry yet")
+        if target == OperationState.REVIEW_REQUIRED:
+            self.review_generation = (self.review_generation or 0) + 1
         self.state = target.value

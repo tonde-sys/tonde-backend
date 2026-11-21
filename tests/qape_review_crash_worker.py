@@ -21,7 +21,7 @@ async def main():
                 await asyncio.sleep(120)
         db.commit = hold_after_review_commit
         await QapeReviewService(db).decide(await db.get(User, actor_id),
-                                           org_id, operation_id, 'REJECT', 'Refus motivé')
+                                           org_id, operation_id, 'REJECT', 'Refus motivé', 1)
     await engine.dispose()
 
 

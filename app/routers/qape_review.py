@@ -12,6 +12,7 @@ router = APIRouter()
 
 
 class HumanReviewInput(BaseModel):
+    review_generation: int = Field(ge=1)
     action: Literal['APPROVE', 'REJECT']
     reason: str = Field(min_length=1, max_length=500)
 
@@ -40,4 +41,4 @@ async def decide_review(org_id: str, operation_id: str, body: HumanReviewInput,
                         actor: User = Depends(get_current_supervisor),
                         db: AsyncSession = Depends(get_db)):
     return await QapeReviewService(db).decide(actor, org_id, operation_id,
-                                               body.action, body.reason)
+                                               body.action, body.reason, body.review_generation)

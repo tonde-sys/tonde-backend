@@ -106,19 +106,19 @@ async def test_review_scope_reject_and_idempotent_audit():
                 await review.pending(actor, org, branch, None, 1, 10)
             assert forbidden.value.status_code == 403
             with pytest.raises(HTTPException) as forbidden:
-                await review.decide(actor, org, op_id, 'REJECT', 'Justification')
+                await review.decide(actor, org, op_id, 'REJECT', 'Justification', 1)
             assert forbidden.value.status_code == 403
         with pytest.raises(HTTPException) as missing:
-            await review.decide(staff, other, op_id, 'REJECT', 'Justification')
+            await review.decide(staff, other, op_id, 'REJECT', 'Justification', 1)
         assert missing.value.status_code == 404
         with pytest.raises(HTTPException) as invalid:
-            await review.decide(staff, org, op_id, 'REJECT', '  ')
+            await review.decide(staff, org, op_id, 'REJECT', '  ', 1)
         assert invalid.value.status_code == 422
-        result = await review.decide(staff, org, op_id, 'REJECT', 'Contrôle manuel')
+        result = await review.decide(staff, org, op_id, 'REJECT', 'Contrôle manuel', 1)
         assert result['state'] == OperationState.DENIED.value
-        assert (await review.decide(staff, org, op_id, 'REJECT', 'Contrôle manuel'))['decided_at'] == result['decided_at']
+        assert (await review.decide(staff, org, op_id, 'REJECT', 'Contrôle manuel', 1))['decided_at'] == result['decided_at']
         with pytest.raises(HTTPException) as conflicting:
-            await review.decide(staff, org, op_id, 'APPROVE', 'Contrôle manuel')
+            await review.decide(staff, org, op_id, 'APPROVE', 'Contrôle manuel', 1)
         assert conflicting.value.status_code == 409
         audit = (await db.scalars(select(AbuseEvent).where(
             AbuseEvent.event_type == 'QAPE_HUMAN_REVIEW',
@@ -146,19 +146,26 @@ async def test_review_approve_client_replays_with_controls_and_one_ticket():
         data, op_id = await make_review(db, ids)
         review = QapeReviewService(db)
         staff = await db.get(User, agent)
-        decision = await review.decide(staff, org, op_id, 'APPROVE', 'Identité vérifiée')
+        decision = await review.decide(staff, org, op_id, 'APPROVE', 'Identité vérifiée', 1)
         assert decision['state'] == OperationState.PENDING.value
         assert await db.scalar(select(func.count(Ticket.id)).where(Ticket.user_id == client)) == 0
         with pytest.raises(HTTPException) as mismatch:
             await TicketService(db).create_ticket(data.model_copy(update={'priority': 'vip'}), client, None)
         assert mismatch.value.detail['code'] == 'IDEMPOTENCY_PAYLOAD_CONFLICT'
-        # Approval does not override a still unavailable Redis. A fresh review
-        # is required; repeating the same human action adds no second audit.
+        # A continued outage opens a NEW review; the old request is stale.
         with patch('app.core.redis.get_redis', new_callable=AsyncMock, side_effect=ConnectionError):
             with pytest.raises(HTTPException) as still_down:
                 await TicketService(db).create_ticket(data, client, None)
         assert still_down.value.status_code == 202
-        await review.decide(staff, org, op_id, 'APPROVE', 'Identité vérifiée')
+        with pytest.raises(HTTPException) as stale:
+            await review.decide(staff, org, op_id, 'APPROVE', 'Identité vérifiée', 1)
+        assert stale.value.detail['code'] == 'STALE_REVIEW_GENERATION'
+        assert (await db.get(QapeCreateOperation, op_id)).review_generation == 2
+        assert await db.scalar(select(func.count(AbuseEvent.id)).where(
+            AbuseEvent.event_type == 'QAPE_DECISION',
+            AbuseEvent.decision == 'REVIEW_REQUIRED',
+            AbuseEvent.details['operation_id'].as_string() == op_id)) == 2
+        await review.decide(staff, org, op_id, 'APPROVE', 'Identité vérifiée', 2)
         created = await TicketService(db).create_ticket(data, client, None)
         assert created.id
         assert (await TicketService(db).create_ticket(data, client, None)).id == created.id
@@ -166,7 +173,7 @@ async def test_review_approve_client_replays_with_controls_and_one_ticket():
             AbuseEvent.event_type == 'TICKET_CREATED', AbuseEvent.ticket_id == created.id)) == 1
         assert await db.scalar(select(func.count(AbuseEvent.id)).where(
             AbuseEvent.event_type == 'QAPE_HUMAN_REVIEW',
-            AbuseEvent.details['operation_id'].as_string() == op_id)) == 1
+            AbuseEvent.details['operation_id'].as_string() == op_id)) == 2
     await engine.dispose()
 
 
@@ -191,7 +198,7 @@ async def test_two_agents_only_one_human_decision():
         async with sf() as session:
             try:
                 return await QapeReviewService(session).decide(
-                    await session.get(User, actor_id), org, op_id, action, 'Vérifié')
+                    await session.get(User, actor_id), org, op_id, action, 'Vérifié', 1)
             except HTTPException as error:
                 return error
     results = await asyncio.gather(act(first, 'APPROVE'), act(second_id, 'REJECT'))
@@ -214,7 +221,7 @@ async def test_approval_rechecks_restriction_and_does_not_create():
         org, _, branch, svc, client, agent, *_ = ids
         data, op_id = await make_review(db, ids)
         await QapeReviewService(db).decide(await db.get(User, agent), org,
-                                           op_id, 'APPROVE', 'Vérification faite')
+                                           op_id, 'APPROVE', 'Vérification faite', 1)
         now = datetime.now(timezone.utc)
         db.add(AbuseRestriction(org_id=org, service_id=svc, user_id=client,
             restriction_type='TEMPORARY_BLOCK', reason_code='EXPLICIT_RESTRICTION',
@@ -241,7 +248,7 @@ async def test_approval_then_business_failure_preserves_recovery():
         org, _, branch, svc, client, agent, *_ = ids
         data, op_id = await make_review(db, ids)
         await QapeReviewService(db).decide(await db.get(User, agent), org,
-                                           op_id, 'APPROVE', 'Vérification faite')
+                                           op_id, 'APPROVE', 'Vérification faite', 1)
         service = await db.get(Service, svc)
         service.is_active = False
         await db.commit()
@@ -278,11 +285,11 @@ async def test_review_commit_ack_lost_is_idempotent_across_sessions():
         with patch.object(db, 'commit', commit_then_lose_ack):
             with pytest.raises(ConnectionError):
                 await QapeReviewService(db).decide(await db.get(User, agent), org,
-                                                   op_id, 'REJECT', 'Motif de sécurité')
+                                                   op_id, 'REJECT', 'Motif de sécurité', 1)
     async with sf() as db:
         actor = await db.get(User, agent)
         replay = await QapeReviewService(db).decide(actor, org, op_id,
-                                                    'REJECT', 'Motif de sécurité')
+                                                    'REJECT', 'Motif de sécurité', 1)
         assert replay['state'] == OperationState.DENIED.value
         assert await db.scalar(select(func.count(AbuseEvent.id)).where(
             AbuseEvent.event_type == 'QAPE_HUMAN_REVIEW',
@@ -316,14 +323,17 @@ async def test_review_http_auth_and_branch_scope():
                 app.dependency_overrides[get_current_supervisor] = provide_actor
                 page = await http.get(url, params={'page': 1, 'page_size': 1})
                 assert page.status_code == 200 and page.json()['total'] == 1
-                blank = await http.post(decision_url, json={'action': 'APPROVE', 'reason': '  '})
+                assert page.json()['items'][0]['review_generation'] == 1
+                blank = await http.post(decision_url, json={'action': 'APPROVE', 'reason': '  ',
+                                                            'review_generation': 1})
                 assert blank.status_code == 422
                 async def provide_outside():
                     return await db.get(User, outside)
                 app.dependency_overrides[get_current_supervisor] = provide_outside
                 assert (await http.get(url)).status_code == 403
                 assert (await http.post(decision_url, json={
-                    'action': 'REJECT', 'reason': 'Contrôle'})).status_code == 403
+                    'action': 'REJECT', 'reason': 'Contrôle',
+                    'review_generation': 1})).status_code == 403
                 async def provide_low():
                     return await db.get(User, low)
                 app.dependency_overrides[get_current_supervisor] = provide_low
@@ -358,7 +368,7 @@ async def test_review_sigkill_after_decision_commit_recovers_replay():
         assert (await db.get(QapeCreateOperation, op_id)).state == OperationState.DENIED.value
         actor = await db.get(User, agent)
         repeated = await QapeReviewService(db).decide(actor, org, op_id,
-                                                       'REJECT', 'Refus motivé')
+                                                       'REJECT', 'Refus motivé', 1)
         assert repeated['state'] == OperationState.DENIED.value
         assert await db.scalar(select(func.count(AbuseEvent.id)).where(
             AbuseEvent.event_type == 'QAPE_HUMAN_REVIEW',
@@ -379,7 +389,7 @@ async def test_second_review_concurrent_same_approval_and_client_replay_once():
         org, _, branch, svc, client, agent, *_ = ids
         data, op_id = await make_review(db, ids)
         staff = await db.get(User, agent)
-        await QapeReviewService(db).decide(staff, org, op_id, 'APPROVE', 'Vérifié')
+        await QapeReviewService(db).decide(staff, org, op_id, 'APPROVE', 'Vérifié', 1)
         with patch('app.core.redis.get_redis', new_callable=AsyncMock, side_effect=ConnectionError):
             with pytest.raises(HTTPException) as still_down:
                 await TicketService(db).create_ticket(data, client, None)
@@ -387,7 +397,7 @@ async def test_second_review_concurrent_same_approval_and_client_replay_once():
     async def approve():
         async with sf() as session:
             return await QapeReviewService(session).decide(
-                await session.get(User, agent), org, op_id, 'APPROVE', 'Vérifié')
+                await session.get(User, agent), org, op_id, 'APPROVE', 'Vérifié', 2)
     approvals = await asyncio.gather(approve(), approve())
     assert all(result['state'] == OperationState.PENDING.value for result in approvals)
     async def replay():
@@ -406,11 +416,37 @@ async def test_second_review_concurrent_same_approval_and_client_replay_once():
             Ticket.user_id == client, Ticket.client_action_id == data.client_action_id)) == 1
         assert await db.scalar(select(func.count(AbuseEvent.id)).where(
             AbuseEvent.event_type == 'QAPE_HUMAN_REVIEW',
-            AbuseEvent.details['operation_id'].as_string() == op_id)) == 1
+            AbuseEvent.details['operation_id'].as_string() == op_id)) == 2
         from app.core.redis import get_redis
         from app.services.qape_reservation import _keys
         operation = await db.get(QapeCreateOperation, op_id)
         keys, _ = _keys(org, svc, client, operation.reservation_id,
                         operation.attempt_generation)
         assert await (await get_redis()).zcard(keys[1]) == 1
+    await engine.dispose()
+
+@pytest.mark.asyncio
+async def test_self_review_denied_for_both_actions_and_other_supervisor_allowed():
+    if not os.getenv('PG_TEST_URL'):
+        pytest.skip('requires disposable PostgreSQL 15')
+    engine = create_async_engine(os.environ['PG_TEST_URL'])
+    sf = async_sessionmaker(engine, expire_on_commit=False)
+    async with sf() as db:
+        ids = await setup_review(db)
+        org, _, branch, svc, client, agent, *_ = ids
+        _, op_id = await make_review(db, ids)
+        requester = await db.get(User, client)
+        requester.role = UserRole.SUPERVISOR
+        requester.org_id = org
+        db.add(Employee(org_id=org, agency_id=branch, user_id=client,
+                        role=UserRole.SUPERVISOR, status=EmployeeStatus.ACTIVE))
+        await db.commit()
+        review = QapeReviewService(db)
+        for action in ('APPROVE', 'REJECT'):
+            with pytest.raises(HTTPException) as forbidden:
+                await review.decide(requester, org, op_id, action, 'Contrôle', 1)
+            assert forbidden.value.status_code == 403
+            assert forbidden.value.detail['code'] == 'QAPE_SELF_REVIEW_FORBIDDEN'
+        assert (await review.decide(await db.get(User, agent), org, op_id,
+                                    'APPROVE', 'Contrôle', 1))['state'] == 'PENDING'
     await engine.dispose()

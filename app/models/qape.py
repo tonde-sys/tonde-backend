@@ -76,6 +76,10 @@ class AbuseEvent(Base):
                              name="fk_abuse_event_service_org"),
         Index("ix_abuse_event_scope_time", "org_id", "service_id", "created_at"),
         Index("ix_abuse_event_user_time", "org_id", "user_id", "created_at"),
+        Index("uq_qape_human_review_cycle", "review_operation_id", "review_generation", unique=True,
+              postgresql_where=text("event_type = 'QAPE_HUMAN_REVIEW' AND review_audit_version = 2"),
+              sqlite_where=text("event_type = 'QAPE_HUMAN_REVIEW' AND review_audit_version = 2")),
+        CheckConstraint("(review_audit_version IS NULL AND review_operation_id IS NULL AND review_generation IS NULL) OR (event_type = 'QAPE_HUMAN_REVIEW' AND review_audit_version IS NOT NULL AND review_audit_version = 2 AND review_operation_id IS NOT NULL AND review_generation IS NOT NULL AND review_generation > 0 AND request_id IS NOT NULL)", name="ck_qape_review_v2_complete"),
         Index("uq_abuse_ticket_created", "ticket_id", unique=True,
               postgresql_where=text("event_type = 'TICKET_CREATED' AND ticket_id IS NOT NULL"),
               sqlite_where=text("event_type = 'TICKET_CREATED' AND ticket_id IS NOT NULL")),
@@ -99,4 +103,7 @@ class AbuseEvent(Base):
     reason_codes: Mapped[list] = mapped_column(JSON_DOCUMENT, nullable=False)
     policy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    review_audit_version: Mapped[int | None] = mapped_column(Integer)
+    review_operation_id: Mapped[str | None] = mapped_column(String(36))
+    review_generation: Mapped[int | None] = mapped_column(Integer)
     details: Mapped[dict] = mapped_column("metadata", JSON_DOCUMENT, nullable=False)
