@@ -610,7 +610,6 @@ class EtaEstimator:
             select(EtaPrediction.ticket_id.label("ticket_id"), func.max(EtaPrediction.version).label("version"))
             .where(
                 EtaPrediction.org_id == service.org_id,
-                EtaPrediction.service_id == service.id,
                 EtaPrediction.ticket_id.in_(ticket_ids),
             )
             .group_by(EtaPrediction.ticket_id)

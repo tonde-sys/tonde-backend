@@ -810,7 +810,9 @@ async def test_call_next_publishes_realtime_events_from_service(ticket_service, 
     second = await _new_ticket(ticket_service, agency, service, "client-2")
     agency_id = agency.id
 
-    with patch("app.services.ticket_service.publish_event", new_callable=AsyncMock) as publish:
+    publish = AsyncMock()
+    with patch("app.services.ticket_service.publish_event", new=publish), \
+         patch("app.services.outbox.publish_event", new=publish):
         await _call(ticket_service, org, agency, service, counter, agent)
 
     events = {call.args[1]["type"]: call.args[1] for call in publish.call_args_list}

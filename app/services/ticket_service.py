@@ -22,7 +22,7 @@ import math
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -2788,7 +2788,10 @@ class TicketService:
                 .where(Service.id == service_id)
             )
             if org_id:
-                query = query.where(Branch.org_id == org_id)
+                # A legacy branch may have lost its org link while its service
+                # still carries the ticket's tenant. Keep display names in that
+                # case without exposing a different tenant's service row.
+                query = query.where(or_(Branch.org_id == org_id, Service.org_id == org_id))
             row = (await self.db.execute(query)).first()
         except Exception as exc:  # noqa: BLE001 — l'affichage ne casse pas la lecture
             logger.warning(
