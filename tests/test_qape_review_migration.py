@@ -25,7 +25,8 @@ def _admin_url():
 
 
 def _database_url(db_name):
-    return str(_admin_url().set(database=db_name))
+    # URL.__str__ masks credentials; Alembic needs the actual password.
+    return _admin_url().set(database=db_name).render_as_string(hide_password=False)
 
 
 def _migration(db_url, revision, *, authorize=False):
@@ -84,18 +85,18 @@ async def test_legacy_migration_preserves_audit_or_blocks(
         pytest.skip('requires disposable PostgreSQL 15 and Redis 7')
     from sqlalchemy import create_engine
     name = 'qape018_migration_' + uuid.uuid4().hex
-    admin = create_engine(str(_admin_url()).replace('+asyncpg', '+psycopg2'),
+    admin = create_engine(_admin_url().set(drivername='postgresql+psycopg2'),
                           isolation_level='AUTOCOMMIT')
     try:
         with admin.connect() as conn:
             conn.execute(text(f'CREATE DATABASE "{name}"'))
         url = _database_url(name)
         first = _migration(url, '017_qape_create_operations')
-        assert first.returncode == 0, first.stderr
+        assert first.returncode == 0, "Alembic 017 failed on disposable database"
         op_id, audit_id = await _seed_legacy(url, state=state,
             actor_is_requester=actor_is_requester, action=action)
         second = _migration(url, 'head', authorize=True)
-        assert (second.returncode != 0) == blocked, second.stderr
+        assert (second.returncode != 0) == blocked, "Unexpected Alembic 018 result"
         engine = create_async_engine(url)
         try:
             async with engine.connect() as conn:
@@ -128,14 +129,14 @@ async def test_human_code_without_any_audit_blocks_migration(code):
         pytest.skip('requires disposable PostgreSQL 15 and Redis 7')
     from sqlalchemy import create_engine
     name = 'qape018_no_audit_' + uuid.uuid4().hex
-    admin = create_engine(str(_admin_url()).replace('+asyncpg', '+psycopg2'),
+    admin = create_engine(_admin_url().set(drivername='postgresql+psycopg2'),
                           isolation_level='AUTOCOMMIT')
     try:
         with admin.connect() as conn:
             conn.execute(text(f'CREATE DATABASE "{name}"'))
         url = _database_url(name)
         first = _migration(url, '017_qape_create_operations')
-        assert first.returncode == 0, first.stderr
+        assert first.returncode == 0, "Alembic 017 failed on disposable database"
         engine = create_async_engine(url)
         try:
             async with async_sessionmaker(engine, expire_on_commit=False)() as db:
@@ -153,7 +154,7 @@ async def test_human_code_without_any_audit_blocks_migration(code):
             await engine.dispose()
         second = _migration(url, 'head', authorize=True)
         assert second.returncode != 0, 'missing human audit must block migration'
-        assert 'Ambiguous QAPE human audit' in second.stderr
+        assert bool('Ambiguous QAPE human audit' in second.stderr), 'Expected audit guard did not fire'
         engine = create_async_engine(url)
         try:
             async with engine.connect() as conn:
