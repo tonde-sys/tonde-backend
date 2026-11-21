@@ -47,6 +47,7 @@ class CounterResponse(BaseModel):
     description: str | None
     is_open: bool
     is_active: bool
+    is_paused: bool = False
     current_ticket_id: str | None
     created_at: datetime
     updated_at: datetime

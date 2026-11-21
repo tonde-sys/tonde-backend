@@ -235,7 +235,8 @@ async def test_branch_display_shows_counters_and_waiting_counts(api, db_session)
     assert data["counters"] == [{"id": counter.id, "name": "Guichet 1", "is_open": True, "now_serving": "A-001"}]
     assert data["services"][0]["waiting"] == 1
     assert data["services"][0]["last_called_number"] == "A-001"
-    assert data["services"][0]["estimated_wait_minutes"] == 5, "un nouvel arrivant aurait 1 personne devant"
+    # Le nouvel arrivant attend le ticket déjà appelé puis celui encore en file.
+    assert data["services"][0]["estimated_wait_minutes"] == 10
     assert "phone" not in response.text and "user" not in response.text
 
 

@@ -5,14 +5,14 @@ Un Counter (guichet) est le point physique où un agent
 sert les clients. Chaque guichet appartient à une Branch (agence)
 et à une Organisation.
 
-Un guichet a DEUX états seulement, portés par deux colonnes distinctes :
+Un guichet porte son état d'activité, d'ouverture et de pause :
   - `is_open`   : le guichet accepte des tickets (ouvert / fermé) ;
   - `is_active` : le guichet existe (désactivé = retiré du service).
 
-Il n'existe PAS d'état « en pause » : fermer un guichet (`is_open = false`)
-n'annule pas le ticket en cours, il empêche seulement d'en appeler de
-nouveaux. Un besoin de pause sans libérer le ticket devrait introduire un
-champ dédié — ne pas déduire une pause de `is_open`.
+La pause est distincte de la fermeture : un guichet en pause ne reçoit pas
+de nouveau ticket. Un ticket déjà en service doit être terminé ou interrompu
+avant de mettre le guichet en pause, afin de ne pas compter le temps de pause
+comme une durée de traitement.
 Le champ current_ticket_id stocke le ticket en cours de service.
 """
 import uuid
@@ -61,6 +61,8 @@ class Counter(Base):
     # ── Statut ────────────────────────────────────────────────
     is_open: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # En pause = aucune nouvelle affectation; un ticket déjà en service doit d'abord être clôturé.
+    is_paused: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
     # ── Dates ─────────────────────────────────────────────────
     created_at: Mapped[datetime] = mapped_column(

@@ -36,6 +36,7 @@ class EventType(str, Enum):
     COUNTER_OPEN       = "counter_open"       # Guichet ouvert (broadcast agence)
     COUNTER_CLOSE      = "counter_close"      # Guichet fermé (broadcast agence)
     COUNTER_PAUSE      = "counter_pause"      # Guichet en pause (broadcast agence)
+    COUNTER_RESUME     = "counter_resume"     # Guichet repris (broadcast agence)
     # Une file de l'agence a changé (création, appel, service terminé, absence,
     # transfert, annulation, priorité). Diffusé à TOUS les écrans de guichet de
     # l'agence : sans lui, `counter_connections` ne recevait jamais rien et le
@@ -91,7 +92,10 @@ class QueueUpdateEvent(BaseModel):
     ticket_number: str
     position: int               # Position actuelle (1 = prochain)
     total_in_queue: int         # Nombre total en attente
-    estimated_wait_minutes: int
+    estimated_wait_minutes: int | None
+    estimated_wait_confidence: str | None = None
+    eta_calculated_at: str | None = None
+    eta_version: int | None = None
     current_called_number: str  # Numéro actuellement au guichet
 
 

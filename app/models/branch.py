@@ -138,6 +138,12 @@ class Service(Base):
 
     # Durée moyenne d'un service en minutes (pour calcul ETA)
     avg_duration_minutes: Mapped[int] = mapped_column(Integer, default=5)
+    # Paramètres AWTE rattachés au service/tenant, configurables par son administrateur.
+    eta_ewma_alpha: Mapped[float] = mapped_column(Float, default=0.25, server_default="0.25")
+    eta_min_service_samples: Mapped[int] = mapped_column(Integer, default=3, server_default="3")
+    eta_min_counter_samples: Mapped[int] = mapped_column(Integer, default=10, server_default="10")
+    eta_outlier_min_samples: Mapped[int] = mapped_column(Integer, default=10, server_default="10")
+    eta_outlier_mad_multiplier: Mapped[float] = mapped_column(Float, default=3.0, server_default="3.0")
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 

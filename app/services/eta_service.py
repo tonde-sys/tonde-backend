@@ -1,95 +1,56 @@
-"""Estimation dynamique des temps d'attente par simulation des guichets.
+"""Production ETA calculation from persisted operations and live queue state.
 
-Le calcul reste déterministe et sans effet de bord sur la file : il lit les
-attentes réelles, estime la durée des services et simule leur affectation aux
-guichets ouverts. Les historiques individuels sont lissés vers la moyenne du
-service pour éviter qu'un petit nombre de dossiers atypiques ne domine l'ETA.
+The forecast is a workload projection over real WAITING/CALLED/SERVING tickets.
+The engine never inserts, reorders or removes queue tickets. PostgreSQL stores
+observations, EWMA profiles and the latest delivered forecast; Redis remains the
+operational queue projection and can be rebuilt by the existing Queue Engine.
 """
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
-from app.models.branch import Service
+from app.models.branch import Branch, Service
 from app.models.counter import Counter
-from app.models.employee import Employee, EmployeeStatus
+from app.models.eta import EtaCounterProfile, EtaObservation, EtaPrediction, EtaServiceProfile
 from app.models.queue_log import QueueLog, QueueLogAction
 from app.models.ticket import PRIORITY_SCORES, Ticket, TicketStatus
-from app.models.user import UserRole
 
-ETA_SAMPLE_SIZE = 10
-ETA_HISTORY_LIMIT = 100
-ETA_HISTORY_DAYS = 90
-ETA_PROFILE_PRIOR_WEIGHT = 4
-ETA_MIN_SERVICE_SECONDS = 30
-ETA_MAX_SERVICE_SECONDS = 3600
-ETA_CALLED_HANDOFF_SECONDS = 30
+
+@dataclass(frozen=True)
+class EtaValue:
+    wait_seconds: int | None
+    confidence: str
+    profile_level: str
+    sample_count: int
 
 
 @dataclass(frozen=True)
 class ServiceQueueEstimate:
-    """ETA de chaque ticket en attente et d'un prochain arrivant."""
+    """Individual waiting-ticket forecasts and a forecast for the next arrival."""
 
     ticket_minutes: dict[str, int]
-    next_ticket_minutes: int
+    next_ticket_minutes: int | None
+    ticket_details: dict[str, EtaValue] = field(default_factory=dict)
+    next_ticket: EtaValue = EtaValue(None, "unavailable", "none", 0)
+    calculated_at: datetime | None = None
+    version: int = 0
 
 
 @dataclass
 class _Lane:
-    counter_id: str | None
-    agent_id: str | None
+    counter_id: str
     free_in_seconds: int = 0
-
-
-@dataclass
-class _ServiceProfile:
-    baseline_seconds: int
-    counter_seconds: dict[str, int] = field(default_factory=dict)
-    agent_seconds: dict[str, int] = field(default_factory=dict)
-    counter_samples: dict[str, list[int]] = field(default_factory=dict)
-    agent_samples: dict[str, list[int]] = field(default_factory=dict)
-
-    def duration_for(self, counter_id: str | None, agent_id: str | None) -> int:
-        if agent_id and agent_id in self.agent_seconds:
-            return self.agent_seconds[agent_id]
-        if counter_id and counter_id in self.counter_seconds:
-            return self.counter_seconds[counter_id]
-        return self.baseline_seconds
-
-    def remaining_for(
-        self,
-        counter_id: str | None,
-        agent_id: str | None,
-        elapsed_seconds: int,
-    ) -> int:
-        """Prévoit le temps résiduel depuis la distribution observée."""
-        expected = self.duration_for(counter_id, agent_id)
-        if agent_id:
-            samples = self.agent_samples.get(agent_id, [])
-        else:
-            samples = []
-        if not samples and counter_id:
-            samples = self.counter_samples.get(counter_id, [])
-        if not samples:
-            return max(0, expected - elapsed_seconds)
-
-        elapsed = max(0, elapsed_seconds)
-        residuals = [max(0, sample - elapsed) for sample in samples if sample >= elapsed]
-        if residuals:
-            return max(0, int(round(sum(residuals) / len(residuals))))
-        # Si le ticket en cours dépasse tous les exemples comparables, il s'agit
-        # probablement d'un dossier atypique. Garder un petit résiduel évite de
-        # prédire qu'un guichet occupé se libère instantanément.
-        return min(expected, max(30, int(expected * 0.1)))
+    confidence_penalty: bool = False
 
 
 class EtaEstimator:
-    """Construit une prévision cohérente pour un ou plusieurs services."""
+    """Estimate time-to-call using tenant-scoped EWMA profiles and queue state."""
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -99,315 +60,687 @@ class EtaEstimator:
         services: list[Service],
         *,
         now: datetime | None = None,
+        persist_forecasts: bool = False,
     ) -> dict[str, ServiceQueueEstimate]:
-        """Simule les files des services fournis en partageant leur capacité de branche.
-
-        Tous les guichets actifs et ouverts d'une branche sont considérés aptes à
-        appeler les services de cette branche, conformément à l'API actuelle de
-        `call_next`. Les tickets déjà appelés ou en service chargent leur guichet.
-        """
-        targets = {service.id: service for service in services}
-        if not targets:
+        requested_targets = {service.id: service for service in services}
+        if not requested_targets:
             return {}
-        now_utc = _as_utc(now or datetime.now(timezone.utc))
+        calculated_at = _as_utc(now or datetime.now(timezone.utc))
         branch_ids = {service.branch_id for service in services}
+        org_ids = {service.org_id for service in services if service.org_id}
+        if not org_ids:
+            return {service_id: _unavailable(calculated_at) for service_id in requested_targets}
 
-        # Charger les services de la branche aussi : un guichet occupé peut traiter
-        # un autre service, et sa charge en cours doit compter dans la prévision.
+        # Branch and service tenant ownership must both match. Legacy service rows
+        # without a tenant are unavailable until repaired; we do not infer one
+        # from an untrusted caller-supplied object.
         catalog_rows = (await self.db.execute(
-            select(Service).where(Service.branch_id.in_(branch_ids))
+            select(Service)
+            .join(Branch, Branch.id == Service.branch_id)
+            .where(
+                Branch.id.in_(branch_ids),
+                Branch.org_id.in_(org_ids),
+                Service.org_id == Branch.org_id,
+            )
         )).scalars().all()
         catalog = {service.id: service for service in catalog_rows}
-        catalog.update(targets)
+        targets = {service_id: catalog[service_id] for service_id in requested_targets if service_id in catalog}
+        if not targets:
+            return {service_id: _unavailable(calculated_at) for service_id in requested_targets}
+        invalid_target_ids = set(requested_targets) - set(targets)
+        service_ids = list(catalog)
 
         waiting_rows = (await self.db.execute(
             select(Ticket).where(
-                Ticket.service_id.in_(targets),
+                Ticket.org_id.in_(org_ids),
                 Ticket.agency_id.in_(branch_ids),
+                Ticket.service_id.in_(targets),
                 Ticket.status == TicketStatus.WAITING,
             )
         )).scalars().all()
-        waiting_by_service: dict[str, list[Ticket]] = {service_id: [] for service_id in targets}
+        waiting_by_service: dict[str, list[Ticket]] = {key: [] for key in targets}
         for ticket in waiting_rows:
-            if ticket.service_id in waiting_by_service:
-                waiting_by_service[ticket.service_id].append(ticket)
+            waiting_by_service.setdefault(ticket.service_id, []).append(ticket)
         for queue in waiting_by_service.values():
             queue.sort(key=lambda ticket: (
-                -PRIORITY_SCORES.get(ticket.priority, 0),
+                -PRIORITY_SCORES[ticket.priority],
                 ticket.queue_sequence,
-                ticket.created_at,
+                _as_utc(ticket.created_at),
                 ticket.id,
             ))
 
         counters = (await self.db.execute(
             select(Counter)
             .where(
+                Counter.org_id.in_(org_ids),
                 Counter.agency_id.in_(branch_ids),
                 Counter.is_active.is_(True),
                 Counter.is_open.is_(True),
+                Counter.is_paused.is_(False),
             )
             .order_by(Counter.name, Counter.id)
         )).scalars().all()
-        counters_by_branch: dict[str, list[Counter]] = {branch_id: [] for branch_id in branch_ids}
+        counters_by_branch: dict[str, list[Counter]] = {key: [] for key in branch_ids}
         for counter in counters:
             counters_by_branch.setdefault(counter.agency_id, []).append(counter)
 
         current_ids = list({counter.current_ticket_id for counter in counters if counter.current_ticket_id})
-        current_rows = []
+        current_by_id: dict[str, Ticket] = {}
         if current_ids:
             current_rows = (await self.db.execute(
                 select(Ticket).where(
                     Ticket.id.in_(current_ids),
+                    Ticket.org_id.in_(org_ids),
+                    Ticket.agency_id.in_(branch_ids),
                     Ticket.status.in_([TicketStatus.CALLED, TicketStatus.SERVING]),
                 )
             )).scalars().all()
-        current_by_id = {ticket.id: ticket for ticket in current_rows}
+            current_by_id = {ticket.id: ticket for ticket in current_rows}
 
-        active_agents_by_counter: dict[str, list[str]] = {}
         counter_ids = [counter.id for counter in counters]
-        if counter_ids:
-            employee_rows = (await self.db.execute(
-                select(Employee.counter_id, Employee.user_id)
-                .where(
-                    Employee.counter_id.in_(counter_ids),
-                    Employee.status == EmployeeStatus.ACTIVE,
-                    Employee.role == UserRole.AGENT,
-                )
-                .order_by(Employee.updated_at.desc(), Employee.created_at.desc())
-            )).all()
-            for counter_id, user_id in employee_rows:
-                if counter_id and user_id:
-                    active_agents_by_counter.setdefault(counter_id, []).append(user_id)
+        profile_join = and_(
+            EtaCounterProfile.org_id.in_(org_ids),
+            EtaCounterProfile.counter_id.in_(counter_ids) if counter_ids else EtaCounterProfile.id == "",
+            EtaCounterProfile.service_id == Service.id,
+        )
+        profile_rows = (await self.db.execute(
+            select(Service.id, EtaServiceProfile, EtaCounterProfile)
+            .join(Branch, Branch.id == Service.branch_id)
+            .outerjoin(
+                EtaServiceProfile,
+                and_(
+                    EtaServiceProfile.org_id == Branch.org_id,
+                    EtaServiceProfile.service_id == Service.id,
+                ),
+            )
+            .outerjoin(EtaCounterProfile, profile_join)
+            .where(Branch.id.in_(branch_ids), Branch.org_id.in_(org_ids), Service.id.in_(service_ids))
+        )).all()
+        service_profile_by_id: dict[str, EtaServiceProfile] = {}
+        counter_profile_by_key: dict[tuple[str, str], EtaCounterProfile] = {}
+        for service_id, service_profile, counter_profile in profile_rows:
+            if service_profile is not None:
+                service_profile_by_id[service_id] = service_profile
+            if counter_profile is not None:
+                counter_profile_by_key[(service_id, counter_profile.counter_id)] = counter_profile
 
-        # N'utiliser le rythme individuel que si un seul agent actif est affecté
-        # au guichet. Plusieurs agents affectés ne disent pas qui travaille ici.
-        assigned_agents = {
-            counter_id: users[0]
-            for counter_id, users in active_agents_by_counter.items()
-            if len(users) == 1
-        }
-
-        profiles = await self._load_profiles(catalog, now_utc)
-
-        serving_agents: dict[str, str] = {}
+        service_samples, counter_samples = await self._load_recent_samples(org_ids, service_ids)
+        serving_actor_by_ticket: dict[str, str] = {}
         if current_ids:
-            serving_logs = (await self.db.execute(
+            actor_rows = (await self.db.execute(
                 select(QueueLog.ticket_id, QueueLog.actor_id)
                 .where(
+                    QueueLog.org_id.in_(org_ids),
                     QueueLog.ticket_id.in_(current_ids),
                     QueueLog.action == QueueLogAction.TICKET_SERVING,
                     QueueLog.actor_id.is_not(None),
                 )
                 .order_by(QueueLog.created_at.desc())
             )).all()
-            for ticket_id, actor_id in serving_logs:
-                serving_agents.setdefault(ticket_id, actor_id)
+            for ticket_id, actor_id in actor_rows:
+                serving_actor_by_ticket.setdefault(ticket_id, actor_id)
 
-        estimates: dict[str, ServiceQueueEstimate] = {}
+        # There is currently one independently ordered queue per service. Since
+        # the Queue Engine does not define cross-service dispatch fairness, an
+        # open counter is projected against this service's real queue and the
+        # confidence is reduced when competing service queues exist.
+        competing_rows = (await self.db.execute(
+            select(Ticket.agency_id, func.count(Ticket.id))
+            .where(
+                Ticket.org_id.in_(org_ids),
+                Ticket.agency_id.in_(branch_ids),
+                Ticket.status == TicketStatus.WAITING,
+                Ticket.service_id.not_in(targets),
+            )
+            .group_by(Ticket.agency_id)
+        )).all()
+        competing_by_branch = {branch_id: count for branch_id, count in competing_rows}
+
+        results: dict[str, ServiceQueueEstimate] = {
+            service_id: _unavailable(calculated_at)
+            for service_id in invalid_target_ids
+        }
+        version = int(calculated_at.timestamp() * 1000)
         for service_id, target in targets.items():
             lanes: list[_Lane] = []
             for counter in counters_by_branch.get(target.branch_id, []):
-                assigned_agent = assigned_agents.get(counter.id)
                 current = current_by_id.get(counter.current_ticket_id or "")
                 free_in = 0
+                penalty = bool(competing_by_branch.get(target.branch_id))
                 if current is not None:
-                    current_profile = profiles.get(current.service_id)
-                    if current_profile is None:
-                        current_service = catalog.get(current.service_id)
-                        fallback = current_service.avg_duration_minutes if current_service else 5
-                        current_profile = _ServiceProfile(_bounded_seconds(fallback * 60))
-                    active_agent = serving_agents.get(current.id) or assigned_agent
-                    if current.status == TicketStatus.SERVING and current.served_at:
-                        elapsed = int((now_utc - _as_utc(current.served_at)).total_seconds())
-                        free_in = current_profile.remaining_for(
-                            counter.id, active_agent, elapsed
+                    current_service = catalog.get(current.service_id)
+                    if current_service is None:
+                        # Unknown work occupying this resource is not treated as free capacity.
+                        continue
+                    if current.status == TicketStatus.CALLED:
+                        # No arbitrary call-to-service delay: actual processing starts
+                        # at `served_at`. The unknown handoff is reflected in confidence.
+                        free_in = self._duration_for(
+                            current_service, counter.id, service_profile_by_id,
+                            counter_profile_by_key,
+                        )[0]
+                        penalty = True
+                    elif current.served_at:
+                        elapsed = max(0, int((calculated_at - _as_utc(current.served_at)).total_seconds()))
+                        duration, _level, _count = self._duration_for(
+                            current_service, counter.id, service_profile_by_id,
+                            counter_profile_by_key,
                         )
+                        observed = counter_samples.get((current.service_id, counter.id)) or service_samples.get(current.service_id, [])
+                        remaining = [sample - elapsed for sample in observed if sample > elapsed]
+                        if remaining:
+                            free_in = int(round(sum(remaining) / len(remaining)))
+                        elif observed:
+                            # The service has exceeded all comparable samples. The
+                            # conditional tail is unobserved, so use the learned mean
+                            # (or configured mean when data is insufficient) and lower confidence.
+                            free_in = int(round(duration))
+                            penalty = True
+                        else:
+                            free_in = max(0, int(round(duration)) - elapsed)
+                            penalty = True
                     else:
-                        called_at = current.called_at or current.created_at
-                        called_elapsed = max(
-                            0, int((now_utc - _as_utc(called_at)).total_seconds())
-                        )
-                        handoff_left = max(
-                            0,
-                            min(
-                                ETA_CALLED_HANDOFF_SECONDS,
-                                settings.ABSENT_TIMEOUT_SECONDS - called_elapsed,
-                            ),
-                        )
-                        free_in = handoff_left + current_profile.duration_for(
-                            counter.id, active_agent
-                        )
-                lanes.append(_Lane(counter.id, assigned_agent, free_in))
+                        free_in = int(round(self._duration_for(
+                            current_service, counter.id, service_profile_by_id,
+                            counter_profile_by_key,
+                        )[0]))
+                        penalty = True
+                lanes.append(_Lane(counter.id, max(0, free_in), penalty))
 
-            # Sans guichet ouvert, garder une voie virtuelle : l'ETA reste utile
-            # et retombe sur le comportement séquentiel connu.
             if not lanes:
-                lanes.append(_Lane(None, None, 0))
+                result = _unavailable(calculated_at, version)
+                results[service_id] = result
+                if persist_forecasts:
+                    await self._persist_forecasts(target, waiting_by_service.get(service_id, []), result)
+                continue
 
-            profile = profiles.get(
-                service_id,
-                _ServiceProfile(_bounded_seconds(max(1, target.avg_duration_minutes) * 60)),
-            )
+            ticket_details: dict[str, EtaValue] = {}
             ticket_minutes: dict[str, int] = {}
             for ticket in waiting_by_service.get(service_id, []):
-                lane = min(lanes, key=lambda item: (item.free_in_seconds, item.counter_id or ""))
+                lane = min(lanes, key=lambda item: (item.free_in_seconds, item.counter_id))
+                seconds, level, count = self._duration_for(
+                    target, lane.counter_id, service_profile_by_id, counter_profile_by_key
+                )
+                confidence = _confidence(
+                    level, count, lane.confidence_penalty,
+                    target.eta_min_service_samples, target.eta_min_counter_samples,
+                )
+                value = EtaValue(lane.free_in_seconds, confidence, level, count)
+                ticket_details[ticket.id] = value
                 ticket_minutes[ticket.id] = _ceil_minutes(lane.free_in_seconds)
-                lane.free_in_seconds += profile.duration_for(lane.counter_id, lane.agent_id)
+                lane.free_in_seconds += max(0, int(round(seconds)))
 
-            next_lane = min(lanes, key=lambda item: (item.free_in_seconds, item.counter_id or ""))
-            estimates[service_id] = ServiceQueueEstimate(
-                ticket_minutes=ticket_minutes,
-                next_ticket_minutes=_ceil_minutes(next_lane.free_in_seconds),
+            next_lane = min(lanes, key=lambda item: (item.free_in_seconds, item.counter_id))
+            next_seconds, next_level, next_count = self._duration_for(
+                target, next_lane.counter_id, service_profile_by_id, counter_profile_by_key
             )
-        return estimates
+            next_value = EtaValue(
+                next_lane.free_in_seconds,
+                _confidence(
+                    next_level, next_count, next_lane.confidence_penalty,
+                    target.eta_min_service_samples, target.eta_min_counter_samples,
+                ),
+                next_level,
+                next_count,
+            )
+            result = ServiceQueueEstimate(
+                ticket_minutes=ticket_minutes,
+                next_ticket_minutes=(
+                    _ceil_minutes(next_value.wait_seconds)
+                    if next_value.wait_seconds is not None else None
+                ),
+                ticket_details=ticket_details,
+                next_ticket=next_value,
+                calculated_at=calculated_at,
+                version=version,
+            )
+            results[service_id] = result
+            if persist_forecasts:
+                await self._persist_forecasts(target, waiting_by_service.get(service_id, []), result)
+        return results
 
-    async def _load_profiles(
-        self,
-        services: dict[str, Service],
-        now: datetime,
-    ) -> dict[str, _ServiceProfile]:
-        if not services:
-            return {}
-        ranked = (
+    async def _load_recent_samples(
+        self, org_ids: set[str], service_ids: list[str]
+    ) -> tuple[dict[str, list[int]], dict[tuple[str, str], list[int]]]:
+        if not service_ids:
+            return {}, {}
+        ranked_service = (
             select(
-                Ticket.id.label("ticket_id"),
-                Ticket.service_id.label("service_id"),
-                Ticket.counter_id.label("counter_id"),
-                Ticket.service_seconds.label("service_seconds"),
+                EtaObservation.service_id.label("service_id"),
+                EtaObservation.duration_seconds.label("duration_seconds"),
                 func.row_number().over(
-                    partition_by=Ticket.service_id,
-                    order_by=(Ticket.done_at.desc(), Ticket.id.desc()),
-                ).label("row_number"),
+                    partition_by=EtaObservation.service_id,
+                    order_by=(EtaObservation.observed_at.desc(), EtaObservation.id.desc()),
+                ).label("rn"),
             )
             .where(
-                Ticket.service_id.in_(services),
-                Ticket.status == TicketStatus.DONE,
-                Ticket.service_seconds.is_not(None),
-                Ticket.service_seconds > 0,
-                Ticket.done_at.is_not(None),
-                Ticket.done_at >= now - timedelta(days=ETA_HISTORY_DAYS),
+                EtaObservation.org_id.in_(org_ids),
+                EtaObservation.service_id.in_(service_ids),
+                EtaObservation.eligible.is_(True),
             )
             .subquery()
         )
-        history = (await self.db.execute(
-            select(
-                ranked.c.ticket_id,
-                ranked.c.service_id,
-                ranked.c.counter_id,
-                ranked.c.service_seconds,
-            )
-            .where(ranked.c.row_number <= ETA_HISTORY_LIMIT)
-            .order_by(ranked.c.service_id, ranked.c.row_number)
+        service_rows = (await self.db.execute(
+            select(ranked_service.c.service_id, ranked_service.c.duration_seconds)
+            .where(ranked_service.c.rn <= 100)
         )).all()
+        service_samples: dict[str, list[int]] = {}
+        for service_id, seconds in service_rows:
+            service_samples.setdefault(service_id, []).append(seconds)
 
-        ticket_ids = [row.ticket_id for row in history]
-        done_actors: dict[str, str] = {}
-        if ticket_ids:
-            actor_rows = (await self.db.execute(
-                select(QueueLog.ticket_id, QueueLog.actor_id)
+        ranked_counter = (
+            select(
+                EtaObservation.service_id.label("service_id"),
+                EtaObservation.counter_id.label("counter_id"),
+                EtaObservation.duration_seconds.label("duration_seconds"),
+                func.row_number().over(
+                    partition_by=(EtaObservation.service_id, EtaObservation.counter_id),
+                    order_by=(EtaObservation.observed_at.desc(), EtaObservation.id.desc()),
+                ).label("rn"),
+            )
+            .where(
+                EtaObservation.org_id.in_(org_ids),
+                EtaObservation.service_id.in_(service_ids),
+                EtaObservation.counter_id.is_not(None),
+                EtaObservation.eligible.is_(True),
+            )
+            .subquery()
+        )
+        counter_rows = (await self.db.execute(
+            select(ranked_counter.c.service_id, ranked_counter.c.counter_id, ranked_counter.c.duration_seconds)
+            .where(ranked_counter.c.rn <= 100)
+        )).all()
+        counter_samples: dict[tuple[str, str], list[int]] = {}
+        for service_id, counter_id, seconds in counter_rows:
+            counter_samples.setdefault((service_id, counter_id), []).append(seconds)
+        return service_samples, counter_samples
+
+    @staticmethod
+    def _duration_for(
+        service: Service,
+        counter_id: str,
+        service_profiles: dict[str, EtaServiceProfile],
+        counter_profiles: dict[tuple[str, str], EtaCounterProfile],
+    ) -> tuple[float, str, int]:
+        configured = float(service.avg_duration_minutes * 60)
+        service_profile = service_profiles.get(service.id)
+        service_count = service_profile.sample_count if service_profile else 0
+        service_seconds = service_profile.ewma_seconds if service_profile else configured
+        if service_count >= service.eta_min_service_samples:
+            service_level = "service"
+        else:
+            service_level = "configured"
+            service_seconds = configured
+
+        local = counter_profiles.get((service.id, counter_id))
+        if local and local.sample_count >= service.eta_min_counter_samples:
+            return local.ewma_seconds, "counter", local.sample_count
+        if service_level == "service":
+            return service_seconds, "service", service_count
+        return configured, "configured", service_count
+
+    async def record_completed_ticket(self, ticket: Ticket) -> bool:
+        """Persist one raw completion and update service/counter EWMA atomically."""
+        if not ticket.org_id:
+            return False
+        service = (await self.db.execute(
+            select(Service).where(
+                Service.id == ticket.service_id,
+                Service.org_id == ticket.org_id,
+                Service.branch_id == ticket.agency_id,
+            ).with_for_update()
+        )).scalar_one_or_none()
+        if service is None:
+            return False
+        counter_id = None
+        if ticket.counter_id:
+            counter_id = await self.db.scalar(select(Counter.id).where(
+                Counter.id == ticket.counter_id,
+                Counter.org_id == ticket.org_id,
+                Counter.agency_id == ticket.agency_id,
+            ))
+        event_key = f"done:{ticket.id}"
+        existing = await self.db.scalar(select(EtaObservation.id).where(
+            EtaObservation.org_id == ticket.org_id,
+            EtaObservation.event_key == event_key,
+        ))
+        if existing:
+            return False
+
+        started = _as_utc(ticket.served_at) if ticket.served_at else None
+        completed = _as_utc(ticket.done_at) if ticket.done_at else None
+        duration = int((completed - started).total_seconds()) if started and completed else None
+        eligible = duration is not None and duration > 0
+        reason = None
+        if not eligible:
+            reason = "missing_or_invalid_service_timestamps" if duration is None else "non_positive_duration"
+        elif await self._is_outlier(service, duration):
+            eligible = False
+            reason = "robust_mad_outlier"
+
+        observation = EtaObservation(
+            org_id=ticket.org_id,
+            branch_id=ticket.agency_id,
+            service_id=ticket.service_id,
+            counter_id=counter_id,
+            ticket_id=ticket.id,
+            event_key=event_key,
+            duration_seconds=duration,
+            eligible=eligible,
+            exclusion_reason=reason,
+            observed_at=completed or datetime.now(timezone.utc),
+            service_started_at=started,
+            service_completed_at=completed,
+        )
+        self.db.add(observation)
+        if not eligible:
+            await self.db.flush()
+            return False
+
+        assert duration is not None
+        service_profile = (await self.db.execute(
+            select(EtaServiceProfile)
+            .where(EtaServiceProfile.org_id == ticket.org_id, EtaServiceProfile.service_id == service.id)
+            .with_for_update()
+        )).scalar_one_or_none()
+        if service_profile is None:
+            service_profile = EtaServiceProfile(
+                service_id=service.id,
+                org_id=ticket.org_id,
+                ewma_seconds=float(service.avg_duration_minutes * 60),
+                sample_count=0,
+            )
+            self.db.add(service_profile)
+            await self.db.flush()
+        service_profile.ewma_seconds = ewma_step(service_profile.ewma_seconds, duration, service.eta_ewma_alpha)
+        service_profile.sample_count += 1
+        service_profile.updated_at = completed or datetime.now(timezone.utc)
+
+        if counter_id:
+            counter_profile = (await self.db.execute(
+                select(EtaCounterProfile)
                 .where(
-                    QueueLog.ticket_id.in_(ticket_ids),
-                    QueueLog.action == QueueLogAction.TICKET_DONE,
-                    QueueLog.actor_id.is_not(None),
+                    EtaCounterProfile.org_id == ticket.org_id,
+                    EtaCounterProfile.service_id == service.id,
+                    EtaCounterProfile.counter_id == counter_id,
                 )
-                .order_by(QueueLog.created_at.desc())
-            )).all()
-            for ticket_id, actor_id in actor_rows:
-                done_actors.setdefault(ticket_id, actor_id)
+                .with_for_update()
+            )).scalar_one_or_none()
+            if counter_profile is None:
+                counter_profile = EtaCounterProfile(
+                    org_id=ticket.org_id,
+                    service_id=service.id,
+                    counter_id=counter_id,
+                    ewma_seconds=float(service.avg_duration_minutes * 60),
+                    sample_count=0,
+                )
+                self.db.add(counter_profile)
+                await self.db.flush()
+            counter_profile.ewma_seconds = ewma_step(counter_profile.ewma_seconds, duration, service.eta_ewma_alpha)
+            counter_profile.sample_count += 1
+            counter_profile.updated_at = completed or datetime.now(timezone.utc)
+        await self.db.flush()
+        return True
 
-        durations_by_service: dict[str, list[int]] = {service_id: [] for service_id in services}
-        durations_by_counter: dict[str, dict[str, list[int]]] = {
-            service_id: {} for service_id in services
+    async def record_interrupted_ticket(self, ticket: Ticket, reason: str) -> bool:
+        """Retain a real but ineligible lifecycle observation for audit."""
+        if not ticket.org_id:
+            return False
+        action_by_reason = {
+            "incomplete": QueueLogAction.TICKET_INCOMPLETE,
+            "transferred": QueueLogAction.TICKET_TRANSFERRED,
+            "absent": QueueLogAction.TICKET_ABSENT,
         }
-        durations_by_agent: dict[str, dict[str, list[int]]] = {
-            service_id: {} for service_id in services
-        }
-        durations_by_agent_counter: dict[str, dict[str, dict[str, list[int]]]] = {
-            service_id: {} for service_id in services
-        }
-        for row in history:
-            duration = _bounded_seconds(row.service_seconds)
-            durations_by_service.setdefault(row.service_id, []).append(duration)
-            if row.counter_id:
-                durations_by_counter.setdefault(row.service_id, {}).setdefault(
-                    row.counter_id, []
-                ).append(duration)
-            actor_id = done_actors.get(row.ticket_id)
-            if actor_id:
-                durations_by_agent.setdefault(row.service_id, {}).setdefault(
-                    actor_id, []
-                ).append(duration)
-                if row.counter_id:
-                    durations_by_agent_counter.setdefault(row.service_id, {}).setdefault(
-                        actor_id, {}
-                    ).setdefault(row.counter_id, []).append(duration)
-
-        profiles: dict[str, _ServiceProfile] = {}
-        for service_id, service in services.items():
-            samples = durations_by_service.get(service_id, [])[:ETA_SAMPLE_SIZE]
-            configured = _bounded_seconds(max(1, service.avg_duration_minutes) * 60)
-            padding = max(0, ETA_SAMPLE_SIZE - len(samples))
-            baseline = _bounded_seconds(
-                (sum(samples) + configured * padding) / ETA_SAMPLE_SIZE
+        action = action_by_reason.get(reason)
+        if action is None:
+            return False
+        log = (await self.db.execute(
+            select(QueueLog.id, QueueLog.created_at)
+            .where(
+                QueueLog.org_id == ticket.org_id,
+                QueueLog.ticket_id == ticket.id,
+                QueueLog.service_id == ticket.service_id,
+                QueueLog.action == action,
             )
+            .order_by(QueueLog.created_at.desc(), QueueLog.id.desc())
+            .limit(1)
+        )).first()
+        if log is None:
+            return False
+        event_key = f"queue-log:{log.id}"
+        exists = await self.db.scalar(select(EtaObservation.id).where(
+            EtaObservation.org_id == ticket.org_id,
+            EtaObservation.event_key == event_key,
+        ))
+        if exists:
+            return False
+        ended_at = _as_utc(log.created_at)
+        started_at = _as_utc(ticket.served_at) if ticket.served_at else None
+        duration = int((ended_at - started_at).total_seconds()) if started_at else None
+        counter_id = None
+        if ticket.counter_id:
+            counter_id = await self.db.scalar(select(Counter.id).where(
+                Counter.id == ticket.counter_id,
+                Counter.org_id == ticket.org_id,
+                Counter.agency_id == ticket.agency_id,
+            ))
+        self.db.add(EtaObservation(
+            org_id=ticket.org_id,
+            branch_id=ticket.agency_id,
+            service_id=ticket.service_id,
+            counter_id=counter_id,
+            ticket_id=ticket.id,
+            event_key=event_key,
+            duration_seconds=duration,
+            eligible=False,
+            exclusion_reason=f"interrupted_{reason}",
+            observed_at=ended_at,
+            service_started_at=started_at,
+            service_completed_at=ended_at,
+        ))
+        await self.db.flush()
+        return True
 
-            counter_seconds: dict[str, int] = {}
-            counter_samples: dict[str, list[int]] = {}
-            for counter_id, values in durations_by_counter.get(service_id, {}).items():
-                recent = values[:ETA_SAMPLE_SIZE]
-                counter_samples[counter_id] = recent
-                counter_seconds[counter_id] = _shrink_mean(
-                    recent, baseline, ETA_PROFILE_PRIOR_WEIGHT
-                )
+    async def _is_outlier(self, service: Service, duration: int) -> bool:
+        rows = (await self.db.execute(
+            select(EtaObservation.duration_seconds)
+            .where(
+                EtaObservation.org_id == service.org_id,
+                EtaObservation.service_id == service.id,
+                EtaObservation.eligible.is_(True),
+                EtaObservation.duration_seconds.is_not(None),
+            )
+            .order_by(EtaObservation.observed_at.desc())
+            .limit(100)
+        )).scalars().all()
+        values = [int(value) for value in rows]
+        if len(values) < service.eta_outlier_min_samples:
+            return False
+        center = statistics.median(values)
+        mad = statistics.median([abs(value - center) for value in values])
+        if mad == 0:
+            # With a degenerate distribution MAD cannot distinguish a genuine
+            # new service pattern from an outlier; retain the raw observation.
+            return False
+        spread = service.eta_outlier_mad_multiplier * 1.4826 * mad
+        return duration < max(0, center - spread) or duration > center + spread
 
-            agent_seconds: dict[str, int] = {}
-            agent_samples: dict[str, list[int]] = {}
-            for agent_id, values in durations_by_agent.get(service_id, {}).items():
-                recent = values[:ETA_SAMPLE_SIZE]
-                agent_samples[agent_id] = recent
-                # Un agent est lissé vers son guichet habituel quand on peut
-                # l'identifier ; sinon, vers la moyenne générale du service.
-                counter_prior = baseline
-                counter_groups = durations_by_agent_counter.get(service_id, {}).get(
-                    agent_id, {}
-                )
-                if counter_groups:
-                    agent_counter_samples = max(
-                        counter_groups.values(), key=len
-                    )[:ETA_SAMPLE_SIZE]
-                    counter_prior = _shrink_mean(
-                        agent_counter_samples,
-                        baseline,
-                        ETA_PROFILE_PRIOR_WEIGHT,
+    async def record_prediction_at_call(self, ticket: Ticket, called_at: datetime) -> None:
+        """Evaluate the latest delivered remaining-wait forecast at first call."""
+        if not ticket.org_id:
+            return
+        prediction = (await self.db.execute(
+            select(EtaPrediction)
+            .where(
+                EtaPrediction.ticket_id == ticket.id,
+                EtaPrediction.org_id == ticket.org_id,
+                EtaPrediction.branch_id == ticket.agency_id,
+                EtaPrediction.service_id == ticket.service_id,
+            )
+            .order_by(EtaPrediction.version.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        if (
+            prediction is None
+            or prediction.evaluated_at
+        ):
+            return
+        prediction.counter_id = ticket.counter_id
+        actual_seconds = max(0, int((_as_utc(called_at) - _as_utc(prediction.calculated_at)).total_seconds()))
+        prediction.actual_wait_seconds = actual_seconds
+        prediction.absolute_error_seconds = (
+            abs(prediction.estimated_wait_seconds - actual_seconds)
+            if prediction.estimated_wait_seconds is not None else None
+        )
+        prediction.evaluated_at = _as_utc(called_at)
+
+    async def _persist_forecasts(
+        self, service: Service, waiting: list[Ticket], estimate: ServiceQueueEstimate
+    ) -> None:
+        if not waiting or not service.org_id or estimate.calculated_at is None:
+            return
+        ticket_ids = [ticket.id for ticket in waiting]
+        # Serialize version assignment for concurrent snapshots of one service.
+        await self.db.scalar(
+            select(Service.id)
+            .where(Service.id == service.id, Service.org_id == service.org_id)
+            .with_for_update()
+        )
+        latest_versions = (
+            select(EtaPrediction.ticket_id.label("ticket_id"), func.max(EtaPrediction.version).label("version"))
+            .where(
+                EtaPrediction.org_id == service.org_id,
+                EtaPrediction.service_id == service.id,
+                EtaPrediction.ticket_id.in_(ticket_ids),
+            )
+            .group_by(EtaPrediction.ticket_id)
+            .subquery()
+        )
+        existing = (await self.db.execute(
+            select(EtaPrediction).join(
+                latest_versions,
+                and_(
+                    EtaPrediction.ticket_id == latest_versions.c.ticket_id,
+                    EtaPrediction.version == latest_versions.c.version,
+                ),
+            )
+        )).scalars().all()
+        by_ticket = {prediction.ticket_id: prediction for prediction in existing}
+        for ticket in waiting:
+            value = estimate.ticket_details.get(ticket.id, EtaValue(None, "unavailable", "none", 0))
+            prediction = by_ticket.get(ticket.id)
+            if prediction is not None:
+                same_minute = (
+                    (prediction.estimated_wait_seconds is None and value.wait_seconds is None)
+                    or (
+                        prediction.estimated_wait_seconds is not None
+                        and value.wait_seconds is not None
+                        and _ceil_minutes(prediction.estimated_wait_seconds) == _ceil_minutes(value.wait_seconds)
                     )
-                agent_seconds[agent_id] = _shrink_mean(
-                    recent, counter_prior, ETA_PROFILE_PRIOR_WEIGHT
                 )
-
-            profiles[service_id] = _ServiceProfile(
-                baseline_seconds=baseline,
-                counter_seconds=counter_seconds,
-                agent_seconds=agent_seconds,
-                counter_samples=counter_samples,
-                agent_samples=agent_samples,
+                recent = (estimate.calculated_at - _as_utc(prediction.calculated_at)).total_seconds() < 60
+                if (
+                    prediction.evaluated_at is None
+                    and same_minute
+                    and recent
+                    and prediction.confidence == value.confidence
+                    and prediction.profile_level == value.profile_level
+                ):
+                    continue
+            ticket.estimated_wait_minutes = (
+                _ceil_minutes(value.wait_seconds) if value.wait_seconds is not None else None
             )
-        return profiles
+            self.db.add(EtaPrediction(
+                ticket_id=ticket.id,
+                org_id=service.org_id,
+                branch_id=service.branch_id,
+                service_id=service.id,
+                estimated_wait_seconds=value.wait_seconds,
+                profile_level=value.profile_level,
+                confidence=value.confidence,
+                sample_count=value.sample_count,
+                calculated_at=estimate.calculated_at,
+                version=(prediction.version + 1) if prediction is not None else 1,
+            ))
+
+    async def metrics(
+        self, *, org_id: str, service_id: str, since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> dict:
+        latest = (
+            select(
+                EtaPrediction.ticket_id.label("ticket_id"),
+                EtaPrediction.counter_id.label("counter_id"),
+                EtaPrediction.absolute_error_seconds.label("absolute_error_seconds"),
+                EtaPrediction.evaluated_at.label("evaluated_at"),
+                func.row_number().over(
+                    partition_by=EtaPrediction.ticket_id,
+                    order_by=EtaPrediction.version.desc(),
+                ).label("rn"),
+            )
+            .where(
+                EtaPrediction.org_id == org_id,
+                EtaPrediction.service_id == service_id,
+            )
+            .subquery()
+        )
+        latest_filters = [latest.c.rn == 1, latest.c.absolute_error_seconds.is_not(None)]
+        if since:
+            latest_filters.append(latest.c.evaluated_at >= _as_utc(since))
+        if until:
+            latest_filters.append(latest.c.evaluated_at < _as_utc(until))
+        count, mean_error = (await self.db.execute(
+            select(func.count(latest.c.ticket_id), func.avg(latest.c.absolute_error_seconds))
+            .where(*latest_filters)
+        )).one()
+        counter_rows = (await self.db.execute(
+            select(
+                latest.c.counter_id,
+                func.count(latest.c.ticket_id),
+                func.avg(latest.c.absolute_error_seconds),
+            )
+            .where(*latest_filters)
+            .group_by(latest.c.counter_id)
+            .order_by(latest.c.counter_id)
+        )).all()
+        return {
+            "org_id": org_id,
+            "service_id": service_id,
+            "evaluated_forecasts": int(count or 0),
+            "mae_seconds": float(mean_error) if mean_error is not None else None,
+            "mae_minutes": (float(mean_error) / 60) if mean_error is not None else None,
+            "by_counter": [
+                {
+                    "counter_id": counter_id,
+                    "evaluated_forecasts": int(counter_count or 0),
+                    "mae_seconds": float(counter_error) if counter_error is not None else None,
+                    "mae_minutes": float(counter_error) / 60 if counter_error is not None else None,
+                }
+                for counter_id, counter_count, counter_error in counter_rows
+            ],
+            "since": since,
+            "until": until,
+        }
 
 
-def _shrink_mean(samples: list[int], prior: int, prior_weight: int) -> int:
-    """Moyenne récente lissée vers un repère fiable lorsque n est faible."""
-    if not samples:
-        return _bounded_seconds(prior)
-    estimate = (sum(samples) + prior * prior_weight) / (len(samples) + prior_weight)
-    return _bounded_seconds(estimate)
+def ewma_step(previous_seconds: float, observation_seconds: int, alpha: float) -> float:
+    return alpha * observation_seconds + (1 - alpha) * previous_seconds
 
 
-def _bounded_seconds(seconds: float | int) -> int:
-    return int(min(ETA_MAX_SERVICE_SECONDS, max(ETA_MIN_SERVICE_SECONDS, seconds)))
+def _unavailable(calculated_at: datetime, version: int = 0) -> ServiceQueueEstimate:
+    return ServiceQueueEstimate({}, None, {}, EtaValue(None, "unavailable", "none", 0), calculated_at, version)
 
 
-def _ceil_minutes(seconds: int) -> int:
-    return max(0, math.ceil(max(0, seconds) / 60))
+def _confidence(level: str, samples: int, penalty: bool, min_service: int, min_counter: int) -> str:
+    if level == "counter" and samples >= min_counter and not penalty:
+        return "high"
+    if level in {"counter", "service"} and samples >= min_service and not penalty:
+        return "medium"
+    return "low"
+
+
+def _ceil_minutes(seconds: int | None) -> int:
+    return max(0, math.ceil(max(0, seconds or 0) / 60))
 
 
 def _as_utc(value: datetime) -> datetime:
