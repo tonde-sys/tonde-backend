@@ -23,8 +23,9 @@ from app.models.organization import Organization
 from app.models.ticket import Ticket, TicketPriority, TicketStatus
 from app.models.user import User
 from app.services import public_service as public_service_module
+from app.services.eta_service import EtaEstimator, ewma_step
 from app.services.public_service import PublicQueueService
-from app.services.ticket_service import ETA_SAMPLE_SIZE, TicketService
+from app.services.ticket_service import TicketService
 
 
 # ── Outils ────────────────────────────────────────────────────────────────────
@@ -206,23 +207,33 @@ async def test_dernier_appele_ignore_les_tickets_jamais_appeles(agence, db_sessi
 
 
 @pytest.mark.asyncio
-async def test_attente_estimee_coherente_avec_le_calcul_unitaire(agence, db_session, mock_redis):
-    """
-    `_eta_minutes` (lot) doit donner le même résultat que `estimate_wait_minutes`
-    (unitaire) : le regroupement ne doit pas changer la formule, seulement le
-    nombre de requêtes.
-    """
+async def test_eta_de_lecran_public_utilise_la_projection_dynamique(agence, db_session, mock_redis):
+    """L'écran public expose l'ETA calculée depuis la file et les guichets réels."""
     org, branch, depot, credit, guichet1, guichet2, appele = agence
-    service = TicketService(db_session)
-
     data = await PublicQueueService(db_session).get_branch_display(branch.id)
     par_prefixe = {row["ticket_prefix"]: row for row in data["services"]}
+    estimates = await EtaEstimator(db_session).estimate_many([depot, credit])
 
-    for prefixe, row in par_prefixe.items():
-        attendu = await service.estimate_wait_minutes(
-            depot if prefixe == "A" else credit, row["waiting"] + 1
-        )
-        assert row["estimated_wait_minutes"] == attendu, prefixe
+    assert par_prefixe["A"]["estimated_wait_minutes"] == estimates[depot.id].next_ticket_minutes
+    assert par_prefixe["B"]["estimated_wait_minutes"] == estimates[credit.id].next_ticket_minutes
+
+
+def test_ewma_met_a_jour_la_duree_depuis_la_configuration_initiale():
+    """Une observation réelle pèse selon le coefficient configuré du service."""
+    assert ewma_step(600, 360, alpha=0.25) == 540
+
+
+@pytest.mark.asyncio
+async def test_eta_projette_la_file_sur_le_guichet_libre_et_le_guichet_occupe(
+    agence, db_session, mock_redis
+):
+    """Les 2 attentes sont distribuées, puis l'ETA du prochain client est calculée."""
+    org, branch, depot, credit, guichet1, guichet2, appele = agence
+
+    estimate = (await EtaEstimator(db_session).estimate_many([depot]))[depot.id]
+
+    assert sorted(estimate.ticket_minutes.values()) == [0, 5]
+    assert estimate.next_ticket_minutes == 5
 
 
 # ══ Le point du constat : le coût ne dépend plus de la taille de l'agence ════
@@ -236,7 +247,8 @@ async def test_nombre_de_requetes_constant_quel_que_soit_le_nombre_de_services(
 
     C'est la formulation qui protège l'avenir. Une assertion du type « moins de
     10 requêtes » passerait aujourd'hui et sauterait à la première agence un peu
-    grande ; celle-ci échoue dès qu'un N+1 revient.
+    grande ; celle-ci échoue dès qu'un N+1 revient. L'estimation dynamique ajoute
+    un coût fixe par type de données consulté ; le budget actuel est plafonné à 14.
     """
     org, branch, depot, credit, guichet1, guichet2, appele = agence
     ecran = PublicQueueService(db_session)
@@ -269,7 +281,7 @@ async def test_nombre_de_requetes_constant_quel_que_soit_le_nombre_de_services(
         f"{len(grand.statements)} pour 8 — il reste un N+1 :\n"
         + "\n".join(grand.statements)
     )
-    assert len(grand.statements) <= 6, "\n".join(grand.statements)
+    assert len(grand.statements) <= 14, "\n".join(grand.statements)
 
 
 @pytest.mark.asyncio
@@ -324,26 +336,20 @@ async def test_agence_inconnue_renvoie_404(db_session):
     assert exc_info.value.detail["code"] == "BRANCH_NOT_FOUND"
 
 
-# ══ Le regroupement ne change pas les valeurs ════════════════════════════════
+# ══ Le repli historique lit la configuration jusqu'à l'initialisation AWTE ═══
 
 @pytest.mark.asyncio
 async def test_duree_moyenne_groupee_egale_au_calcul_unitaire(agence, db_session):
-    """
-    `avg_service_seconds_batch` (row_number) doit rendre exactement ce que rend
-    `_avg_service_seconds` service par service — y compris la troncature aux
-    ETA_SAMPLE_SIZE derniers tickets.
-    """
+    """Le calcul groupé et le calcul unitaire lisent le même EWMA/config."""
     org, branch, depot, credit, guichet1, guichet2, appele = agence
 
-    # Plus de ETA_SAMPLE_SIZE tickets terminés, pour exercer la fenêtre glissante :
-    # seuls les plus récents doivent compter.
     now = datetime.now(timezone.utc)
-    for i in range(ETA_SAMPLE_SIZE + 4):
+    for i in range(14):
         await _make_ticket(
             db_session, org.id, branch.id, credit, appele.user_id, 100 + i,
             TicketStatus.DONE,
             called_at=now - timedelta(hours=5),
-            done_at=now - timedelta(minutes=ETA_SAMPLE_SIZE + 4 - i),
+            done_at=now - timedelta(minutes=14 - i),
             service_seconds=60 * (i + 1),
         )
 

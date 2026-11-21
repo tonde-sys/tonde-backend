@@ -53,6 +53,7 @@ AGENCY_BROADCAST_EVENTS = {
     EventType.COUNTER_OPEN.value,
     EventType.COUNTER_CLOSE.value,
     EventType.COUNTER_PAUSE.value,
+    EventType.COUNTER_RESUME.value,
 }
 
 # Événements diffusés à tous les ÉCRANS DE GUICHET d'une branch (champ
@@ -414,6 +415,10 @@ class QueueWebSocketManager:
         """
         positions: dict[str, int] = event.get("positions", {})
         eta_per_position = int(event.get("eta_seconds_per_position", 0))
+        estimated_waits: dict[str, int] = event.get(
+            "estimated_wait_minutes_by_ticket", {}
+        )
+        confidences: dict[str, str] = event.get("eta_confidence_by_ticket", {})
         total = int(event.get("total_in_queue", len(positions)))
 
         for ticket_id in list(self.connections_by_ticket.keys()):
@@ -421,12 +426,21 @@ class QueueWebSocketManager:
             if position is None:
                 continue
             ahead = max(0, position - 1)
+            eta_minutes = estimated_waits.get(ticket_id)
+            if ticket_id not in estimated_waits and event.get("eta_version") is None:
+                eta_minutes = -(-ahead * eta_per_position // 60)
             await self.send_to_ticket(ticket_id, {
                 "type": EventType.QUEUE_UPDATE.value,
                 "ticket_id": ticket_id,
                 "position": position,
                 "total_in_queue": total,
-                "estimated_wait_minutes": -(-ahead * eta_per_position // 60),  # arrondi supérieur
+                "estimated_wait_minutes": eta_minutes,
+                "estimated_wait_confidence": confidences.get(
+                    ticket_id,
+                    "low" if event.get("eta_available", True) else "unavailable",
+                ),
+                "eta_calculated_at": event.get("eta_calculated_at"),
+                "eta_version": event.get("eta_version"),
                 "current_called_number": event.get("current_called_number", ""),
             })
 

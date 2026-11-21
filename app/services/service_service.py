@@ -52,6 +52,11 @@ class ServiceService:
             description=data.description,
             ticket_prefix=prefix,
             avg_duration_minutes=data.avg_duration_minutes,
+            eta_ewma_alpha=data.eta_ewma_alpha,
+            eta_min_service_samples=data.eta_min_service_samples,
+            eta_min_counter_samples=data.eta_min_counter_samples,
+            eta_outlier_min_samples=data.eta_outlier_min_samples,
+            eta_outlier_mad_multiplier=data.eta_outlier_mad_multiplier,
             is_active=data.is_active,
         )
         self.db.add(service)
@@ -155,6 +160,18 @@ class ServiceService:
             )
 
         changes = data.model_dump(exclude_unset=True)
+        eta_or_availability_changed = any(
+            field in changes
+            for field in (
+                "avg_duration_minutes",
+                "eta_ewma_alpha",
+                "eta_min_service_samples",
+                "eta_min_counter_samples",
+                "eta_outlier_min_samples",
+                "eta_outlier_mad_multiplier",
+                "is_active",
+            )
+        )
 
         # P2-13 : le préfixe n'est pas modifiable (extra="forbid"), mais `is_active`
         # l'est. Réactiver un service dont le préfixe a été repris entre-temps par un
@@ -171,6 +188,13 @@ class ServiceService:
 
         await self.db.commit()
         await self.db.refresh(service)
+        if eta_or_availability_changed:
+            # Keep connected queue clients in sync with persisted ETA policy changes.
+            # Queue snapshots are best effort; the next authorized ticket read also
+            # reconstructs its current forecast from PostgreSQL.
+            from app.services.ticket_service import TicketService
+
+            await TicketService(self.db)._publish_queue_snapshot(org_id, branch_id, service_id)
         return self._to_dict(service)
 
     async def delete(self, service_id: str, branch_id: str, org_id: str) -> None:
@@ -201,6 +225,10 @@ class ServiceService:
 
         service.is_active = False
         await self.db.commit()
+
+        from app.services.ticket_service import TicketService
+
+        await TicketService(self.db)._publish_queue_snapshot(org_id, branch_id, service_id)
 
     # ── Helpers privés ────────────────────────────────────────────────────────
     async def _ensure_prefix_available(
@@ -277,6 +305,11 @@ class ServiceService:
             "description": service.description,
             "ticket_prefix": service.ticket_prefix,
             "avg_duration_minutes": service.avg_duration_minutes,
+            "eta_ewma_alpha": service.eta_ewma_alpha,
+            "eta_min_service_samples": service.eta_min_service_samples,
+            "eta_min_counter_samples": service.eta_min_counter_samples,
+            "eta_outlier_min_samples": service.eta_outlier_min_samples,
+            "eta_outlier_mad_multiplier": service.eta_outlier_mad_multiplier,
             "is_active": service.is_active,
             "created_at": service.created_at.isoformat() if service.created_at else None,
         }

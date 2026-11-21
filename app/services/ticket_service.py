@@ -5,7 +5,7 @@ Responsabilités :
   - Création et suivi des tickets (idempotent : client_action_id)
   - Machine à états explicite (transitions contrôlées)
   - Appel atomique du prochain ticket (ZPOPMIN + compare-and-set en base)
-  - Calcul ETA (moyenne glissante des derniers services réels)
+  - Prévision ETA issue de l'AWTE et des observations réelles persistées
   - Intégration Redis (file d'attente, position, échéances) avec auto-réparation
     depuis PostgreSQL (la vérité) si Redis est vide ou désynchronisé
   - Isolation multi-tenant via org_id + périmètre par guichet / branche pour le staff
@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,6 +53,7 @@ from app.models.audit_log import AuditAction, AuditLog
 from app.models.branch import Branch, Service
 from app.models.counter import Counter
 from app.models.employee import Employee, EmployeeStatus
+from app.models.eta import EtaPrediction, EtaServiceProfile
 from app.models.organization import Organization
 from app.models.queue_log import QueueLog, QueueLogAction
 from app.models.qape import AbuseEvent, AbusePolicy
@@ -77,6 +78,7 @@ from app.schemas.ticket import (
     TicketResponse,
 )
 from app.services.audit_service import AuditService
+from app.services.eta_service import EtaEstimator, ServiceQueueEstimate
 from app.services.outbox import OutboxService
 from app.websocket.events import EventType
 from app.websocket.publisher import counter_activity_event, publish_event, queue_snapshot_event
@@ -115,11 +117,6 @@ _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
 # Nombre maximum d'entrées périmées sautées par appel (ticket annulé/supprimé
 # mais resté dans la file Redis). Évite une boucle infinie sur une file corrompue.
 MAX_STALE_QUEUE_ENTRIES = 25
-
-# ETA : nombre de services récents moyennés, et poids du défaut quand l'historique est court
-ETA_SAMPLE_SIZE = 10
-ETA_MIN_SERVICE_SECONDS = 30
-ETA_MAX_SERVICE_SECONDS = 3600
 
 # Rôles autorisés à appeler depuis n'importe quel guichet de leur organisation.
 # Un AGENT, lui, ne peut appeler que depuis le guichet qui lui est affecté.
@@ -716,7 +713,6 @@ class TicketService:
         # devait nettoyer plus tard. On dégrade l'affichage, pas la prise de ticket.
         if queue_degraded:
             total = await self._count_waiting_in_db(ticket.service_id)
-            eta = await self.estimate_wait_minutes(service, total + 1)
         else:
             try:
                 total = await get_queue_size(ticket.org_id, ticket.agency_id, ticket.service_id)
@@ -725,7 +721,9 @@ class TicketService:
                     f"Taille de file indisponible pour {ticket.number} (affichage dégradé) : {exc}"
                 )
                 total = position
-            eta = await self.estimate_wait_minutes(service, position)
+        eta = await self.estimate_ticket_wait_minutes(
+            ticket, service, persist_forecast=True
+        )
         ticket.estimated_wait_minutes = eta
         await self.db.commit()
 
@@ -739,10 +737,12 @@ class TicketService:
         # sondage. C'est le cas le plus fréquent de la journée (un client arrive),
         # et c'est précisément celui que le poste desktop devait attendre 7 secondes.
         await self._publish_counter_activity(ticket, "ticket_created")
+        await self._publish_queue_snapshot(ticket.org_id, ticket.agency_id, ticket.service_id)
 
         response = self._to_response(ticket, position=position, total=total, eta=eta)
         response.queue_degraded = queue_degraded
-        await self._fill_context_names(response, ticket.service_id)
+        await self._fill_context_names(response, ticket.service_id, ticket.org_id)
+        await self._fill_eta_metadata(response, ticket)
         return response
 
     # ══ Consultation ═══════════════════════════════════════════════════════════
@@ -846,8 +846,11 @@ class TicketService:
             "status": response.status,
             "position": response.position,
             "total_in_queue": response.total_in_queue,
-            "estimated_wait_minutes": response.estimated_wait_minutes or 0,
-            "current_called_number": await self._current_called_number(ticket.service_id) or "",
+            "estimated_wait_minutes": response.estimated_wait_minutes,
+            "estimated_wait_confidence": response.estimated_wait_confidence,
+            "eta_calculated_at": response.eta_calculated_at.isoformat() if response.eta_calculated_at else None,
+            "eta_version": response.eta_version,
+            "current_called_number": await self._current_called_number(ticket.service_id, ticket.org_id) or "",
             "counter_name": ticket.counter_name,
         }
 
@@ -898,11 +901,16 @@ class TicketService:
                         f"File indisponible pour l'historique du ticket {t.number} ({exc}) "
                         ": position laissée à 0"
                     )
-            items.append(
-                self._to_response(
-                    t, position=position, total=queue_total, eta=t.estimated_wait_minutes
+            eta = t.estimated_wait_minutes
+            if t.status == TicketStatus.WAITING:
+                service = await self._get_service_row(t.service_id, t.org_id)
+                eta = await self.estimate_ticket_wait_minutes(
+                    t,
+                    service,
                 )
-            )
+            items.append(self._to_response(
+                t, position=position, total=queue_total, eta=eta
+            ))
 
         return TicketHistoryResponse(
             items=items,
@@ -1606,6 +1614,7 @@ class TicketService:
         ticket.served_at = datetime.now(timezone.utc)
         await self.db.commit()
         await clear_deadlines(ticket.org_id, ticket.id)  # présenté : plus d'absence possible
+        await self._publish_queue_snapshot(ticket.org_id, ticket.agency_id, ticket.service_id)
         return {"success": True, "ticket_id": ticket.id}
 
     async def complete_ticket(self, ticket_id: str, actor: User) -> dict:
@@ -1628,12 +1637,13 @@ class TicketService:
         )
         ticket.done_at = datetime.now(timezone.utc)
 
-        # Durée réelle de service (secondes) : source de l'ETA par moyenne glissante
+        # Durée réelle de service (secondes) : source de l'EWMA AWTE
         if ticket.served_at:
             ticket.service_seconds = max(
                 0, int((ticket.done_at - as_utc(ticket.served_at)).total_seconds())
             )
 
+        await EtaEstimator(self.db).record_completed_ticket(ticket)
         await self._release_counter(ticket)
         await self.db.commit()
 
@@ -1651,6 +1661,7 @@ class TicketService:
             "ticket_number": ticket.number,
             "agency_id": ticket.agency_id,
         })
+        await self._publish_queue_snapshot(ticket.org_id, ticket.agency_id, ticket.service_id)
         return {"success": True, "ticket_id": ticket.id}
 
     async def mark_incomplete(self, ticket_id: str, actor: User, reason: str | None = None) -> dict:
@@ -1672,6 +1683,7 @@ class TicketService:
             actor_id=actor.id, actor_role=actor.role.value,
             extra={"reason": reason} if reason else None,
         )
+        await EtaEstimator(self.db).record_interrupted_ticket(ticket, "incomplete")
         await self._release_counter(ticket)
         await self.db.commit()
         return {"success": True, "ticket_id": ticket.id}
@@ -1829,6 +1841,7 @@ class TicketService:
                 "reason": reason,
             },
         )
+        await EtaEstimator(self.db).record_interrupted_ticket(ticket, "transferred")
         await self._release_counter(ticket)
 
         # 2. Nouvelle identité dans le service cible
@@ -2387,86 +2400,121 @@ class TicketService:
             ids = await get_queue_snapshot(org_id, agency_id, service_id)
             if not ids:
                 return
-            service = await self._get_service_row(service_id)
+            service = await self._get_service_row(service_id, org_id)
             avg_seconds = await self._avg_service_seconds(
-                service_id, service.avg_duration_minutes if service else 5
-            )
-            await publish_event(org_id, queue_snapshot_event(
+                service_id, service.avg_duration_minutes if service else 0
+            ) if service is not None else 0
+            estimated_waits: dict[str, int | None] = {}
+            eta_confidences: dict[str, str] = {}
+            eta_calculated_at = None
+            # Non-null marks the production payload, even if the estimate is
+            # unavailable; WebSocket clients must not fall back to a fake ETA.
+            eta_version = 0
+            eta_available = False
+            if service is not None:
+                try:
+                    estimate = (await EtaEstimator(self.db).estimate_many(
+                        [service], persist_forecasts=True
+                    )).get(service_id)
+                    if estimate is not None:
+                        estimated_waits = {
+                            ticket_id: (
+                                math.ceil(value.wait_seconds / 60)
+                                if value.wait_seconds is not None else None
+                            )
+                            for ticket_id, value in estimate.ticket_details.items()
+                        }
+                        eta_confidences = {
+                            ticket_id: value.confidence
+                            for ticket_id, value in estimate.ticket_details.items()
+                        }
+                        eta_calculated_at = estimate.calculated_at.isoformat() if estimate.calculated_at else None
+                        eta_version = estimate.version
+                        eta_available = estimate.next_ticket_minutes is not None
+                except Exception as exc:  # noqa: BLE001 — conserver le snapshot historique
+                    logger.warning(
+                        f"ETA dynamique indisponible pour le snapshot {service_id} ({exc})"
+                    )
+            event = queue_snapshot_event(
                 agency_id=agency_id,
                 service_id=service_id,
                 positions={tid: index + 1 for index, tid in enumerate(ids)},
-                current_called_number=await self._current_called_number(service_id),
+                current_called_number=await self._current_called_number(service_id, org_id),
                 eta_seconds_per_position=avg_seconds,
-            ))
+                estimated_wait_minutes_by_ticket=estimated_waits,
+                eta_confidence_by_ticket=eta_confidences,
+                eta_calculated_at=eta_calculated_at,
+                eta_version=eta_version,
+                eta_available=eta_available,
+            )
+            # Commit the forecast projection and its event together. The business
+            # transition was already committed by the Queue Engine; from this point
+            # onward the existing outbox guarantees replay after Redis recovery.
+            outbox = OutboxService(self.db)
+            row_id = await outbox.enqueue(
+                org_id=org_id,
+                event_type=event["type"],
+                payload=event,
+            )
+            await self.db.commit()
+            if await outbox.publish_now(row_id, org_id, event):
+                await self.db.commit()
         except Exception as exc:  # noqa: BLE001 — jamais bloquant
             logger.error(f"Snapshot de file non publié (service={service_id}): {exc}")
 
     # ══ ETA ════════════════════════════════════════════════════════════════════
 
-    async def estimate_wait_minutes(self, service: Service | None, position: int) -> int:
+    async def estimate_service_queues(
+        self, services: list[Service]
+    ) -> dict[str, ServiceQueueEstimate]:
+        """Retourne les ETA dynamiques groupées, avec état indisponible explicite."""
+        return await EtaEstimator(self.db).estimate_many(services)
+
+    async def estimate_ticket_wait_minutes(
+        self,
+        ticket: Ticket,
+        service: Service | None,
+        *,
+        persist_forecast: bool = False,
+    ) -> int | None:
+        """Prévoit l'attente restante à partir de l'état opérationnel courant.
+
+        Une absence de capacité opérationnelle ou une erreur temporaire de calcul
+        renvoie `None` : la position seule ne décrit pas la capacité disponible.
         """
-        Estime l'attente en minutes pour une position donnée (1 = prochain).
-
-        ETA = personnes devant × durée moyenne d'un service, arrondie à la minute
-        supérieure. La durée moyenne est celle des derniers services RÉELS du service
-        (moyenne glissante), lissée par la valeur configurée tant que l'historique est court.
-
-        Args:
-            service: Le service (fournit la durée par défaut). None → 5 minutes.
-            position: Position dans la file (1 = prochain)
-
-        Returns:
-            Minutes d'attente estimées (0 si c'est le prochain ou hors file).
-        """
-        if position <= 1:
-            return 0
-        default_minutes = service.avg_duration_minutes if service else 5
-        service_id = service.id if service else None
-        avg_seconds = await self._avg_service_seconds(service_id, default_minutes)
-        return math.ceil((position - 1) * avg_seconds / 60)
+        if ticket.status != TicketStatus.WAITING or service is None:
+            return ticket.estimated_wait_minutes or 0
+        try:
+            estimate = (await EtaEstimator(self.db).estimate_many(
+                [service], persist_forecasts=persist_forecast
+            )).get(service.id)
+            if estimate is not None:
+                return estimate.ticket_minutes.get(ticket.id)
+        except Exception as exc:  # noqa: BLE001 — ETA ne doit jamais casser le ticket
+            logger.warning(
+                f"ETA dynamique indisponible pour {ticket.number} ({exc}); aucune prévision n'est publiée"
+            )
+            return None
 
     async def _avg_service_seconds(self, service_id: str | None, default_minutes: int) -> int:
-        """
-        Durée moyenne d'un service en secondes — moyenne glissante des ETA_SAMPLE_SIZE
-        derniers tickets DONE de ce service.
-
-        Avec n < ETA_SAMPLE_SIZE échantillons, la durée configurée complète la moyenne
-        (lissage) : un seul service très long ne fausse pas tout l'ETA. Borné entre
-        ETA_MIN_SERVICE_SECONDS et ETA_MAX_SERVICE_SECONDS.
-        """
-        samples: list[int] = []
-        if service_id:
-            result = await self.db.execute(
-                select(Ticket.service_seconds)
-                .where(
-                    Ticket.service_id == service_id,
-                    Ticket.status == TicketStatus.DONE,
-                    Ticket.service_seconds.isnot(None),
-                    # Un ticket DONE sans done_at ne peut pas être ordonné : il est
-                    # exclu, sinon PostgreSQL le place EN TÊTE du tri descendant
-                    # (NULLS FIRST par défaut) et la fenêtre glissante est fausse.
-                    Ticket.done_at.isnot(None),
-                )
-                .order_by(Ticket.done_at.desc())
-                .limit(ETA_SAMPLE_SIZE)
+        """Lit l'EWMA persisté; tant que le seuil n'est pas atteint, utilise la config."""
+        if not service_id:
+            return max(0, default_minutes) * 60
+        service = (await self.db.execute(
+            select(Service).where(Service.id == service_id)
+        )).scalar_one_or_none()
+        if service is None:
+            return max(0, default_minutes) * 60
+        from app.models.eta import EtaServiceProfile
+        profile = (await self.db.execute(
+            select(EtaServiceProfile).where(
+                EtaServiceProfile.org_id == service.org_id,
+                EtaServiceProfile.service_id == service_id,
             )
-            samples = [s for (s,) in result.all()]
-
-        return self._blend_service_seconds(samples, default_minutes)
-
-    @staticmethod
-    def _blend_service_seconds(samples: list[int], default_minutes: int) -> int:
-        """
-        Mélange les durées observées avec la durée configurée (lissage).
-
-        Avec n < ETA_SAMPLE_SIZE échantillons, la durée configurée complète la
-        moyenne : un seul service très long ne fausse pas tout l'ETA. Borné entre
-        ETA_MIN_SERVICE_SECONDS et ETA_MAX_SERVICE_SECONDS.
-        """
-        default_seconds = max(1, default_minutes) * 60
-        padding = max(0, ETA_SAMPLE_SIZE - len(samples))
-        average = (sum(samples) + default_seconds * padding) / ETA_SAMPLE_SIZE
-        return int(min(ETA_MAX_SERVICE_SECONDS, max(ETA_MIN_SERVICE_SECONDS, average)))
+        )).scalar_one_or_none()
+        if profile and profile.sample_count >= service.eta_min_service_samples:
+            return max(0, int(round(profile.ewma_seconds)))
+        return max(0, service.avg_duration_minutes) * 60
 
     async def avg_service_seconds_batch(self, services: list[Service]) -> dict[str, int]:
         """
@@ -2487,38 +2535,19 @@ class TicketService:
         if not services:
             return {}
 
-        ids = [s.id for s in services]
-        ranked = (
-            select(
-                Ticket.service_id.label("service_id"),
-                Ticket.service_seconds.label("service_seconds"),
-                func.row_number().over(
-                    partition_by=Ticket.service_id,
-                    order_by=Ticket.done_at.desc(),
-                ).label("rn"),
+        ids = [service.id for service in services]
+        org_ids = {service.org_id for service in services if service.org_id}
+        profiles = (await self.db.execute(
+            select(EtaServiceProfile).where(
+                EtaServiceProfile.org_id.in_(org_ids),
+                EtaServiceProfile.service_id.in_(ids),
             )
-            .where(
-                Ticket.service_id.in_(ids),
-                Ticket.status == TicketStatus.DONE,
-                Ticket.service_seconds.isnot(None),
-                Ticket.done_at.isnot(None),
-            )
-            .subquery()
-        )
-
-        rows = (await self.db.execute(
-            select(ranked.c.service_id, ranked.c.service_seconds)
-            .where(ranked.c.rn <= ETA_SAMPLE_SIZE)
-        )).all()
-
-        samples: dict[str, list[int]] = {service_id: [] for service_id in ids}
-        for service_id, seconds in rows:
-            samples[service_id].append(seconds)
-
+        )).scalars().all() if org_ids else []
+        by_id = {profile.service_id: profile for profile in profiles}
         return {
-            service.id: self._blend_service_seconds(
-                samples[service.id], service.avg_duration_minutes
-            )
+            service.id: max(0, int(round(by_id[service.id].ewma_seconds)))
+            if service.id in by_id and by_id[service.id].sample_count >= service.eta_min_service_samples
+            else max(0, service.avg_duration_minutes) * 60
             for service in services
         }
 
@@ -2762,6 +2791,7 @@ class TicketService:
                 ticket.actual_wait_minutes = max(
                     0, int((now - as_utc(ticket.created_at)).total_seconds() // 60)
                 )
+                await EtaEstimator(self.db).record_prediction_at_call(ticket, now)
                 await self._log_action(
                     ticket=ticket,
                     action=QueueLogAction.TICKET_CALLED,
@@ -2827,6 +2857,7 @@ class TicketService:
                 **(extra or {}),
             },
         )
+        await EtaEstimator(self.db).record_interrupted_ticket(ticket, "absent")
         await self._release_counter(ticket)
         await self.db.commit()
         await clear_deadlines(ticket.org_id, ticket.id)
@@ -2867,15 +2898,14 @@ class TicketService:
         Auto-réparation : un ticket WAITING absent de Redis est réinséré à sa place d'origine.
 
         Dégradation : si Redis est indisponible, la position exacte est inconnue mais
-        la lecture ne doit PAS échouer. On renvoie alors la position 0 (inconnue), le
-        nombre d'attente lu en base, et une ETA prudente (comme si le client était le
-        dernier). Avant, une panne Redis transformait toute consultation de ticket en
-        500 — alors que l'écran public, lui, retombait déjà sur PostgreSQL.
+        la lecture ne doit PAS échouer. On renvoie alors la position 0 (inconnue) et
+        le nombre d'attente lu en base. L'AWTE calcule son estimation depuis l'état
+        PostgreSQL et renvoie null si elle ne peut pas établir une capacité fiable.
         """
         position = 0
         total = 0
         eta = ticket.estimated_wait_minutes
-        service = await self._get_service_row(ticket.service_id)
+        service = await self._get_service_row(ticket.service_id, ticket.org_id)
 
         if ticket.status == TicketStatus.WAITING:
             try:
@@ -2890,7 +2920,11 @@ class TicketService:
                     )
                     logger.warning(f"Ticket {ticket.number} absent de Redis : remis en file (auto-réparation)")
                 total = await get_queue_size(ticket.org_id, ticket.agency_id, ticket.service_id)
-                eta = await self.estimate_wait_minutes(service, position)
+                eta = await self.estimate_ticket_wait_minutes(
+                    ticket,
+                    service,
+                    persist_forecast=True,
+                )
             except Exception as exc:  # noqa: BLE001 — Redis ne doit jamais casser une lecture
                 logger.warning(
                     f"File indisponible pour {ticket.number} ({exc}) : position inconnue, "
@@ -2898,12 +2932,44 @@ class TicketService:
                 )
                 position = 0
                 total = await self._count_waiting_in_db(ticket.service_id)
-                eta = await self.estimate_wait_minutes(service, total + 1)
+                eta = await self.estimate_ticket_wait_minutes(
+                    ticket, service,
+                    persist_forecast=True,
+                )
 
         response = self._to_response(ticket, position=max(0, position), total=total, eta=eta)
-        await self._fill_context_names(response, ticket.service_id)
+        # AWTE : les prévisions sont persistées pendant la lecture ; on commit
+        # pour que les versions ETA soient visibles par les autres sessions.
+        if ticket.status == TicketStatus.WAITING:
+            await self.db.commit()
+        await self._fill_eta_metadata(response, ticket)
+        # Signature à 3 arguments introduite par AWTE (org_id requis pour
+        # l'isolation multi-tenant des noms d'affichage).
+        await self._fill_context_names(response, ticket.service_id, ticket.org_id)
+        # Anti-fraude (QAPE/main) : identité du client pour le guichetier.
         await self._fill_client_identity(response, ticket.user_id)
         return response
+
+    async def _fill_eta_metadata(self, response: TicketResponse, ticket: Ticket) -> None:
+        """Attach current forecast metadata from the tenant-scoped projection."""
+        if not ticket.org_id:
+            return
+        prediction = (await self.db.execute(
+            select(EtaPrediction)
+            .where(
+                EtaPrediction.ticket_id == ticket.id,
+                EtaPrediction.org_id == ticket.org_id,
+                EtaPrediction.branch_id == ticket.agency_id,
+                EtaPrediction.service_id == ticket.service_id,
+            )
+            .order_by(EtaPrediction.version.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        if prediction is None:
+            return
+        response.estimated_wait_confidence = prediction.confidence
+        response.eta_calculated_at = prediction.calculated_at
+        response.eta_version = prediction.version
 
     async def _count_waiting_in_db(self, service_id: str) -> int:
         """Nombre de tickets WAITING d'un service, lu en base (repli quand Redis est absent)."""
@@ -2944,17 +3010,19 @@ class TicketService:
             queue_sequence=ticket.queue_sequence,
         )
 
-    async def _current_called_number(self, service_id: str) -> str | None:
+    async def _current_called_number(self, service_id: str, org_id: str | None = None) -> str | None:
         """Dernier numéro appelé dans un service (affiché dans la salle d'attente)."""
-        result = await self.db.execute(
-            select(Ticket.number)
-            .where(Ticket.service_id == service_id, Ticket.called_at.isnot(None))
-            .order_by(Ticket.called_at.desc())
-            .limit(1)
+        query = select(Ticket.number).where(
+            Ticket.service_id == service_id, Ticket.called_at.isnot(None)
         )
+        if org_id:
+            query = query.where(Ticket.org_id == org_id)
+        result = await self.db.execute(query.order_by(Ticket.called_at.desc()).limit(1))
         return result.scalar_one_or_none()
 
-    async def current_called_numbers(self, service_ids: list[str]) -> dict[str, str | None]:
+    async def current_called_numbers(
+        self, service_ids: list[str], org_id: str | None = None
+    ) -> dict[str, str | None]:
         """
         Variante GROUPÉE de `_current_called_number` : une requête pour N services.
 
@@ -2971,7 +3039,7 @@ class TicketService:
         if not service_ids:
             return {}
 
-        ranked = (
+        ranked_query = (
             select(
                 Ticket.service_id.label("service_id"),
                 Ticket.number.label("number"),
@@ -2981,8 +3049,10 @@ class TicketService:
                 ).label("rn"),
             )
             .where(Ticket.service_id.in_(service_ids), Ticket.called_at.isnot(None))
-            .subquery()
         )
+        if org_id:
+            ranked_query = ranked_query.where(Ticket.org_id == org_id)
+        ranked = ranked_query.subquery()
 
         rows = (await self.db.execute(
             select(ranked.c.service_id, ranked.c.number).where(ranked.c.rn == 1)
@@ -2992,12 +3062,17 @@ class TicketService:
         numbers.update({service_id: number for service_id, number in rows})
         return numbers
 
-    async def _get_service_row(self, service_id: str) -> Service | None:
-        """Récupère un service par ID (sans contrôle de tenant : usage interne uniquement)."""
-        result = await self.db.execute(select(Service).where(Service.id == service_id))
+    async def _get_service_row(self, service_id: str, org_id: str | None = None) -> Service | None:
+        """Récupère un service dans son tenant lorsque celui-ci est connu."""
+        query = select(Service).where(Service.id == service_id)
+        if org_id:
+            query = query.where(Service.org_id == org_id)
+        result = await self.db.execute(query)
         return result.scalar_one_or_none()
 
-    async def _fill_context_names(self, response: TicketResponse, service_id: str) -> None:
+    async def _fill_context_names(
+        self, response: TicketResponse, service_id: str, org_id: str | None = None
+    ) -> None:
         """
         Renseigne les noms lisibles (organisation, agence, service) d'une réponse.
 
@@ -3009,7 +3084,7 @@ class TicketService:
         sur son cache local), il ne doit pas empêcher la consultation du ticket.
         """
         try:
-            row = (await self.db.execute(
+            query = (
                 select(
                     Service.name,
                     Branch.name,
@@ -3020,7 +3095,13 @@ class TicketService:
                 .outerjoin(Branch, Branch.id == Service.branch_id)
                 .outerjoin(Organization, Organization.id == Branch.org_id)
                 .where(Service.id == service_id)
-            )).first()
+            )
+            if org_id:
+                # A legacy branch may have lost its org link while its service
+                # still carries the ticket's tenant. Keep display names in that
+                # case without exposing a different tenant's service row.
+                query = query.where(or_(Branch.org_id == org_id, Service.org_id == org_id))
+            row = (await self.db.execute(query)).first()
         except Exception as exc:  # noqa: BLE001 — l'affichage ne casse pas la lecture
             logger.warning(
                 f"Noms d'affichage indisponibles pour le service {service_id} : {exc}"
@@ -3406,6 +3487,11 @@ class TicketService:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail={"code": "COUNTER_CLOSED", "message": "Ce guichet est fermé. Ouvrez-le avant d'appeler un ticket"},
+            )
+        if counter.is_paused:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "COUNTER_PAUSED", "message": "Ce guichet est en pause"},
             )
         return counter
 

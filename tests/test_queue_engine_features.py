@@ -2,7 +2,7 @@
 Tests des fonctions du Queue Engine — contre un VRAI Redis.
 
 Couvre : transfert, confirmation de priorité, auto-absent (scheduler), expirations,
-reconstruction de la file depuis PostgreSQL (auto-réparation), ETA par moyenne glissante,
+reconstruction de la file depuis PostgreSQL (auto-réparation), apprentissage ETA AWTE,
 idempotence, quotas / horaires, flux INCOMPLETE → requeue/close, périmètre des agents,
 événements temps réel publiés par le service.
 
@@ -565,57 +565,6 @@ async def test_create_ticket_survit_a_une_panne_redis(ticket_service, db_session
 
 # ══ ETA ═══════════════════════════════════════════════════════════════════════
 
-async def _add_done_tickets(db_session, org, agency, service, durations: list[int]) -> None:
-    """Insère des tickets DONE avec des durées de service réelles."""
-    base = datetime.now(timezone.utc) - timedelta(hours=1)
-    for index, seconds in enumerate(durations):
-        db_session.add(Ticket(
-            number=f"A-{900 + index}", prefix="A", sequence=900 + index, user_id=f"hist-{index}",
-            org_id=org.id, agency_id=agency.id, service_id=service.id,
-            status=TicketStatus.DONE, service_seconds=seconds,
-            done_at=base + timedelta(minutes=index),
-        ))
-    await db_session.commit()
-
-
-@pytest.mark.asyncio
-async def test_eta_uses_configured_duration_without_history(ticket_service, db_session, real_redis):
-    """Sans historique : durée configurée du service (5 min) × personnes devant."""
-    org, agency, service, counter, agent = await _world(db_session)
-
-    assert await ticket_service.estimate_wait_minutes(service, 1) == 0, "prochain : pas d'attente"
-    assert await ticket_service.estimate_wait_minutes(service, 3) == 10   # 2 devant × 5 min
-
-
-@pytest.mark.asyncio
-async def test_eta_follows_rolling_average_of_real_services(ticket_service, db_session, real_redis):
-    """Dix services réels de 60 s : l'ETA suit la réalité (2 min pour 2 personnes devant)."""
-    org, agency, service, counter, agent = await _world(db_session)
-    await _add_done_tickets(db_session, org, agency, service, [60] * 10)
-
-    assert await ticket_service.estimate_wait_minutes(service, 3) == 2
-
-
-@pytest.mark.asyncio
-async def test_eta_is_smoothed_while_history_is_short(ticket_service, db_session, real_redis):
-    """Peu d'historique : la durée configurée complète la moyenne (pas d'emballement)."""
-    org, agency, service, counter, agent = await _world(db_session)
-    await _add_done_tickets(db_session, org, agency, service, [120, 120])
-
-    # (120+120 + 8×300) / 10 = 264 s ; 1 personne devant → 264 s → 5 min (arrondi supérieur)
-    assert await ticket_service.estimate_wait_minutes(service, 2) == 5
-
-
-@pytest.mark.asyncio
-async def test_eta_ignores_other_services(ticket_service, db_session, real_redis):
-    """L'historique d'un autre service n'influence pas l'ETA de celui-ci."""
-    org, agency, service, counter, agent = await _world(db_session)
-    other = await _make_service(db_session, org.id, agency.id, "B", "Crédit")
-    await _add_done_tickets(db_session, org, agency, other, [10] * 10)
-
-    assert await ticket_service.estimate_wait_minutes(service, 3) == 10
-
-
 @pytest.mark.asyncio
 async def test_real_wait_and_service_duration_are_recorded(ticket_service, db_session, real_redis):
     """À l'appel : attente réelle ; à la fin : durée réelle du service (secondes)."""
@@ -861,7 +810,9 @@ async def test_call_next_publishes_realtime_events_from_service(ticket_service, 
     second = await _new_ticket(ticket_service, agency, service, "client-2")
     agency_id = agency.id
 
-    with patch("app.services.ticket_service.publish_event", new_callable=AsyncMock) as publish:
+    publish = AsyncMock()
+    with patch("app.services.ticket_service.publish_event", new=publish), \
+         patch("app.services.outbox.publish_event", new=publish):
         await _call(ticket_service, org, agency, service, counter, agent)
 
     events = {call.args[1]["type"]: call.args[1] for call in publish.call_args_list}
