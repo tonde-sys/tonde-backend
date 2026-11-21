@@ -108,6 +108,15 @@ class TicketResponse(BaseModel):
     # faisait, et qui ne reproduisait pas exactement l'ordre du serveur.
     queue_sequence: Optional[int] = None
 
+    # ── Identité du client (anti-fraude) ──────────────────────
+    # Affichés au guichetier lors de l'appel pour vérifier que la personne
+    # présente correspond à celle qui a pris le ticket. Renseignés uniquement
+    # pour les routes consultées par le staff (get_ticket, call_next).
+    # Le mobile client ne les reçoit pas (ils ne sont pas peuplés dans les
+    # réponses client — _fill_client_identity n'est appelé que côté staff).
+    client_name: Optional[str] = None
+    client_phone: Optional[str] = None
+
 
 class TicketHistoryResponse(BaseModel):
     """Réponse paginée pour l'historique des tickets."""

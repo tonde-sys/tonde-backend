@@ -1367,6 +1367,19 @@ class TicketService:
         assert ticket is not None
         logger.info(f"Ticket appelé: {ticket.number} → guichet {counter_name} | org={org_id}")
 
+        # Identité du client pour le guichetier (anti-fraude : vérification visuelle)
+        client_name: str | None = None
+        client_phone: str | None = None
+        try:
+            client_user = (await self.db.execute(
+                select(User.name, User.phone).where(User.id == ticket.user_id)
+            )).first()
+            if client_user:
+                client_name = client_user.name or None
+                client_phone = client_user.phone or None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Identité client indisponible pour ticket {ticket.id}: {exc}")
+
         # Échéances : avertissement puis passage automatique en ABSENT
         await self._schedule_absent_deadlines(ticket)
 
@@ -1402,6 +1415,8 @@ class TicketService:
             "ticket_number": ticket.number,
             "counter_name": counter_name,
             "user_id": ticket.user_id,
+            "client_name": client_name,
+            "client_phone": client_phone,
         }
 
     async def recall(self, ticket_id: str, actor: User) -> dict:
@@ -2887,6 +2902,7 @@ class TicketService:
 
         response = self._to_response(ticket, position=max(0, position), total=total, eta=eta)
         await self._fill_context_names(response, ticket.service_id)
+        await self._fill_client_identity(response, ticket.user_id)
         return response
 
     async def _count_waiting_in_db(self, service_id: str) -> int:
@@ -3017,6 +3033,33 @@ class TicketService:
         response.agency_name = branch_name
         response.organization_id = org_id
         response.organization_name = org_name
+
+    async def _fill_client_identity(self, response: TicketResponse, user_id: str) -> None:
+        """
+        Renseigne l'identité du client (nom, téléphone) sur la réponse.
+
+        Anti-fraude : le guichetier voit qui a pris le ticket quand il l'appelle,
+        pour vérifier que la personne présente au guichet correspond à celle qui
+        a réservé. Sans cela, un fraudeur pouvait vendre un ticket : le guichetier
+        n'avait aucun moyen de savoir à qui il appartenait.
+
+        N'échoue jamais : un user supprimé ou sans nom dégrade l'affichage (le
+        guichetier voit « Client » au lieu d'un nom), il ne doit pas empêcher
+        la consultation du ticket.
+        """
+        try:
+            user = (await self.db.execute(
+                select(User.name, User.phone).where(User.id == user_id)
+            )).first()
+        except Exception as exc:  # noqa: BLE001 — l'affichage ne casse pas la lecture
+            logger.warning(
+                f"Identité client indisponible pour user {user_id} : {exc}"
+            )
+            return
+        if user is None:
+            return
+        response.client_name = user.name or None
+        response.client_phone = user.phone or None
 
     async def _enforce_daily_limit(self, branch: Branch) -> None:
         """
