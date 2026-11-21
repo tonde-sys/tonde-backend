@@ -23,6 +23,29 @@
     "avg_service_minutes": 5,
     "is_open": true
   },
+  "qape": {
+    "enabled": true,
+    "description": "Active QAPE sur toute l'organisation (tous les services). Seuils par defaut : 3 tickets rapides, 3 requetes/10min, 5 tickets/jour, cooldown 60s.",
+    "limits": {
+      "bucket_capacity": 3,
+      "bucket_refill_seconds": 30.0,
+      "max_requests_per_10m": 3,
+      "max_tickets_per_day": 5
+    },
+    "risk": {
+      "review_threshold": 4,
+      "cooldown_seconds": 60,
+      "hard_block_seconds": 300
+    },
+    "counting": {
+      "timezone": "Africa/Bujumbura"
+    },
+    "staff_override": {
+      "enabled": true,
+      "require_reason": true
+    },
+    "redis_unavailable": "REVIEW_REQUIRED"
+  },
   "services": [
     {
       "name": "Prise de Photo",

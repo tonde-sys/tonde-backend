@@ -94,6 +94,7 @@ async def test_bootstrap_creates_complete_pilot_organization(db_session):
     assert result.generated_passwords == {}
     assert result.created == {
         "organizations": 1,
+        "qape_policies": 1,  # QAPE actif par défaut sur toute nouvelle org
         "branches": 1,
         "services": 2,
         "counters": 2,
@@ -101,6 +102,11 @@ async def test_bootstrap_creates_complete_pilot_organization(db_session):
         "memberships": 3,
         "employees": 3,
     }
+    # La section `qape` est absente du config de test : le défaut doit
+    # activer QAPE sur toute l'organisation (scope org-wide).
+    assert result.qape is not None
+    assert result.qape["enabled"] is True
+    assert result.qape["scope"] == "organization"
 
     assert await _count(db_session, Organization) == 1
     assert await _count(db_session, Branch) == 1

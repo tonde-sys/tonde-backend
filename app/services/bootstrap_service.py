@@ -35,9 +35,12 @@ from app.core.security import hash_password
 from app.models.branch import Branch, Service
 from app.models.counter import Counter
 from app.models.employee import Employee, EmployeeStatus
+from app.models.qape import AbusePolicy
 from app.models.organization import Organization
 from app.models.user import User, UserRole
 from app.models.user_organization import UserOrganization
+from app.schemas.qape import PolicyConfig, PolicyInput
+from app.services.qape_data import PolicyRepository
 
 VALID_SECTORS = {"bank", "hospital", "university", "administration", "other"}
 VALID_STAFF_ROLES = {
@@ -75,6 +78,7 @@ class BootstrapResult:
     users: list[dict[str, Any]] = field(default_factory=list)
     generated_passwords: dict[str, str] = field(default_factory=dict)
     created: dict[str, int] = field(default_factory=dict)
+    qape: dict[str, Any] | None = None
     dry_run: bool = False
 
     def as_dict(self) -> dict[str, Any]:
@@ -87,11 +91,99 @@ class BootstrapResult:
             "users": self.users,
             "generated_passwords": self.generated_passwords,
             "created": self.created,
+            "qape": self.qape,
         }
 
 
 def _fail(message: str) -> None:
     raise BootstrapError(message)
+
+
+# Configuration QAPE par défaut, appliquée à toute organisation bootstrappée.
+# Valeurs conservatrices : un client honnête n'est jamais gêné, un abus est
+# ralenti puis soumis à revue humaine plutôt que bloqué sèchement.
+_DEFAULT_QAPE_CONFIG = PolicyConfig(
+    limits={
+        "bucket_capacity": 3,
+        "bucket_refill_seconds": 30.0,
+        "max_requests_per_10m": 3,
+        "max_tickets_per_day": 5,
+    },
+    risk={
+        "review_threshold": 4,
+        "cooldown_seconds": 60,
+        "hard_block_seconds": 300,
+    },
+    counting={"timezone": "Africa/Bujumbura"},
+    staff_override={"enabled": True, "require_reason": True},
+    redis_unavailable="REVIEW_REQUIRED",
+)
+
+
+async def _ensure_qape_policy(
+    db: AsyncSession,
+    org: Organization,
+    qape_cfg: Mapping[str, Any] | None,
+    created: dict[str, int],
+) -> AbusePolicy | None:
+    """
+    Active QAPE sur toute l'organisation si la section `qape` le demande.
+
+    Appelée à chaque bootstrap : idempotente (une org déjà pourvue d'une
+    politique org-wide active est laissée telle quelle). Le scope est
+    organisation-wide (`service_id=NULL`) : la politique couvre tous les
+    services présents et futurs de l'organisation.
+
+    La configuration est validée par `PolicyConfig`/`PolicyInput` avant
+    écriture — un champ inconnu ou un seuil invalide fait échouer le bootstrap
+    au lieu d'écrire une politique incomplète.
+
+    Args:
+        db: session async (la transaction reste gérée par bootstrap_pilot).
+        org: organisation fraîchement créée ou retrouvée.
+        qape_cfg: section `qape` du JSON (None = défaut activé).
+        created: compteur de création, incrémenté si une politique est écrite.
+
+    Returns:
+        La politique créée, ou None si désactivée / déjà active.
+    """
+    if qape_cfg is None:
+        qape_cfg = {}
+    if not isinstance(qape_cfg, Mapping):
+        _fail("qape doit être un objet")
+
+    if qape_cfg.get("enabled", True) is False:
+        return None
+
+    repo = PolicyRepository(db)
+    existing = await repo.effective(org.id, None)
+    if existing is not None:
+        # Idempotence : ne jamais remplacer une politique déjà active — elle
+        # peut avoir été ajustée en production depuis le bootstrap initial.
+        return None
+
+    raw_config = {k: v for k, v in qape_cfg.items()
+                  if k not in ("enabled", "description")}
+    if not raw_config:
+        raw_config = _DEFAULT_QAPE_CONFIG.model_dump()
+
+    try:
+        config = PolicyConfig(**raw_config)
+        data = PolicyInput(
+            org_id=org.id,
+            service_id=None,  # organisation-wide : tous les services
+            version=1,
+            enabled=True,
+            config=config,
+            created_by=None,
+        )
+    except Exception as exc:
+        _fail(f"qape.configuration invalide : {exc}")
+
+    policy = await repo.create(data)
+    await repo.activate(org.id, policy.id)
+    created["qape_policies"] = created.get("qape_policies", 0) + 1
+    return policy
 
 
 def _text(
@@ -596,6 +688,7 @@ async def bootstrap_pilot(
         services_cfg = config.get("services") or []
         counters_cfg = config.get("counters") or []
         users_cfg = config.get("users") or []
+        qape_cfg = config.get("qape")
 
         if not isinstance(org_cfg, Mapping):
             _fail("organization est obligatoire")
@@ -617,6 +710,7 @@ async def bootstrap_pilot(
             _fail("users doit contenir au moins un admin_org ou un super_admin")
 
         org = await _get_or_create_organization(db, org_cfg, created)
+        qape_policy = await _ensure_qape_policy(db, org, qape_cfg, created)
         branch = await _get_or_create_branch(db, org, branch_cfg, created)
         services = await _ensure_services(db, org, branch, services_cfg, created)
         counters = await _ensure_counters(db, org, branch, counters_cfg, created)
@@ -624,6 +718,12 @@ async def bootstrap_pilot(
 
         result = BootstrapResult(
             organization={"id": org.id, "name": org.name, "slug": org.slug},
+            qape=(
+                {"enabled": True, "policy_id": qape_policy.id,
+                 "scope": "organization", "version": qape_policy.version}
+                if qape_policy is not None
+                else {"enabled": False, "reason": "already_active_or_disabled"}
+            ),
             branch={"id": branch.id, "name": branch.name, "slug": branch.slug},
             services=[
                 {
