@@ -32,6 +32,8 @@ from app.core.redis import (
     mark_once,
 )
 from app.services.outbox import OutboxService
+from app.services.qape_recovery import claim_expired, reconcile_one
+import uuid
 from app.services.ticket_service import TicketService
 
 logger = logging.getLogger(__name__)
@@ -131,6 +133,21 @@ class QueueScheduler:
         stats = {"warnings": 0, "absent": 0, "expired": 0, "alerts": 0, "repaired": 0,
                  "published": 0}
 
+        # PostgreSQL leasing (SKIP LOCKED) works even when Redis is unavailable.
+        # Separate sessions ensure a claim is durable before any Redis call.
+        try:
+            owner = str(uuid.uuid4())
+            async with self._session_factory() as claim_session:
+                claims = await claim_expired(claim_session, owner=owner, limit=20)
+            for operation_id, epoch in claims:
+                try:
+                    async with self._session_factory() as recovery_session:
+                        await reconcile_one(recovery_session, operation_id, owner, epoch)
+                except Exception:
+                    logger.exception('QAPE recovery failed operation=%s', operation_id)
+        except Exception:
+            logger.exception('QAPE recovery scan failed (check migration 017)')
+
         for org_id, ticket_id in await claim_due_deadlines(DEADLINE_WARNING, now_ts):
             if await self._safely(org_id, ticket_id, "avertissement", "send_absent_warning"):
                 stats["warnings"] += 1
@@ -165,6 +182,7 @@ class QueueScheduler:
                     stats["published"] = await OutboxService(session).dispatch()
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"Scheduler : maintenance échouée : {exc}", exc_info=True)
+
 
         return stats
 

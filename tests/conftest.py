@@ -24,6 +24,19 @@ import app.models  # noqa: F401
 
 from app.services.auth_service import AuthService
 from app.services.ticket_service import TicketService
+from app.core.redis import close_redis
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def close_test_redis_on_its_loop():
+    """Function-scoped client teardown before pytest closes the test loop.
+
+    Async tests use the same function-scoped loop for fixtures and test body.
+    Do not merely clear redis_client: that leaks open sockets on a dead loop.
+    Production's connection lifetime remains managed by app.main lifespan.
+    """
+    yield
+    await close_redis()
 
 
 # ── Configuration SQLite en mémoire ──────────────────────────────────────────

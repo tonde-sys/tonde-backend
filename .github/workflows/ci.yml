@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main, develop]
   push:
-    branches: [main]
+    branches: [main, develop, 'feat/**']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -43,6 +43,8 @@ jobs:
 
     env:
       DATABASE_URL: postgresql+asyncpg://tonde:tonde123@localhost:5432/tonde_db
+      PG_TEST_URL: postgresql+asyncpg://tonde:tonde123@localhost:5432/tonde_db
+      QAPE_REDIS_TEST: "1"
       REDIS_URL: redis://localhost:6379
       JWT_SECRET_KEY: ci-test-secret-key-not-for-production
       ENVIRONMENT: development
@@ -64,11 +66,48 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
+      - name: Verify disposable database creation privileges
+        run: |
+          python - <<'PY'
+          import psycopg2
+
+          # The official postgres image creates POSTGRES_USER as a superuser.
+          # Migration tests connect to the maintenance database and create/drop
+          # their own disposable databases; fail early if that changes.
+          with psycopg2.connect(
+              host="localhost", port=5432, dbname="postgres",
+              user="tonde", password="tonde123",
+          ) as connection:
+              with connection.cursor() as cursor:
+                  cursor.execute(
+                      "SELECT rolcreatedb OR rolsuper FROM pg_roles WHERE rolname = current_user"
+                  )
+                  assert cursor.fetchone() == (True,), "PostgreSQL role cannot create test databases"
+          PY
+
       - name: Apply Alembic migrations from an empty database
         run: alembic upgrade head
 
       - name: Run tests
         run: pytest --tb=short -q
+
+      - name: Require QAPE migration tests to run without skips
+        run: |
+          pytest --tb=short -q --junitxml="${RUNNER_TEMP}/qape-migration.xml" tests/test_qape_review_migration.py
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(os.path.join(os.environ["RUNNER_TEMP"], "qape-migration.xml")).getroot()
+          cases = root.findall(".//testcase")
+          assert cases, "No QAPE migration tests were collected"
+          assert not any(case.find("skipped") is not None for case in cases), (
+              "QAPE migration tests must not be skipped"
+          )
+          assert not any(case.find("failure") is not None or case.find("error") is not None
+                         for case in cases), "QAPE migration tests failed"
+          print(f"Verified {len(cases)} QAPE migration tests, none skipped.")
+          PY
 
       - name: Validate production configuration guardrails
         env:

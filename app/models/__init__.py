@@ -29,3 +29,5 @@ from app.models.notification import (              # noqa: F401
 from app.models.queue_log import QueueLog, QueueLogAction  # noqa: F401
 from app.models.audit_log import AuditLog, AuditAction      # noqa: F401
 from app.models.event_outbox import EventOutbox             # noqa: F401
+from app.models.qape import AbusePolicy, AbuseRestriction, AbuseEvent  # noqa: F401
+from app.models.qape_operation import QapeCreateOperation  # noqa: F401
