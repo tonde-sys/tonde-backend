@@ -197,9 +197,28 @@ sortie, et les tickets bloqués sont clos automatiquement (voir *Expirations*).
 | Numéros uniques, sans trou | Compteur Redis `INCR` par jour (heure du Burundi, UTC+2), format `A-007` |
 | Pas de double ticket (double tap, retry réseau) | Verrou `SET NX` par utilisateur + idempotence `client_action_id` |
 | Redis est un accélérateur, **PostgreSQL est la vérité** | Reconstruction des files au démarrage, à la consultation d'un ticket absent, et à l'appel d'une file vide |
-| ETA réaliste | Moyenne glissante des 10 derniers services **réels** (`service_seconds`), lissée par la durée configurée |
+| ETA dynamique | Projection individuelle des tickets en attente, à partir des observations réelles, de l’état des guichets et de la priorité |
 | Priorité jamais auto-attribuée | Le client *demande* ; un agent confirme (`POST /tickets/{id}/priority`), l'ancienneté est conservée |
 | L'agent n'agit que sur SES tickets | Guichet affecté (`Employee.counter_id`), branche pour superviseurs/admins d'agence |
+
+### Estimation dynamique du temps d'attente (AWTE)
+
+AWTE calcule une prévision individuelle depuis les tickets et horodatages
+conservés dans PostgreSQL. Les durées réellement terminées mettent à jour une
+EWMA persistée par service et par guichet. Le calcul projette la charge qui
+précède chaque ticket en attente sur les guichets actifs, ouverts et hors pause.
+Il applique l'ordre de priorité existant sans modifier la file réelle.
+
+La durée configurée du service sert d'initialisation et de repli tant que les
+seuils d'observations fiables ne sont pas atteints. Si aucune capacité n'est
+disponible, l'API renvoie `estimated_wait_minutes: null` avec une confiance
+`unavailable` ; elle ne fabrique pas une durée. Les estimations persistées sont
+évaluées au premier appel effectif, et l'endpoint métriques fournit la MAE par
+service et par guichet. Une panne du calculateur renvoie aussi une ETA absente,
+sans substituer une formule fondée uniquement sur la position.
+
+La configuration, les règles de calcul, les endpoints, les événements et les
+limites connues sont décrits dans [la documentation AWTE de production](docs/AWTE-PRODUCTION.md).
 
 ### Tâches planifiées (`QueueScheduler`, sans Celery)
 

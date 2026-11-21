@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
+from app.models.counter import Counter
 from app.models.user import User, UserRole
 from app.schemas.ticket import CreateTicketRequest
 from tests.test_ticket_service import (
@@ -39,6 +40,11 @@ async def _un_ticket(ticket_service, db_session):
     org = await _create_test_org(db_session)
     agency = await _create_test_agency(db_session, org.id)
     service = await _create_test_service(db_session, agency.id, org.id)
+    counter = Counter(
+        org_id=org.id, agency_id=agency.id, name="Guichet 1", is_open=True, is_active=True
+    )
+    db_session.add(counter)
+    await db_session.commit()
     return await ticket_service.create_ticket(
         CreateTicketRequest(agency_id=agency.id, service_id=service.id), "client-1", None
     )
