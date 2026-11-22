@@ -316,7 +316,7 @@ class QueueWebSocketManager:
         current_called_number: str,
         position: int,
         total: int,
-        eta_minutes: int,
+        eta_minutes: int | None,
     ) -> None:
         """Envoie la mise à jour de position à un client spécifique."""
         await self.send_to_ticket(ticket_id, {
@@ -442,6 +442,9 @@ class QueueWebSocketManager:
                 "eta_calculated_at": event.get("eta_calculated_at"),
                 "eta_version": event.get("eta_version"),
                 "current_called_number": event.get("current_called_number", ""),
+                # Guichets en pause de la branch : le client affiche l'heure de
+                # reprise annoncée plutôt qu'un ETA qui ignore cette capacité.
+                "paused_counters": event.get("paused_counters", []),
             })
 
     async def publish_event(self, org_id: str, event: dict) -> None:

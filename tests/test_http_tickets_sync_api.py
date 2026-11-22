@@ -233,7 +233,8 @@ async def test_branch_display_shows_counters_and_waiting_counts(api, db_session)
     data = response.json()["data"]
     assert data["branch"]["is_open"] is True
     assert data["counters"] == [{"id": counter.id, "name": "Guichet 1", "is_open": True,
-                                "is_paused": False, "now_serving": "A-001"}]
+                                "is_paused": False, "paused_until": None,
+                                "now_serving": "A-001"}]
     assert data["services"][0]["waiting"] == 1
     assert data["services"][0]["last_called_number"] == "A-001"
     # Le nouvel arrivant attend le ticket déjà appelé puis celui encore en file.

@@ -23,6 +23,7 @@ from app.schemas.counter import (
     CounterListResponse,
     CounterResponse,
     CreateCounterRequest,
+    PauseCounterRequest,
     UpdateCounterRequest,
 )
 from app.services.ticket_service import TicketService
@@ -231,16 +232,22 @@ class CounterService:
         counter = await self._get_counter(counter_id, org_id, agency_id)
         was_active = counter.is_active
         was_open = counter.is_open
+        was_paused = counter.is_paused
 
         for field, value in data.model_dump(exclude_unset=True).items():
             setattr(counter, field, value)
 
         deactivated = counter.is_active is False
-        capacity_changed = was_active != counter.is_active or was_open != counter.is_open
+        capacity_changed = (
+            was_active != counter.is_active
+            or was_open != counter.is_open
+            or was_paused != counter.is_paused
+        )
         if deactivated:
             await self._release_called_ticket(counter)
             counter.is_open = False
             counter.is_paused = False
+            counter.paused_until = None
             counter.current_ticket_id = None
 
         await self.db.commit()
@@ -282,6 +289,7 @@ class CounterService:
 
         counter.is_open = True
         counter.is_paused = False
+        counter.paused_until = None
         await self.db.commit()
         await self.db.refresh(counter)
         await self._announce(counter, EventType.COUNTER_OPEN)
@@ -319,6 +327,7 @@ class CounterService:
 
         counter.is_open = False
         counter.is_paused = False
+        counter.paused_until = None
         # Le client appelé ne doit pas être abandonné parce que le guichet ferme.
         await self._release_called_ticket(counter)
         counter.current_ticket_id = None
@@ -329,9 +338,18 @@ class CounterService:
         return CounterResponse.model_validate(counter)
 
     async def pause(
-        self, counter_id: str, org_id: str, agency_id: str | None = None
+        self,
+        counter_id: str,
+        org_id: str,
+        agency_id: str | None = None,
+        data: PauseCounterRequest | None = None,
     ) -> CounterResponse:
-        """Remove an idle open counter from available ETA and Queue Engine capacity."""
+        """Remove an idle open counter from available ETA and Queue Engine capacity.
+
+        When `paused_until` is supplied, the expected resumption time is stored
+        and announced to clients so the mobile app can show « guichet en pause
+        jusqu'à 14h45 » instead of a misleading ETA.
+        """
         counter = await self._get_counter(counter_id, org_id, agency_id, active_only=True)
         if not counter.is_open:
             raise HTTPException(status_code=400, detail={"code": "COUNTER_CLOSED", "message": "Ouvrez le guichet avant de le mettre en pause"})
@@ -340,6 +358,7 @@ class CounterService:
         if counter.current_ticket_id:
             raise HTTPException(status_code=409, detail={"code": "COUNTER_BUSY", "message": "Terminez ou interrompez le ticket en cours avant la pause"})
         counter.is_paused = True
+        counter.paused_until = data.paused_until if data else None
         await self.db.commit()
         await self.db.refresh(counter)
         await self._announce(counter, EventType.COUNTER_PAUSE)
@@ -356,6 +375,7 @@ class CounterService:
         if not counter.is_paused:
             raise HTTPException(status_code=400, detail={"code": "COUNTER_NOT_PAUSED", "message": "Ce guichet n'est pas en pause"})
         counter.is_paused = False
+        counter.paused_until = None
         await self.db.commit()
         await self.db.refresh(counter)
         await self._announce(counter, EventType.COUNTER_RESUME)
@@ -413,6 +433,7 @@ class CounterService:
         counter.is_open = False
         counter.is_active = False
         counter.is_paused = False
+        counter.paused_until = None
         counter.current_ticket_id = None
         await self.db.commit()
         if was_open:
@@ -426,6 +447,10 @@ class CounterService:
             "agency_id": counter.agency_id,
             "counter_id": counter.id,
             "counter_name": counter.name,
+            "paused_until": (
+                counter.paused_until.isoformat()
+                if counter.is_paused and counter.paused_until else None
+            ),
         })
 
     async def _refresh_branch_queue_etas(self, counter: Counter) -> None:

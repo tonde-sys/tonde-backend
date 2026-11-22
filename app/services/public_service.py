@@ -286,6 +286,10 @@ class PublicQueueService:
                 "name": counter.name,
                 "is_open": counter.is_open,
                 "is_paused": counter.is_paused,
+                "paused_until": (
+                    counter.paused_until.isoformat()
+                    if counter.is_paused and counter.paused_until else None
+                ),
                 "now_serving": serving_numbers.get(counter.current_ticket_id or ""),
             }
             for counter in counters

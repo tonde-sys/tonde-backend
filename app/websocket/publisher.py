@@ -94,6 +94,7 @@ def queue_snapshot_event(
     eta_calculated_at: str | None = None,
     eta_version: int | None = None,
     eta_available: bool = True,
+    paused_counters: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Construit l'événement interne décrivant l'état complet d'une file.
@@ -105,6 +106,8 @@ def queue_snapshot_event(
         current_called_number: Dernier numéro appelé dans ce service
         eta_seconds_per_position: Durée moyenne par position (repli historique)
         estimated_wait_minutes_by_ticket: ETA individuelle calculée depuis la file réelle
+        paused_counters: Guichets en pause de la branch, avec leur heure de
+            reprise annoncée. Le mobile l'affiche à la place d'un ETA trompeur.
     """
     return {
         "type": EventType.QUEUE_SNAPSHOT.value,
@@ -119,4 +122,5 @@ def queue_snapshot_event(
         "eta_calculated_at": eta_calculated_at,
         "eta_version": eta_version,
         "eta_available": eta_available,
+        "paused_counters": paused_counters or [],
     }

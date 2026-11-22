@@ -63,6 +63,12 @@ class Counter(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     # En pause = aucune nouvelle affectation; un ticket déjà en service doit d'abord être clôturé.
     is_paused: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Heure prévue de reprise, annoncée aux clients (« guichet en pause jusqu'à 14h45 »).
+    # Null signifie une pause sans échéance annoncée.
+    paused_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     # ── Dates ─────────────────────────────────────────────────
     created_at: Mapped[datetime] = mapped_column(

@@ -8,11 +8,13 @@ Pattern : Router → Service → Model
 Isolation multi-tenant : toutes les requêtes filtrent par org_id.
 """
 import uuid
+from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from fastapi import HTTPException
 
 from app.models.branch import Branch, Service
+from app.models.eta import EtaCounterProfile, EtaServiceProfile
 from app.schemas.service import CreateServiceRequest, UpdateServiceRequest
 
 
@@ -159,6 +161,7 @@ class ServiceService:
                 detail={"code": "SERVICE_NOT_FOUND", "message": "Service introuvable"},
             )
 
+        previous_avg_minutes = service.avg_duration_minutes
         changes = data.model_dump(exclude_unset=True)
         eta_or_availability_changed = any(
             field in changes
@@ -185,6 +188,34 @@ class ServiceService:
 
         for field, value in changes.items():
             setattr(service, field, value)
+
+        # L'administrateur garde la main sur la durée de référence : quand il la
+        # change, on ré-amorce l'apprentissage (EWMA) avec cette nouvelle valeur
+        # sans effacer les observations ni le niveau de confiance déjà acquis.
+        if (
+            "avg_duration_minutes" in changes
+            and changes["avg_duration_minutes"] != previous_avg_minutes
+        ):
+            seeded_seconds = float(service.avg_duration_minutes * 60)
+            now = datetime.now(timezone.utc)
+            service_profile = (await self.db.execute(
+                select(EtaServiceProfile).where(
+                    EtaServiceProfile.service_id == service.id,
+                    EtaServiceProfile.org_id == org_id,
+                )
+            )).scalar_one_or_none()
+            if service_profile is not None:
+                service_profile.ewma_seconds = seeded_seconds
+                service_profile.updated_at = now
+            counter_profiles = (await self.db.execute(
+                select(EtaCounterProfile).where(
+                    EtaCounterProfile.service_id == service.id,
+                    EtaCounterProfile.org_id == org_id,
+                )
+            )).scalars().all()
+            for counter_profile in counter_profiles:
+                counter_profile.ewma_seconds = seeded_seconds
+                counter_profile.updated_at = now
 
         await self.db.commit()
         await self.db.refresh(service)

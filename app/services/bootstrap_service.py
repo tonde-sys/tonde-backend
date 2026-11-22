@@ -237,6 +237,18 @@ def _positive_int(value: Any, label: str, default: int, *, maximum: int = 100_00
     return number
 
 
+def _bounded_float(value: Any, label: str, default: float, *, minimum: float, maximum: float) -> float:
+    if value is None:
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        _fail(f"{label} doit être un nombre")
+    if number < minimum or number > maximum:
+        _fail(f"{label} doit être compris entre {minimum} et {maximum}")
+    return number
+
+
 def _parse_role(value: Any, label: str) -> UserRole:
     raw = _text(value, label)
     assert raw is not None
@@ -448,6 +460,39 @@ async def _ensure_services(
                     cfg.get("avg_duration_minutes"),
                     f"services[{index}].avg_duration_minutes",
                     5,
+                    maximum=240,
+                ),
+                eta_ewma_alpha=_bounded_float(
+                    cfg.get("eta_ewma_alpha"),
+                    f"services[{index}].eta_ewma_alpha",
+                    0.25,
+                    minimum=0.2,
+                    maximum=0.3,
+                ),
+                eta_min_service_samples=_positive_int(
+                    cfg.get("eta_min_service_samples"),
+                    f"services[{index}].eta_min_service_samples",
+                    3,
+                    maximum=100,
+                ),
+                eta_min_counter_samples=_positive_int(
+                    cfg.get("eta_min_counter_samples"),
+                    f"services[{index}].eta_min_counter_samples",
+                    10,
+                    maximum=1000,
+                ),
+                eta_outlier_min_samples=_positive_int(
+                    cfg.get("eta_outlier_min_samples"),
+                    f"services[{index}].eta_outlier_min_samples",
+                    10,
+                    maximum=1000,
+                ),
+                eta_outlier_mad_multiplier=_bounded_float(
+                    cfg.get("eta_outlier_mad_multiplier"),
+                    f"services[{index}].eta_outlier_mad_multiplier",
+                    3.0,
+                    minimum=0.01,
+                    maximum=10,
                 ),
                 is_active=True,
             )

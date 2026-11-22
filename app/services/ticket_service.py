@@ -2401,6 +2401,30 @@ class TicketService:
             if not ids:
                 return
             service = await self._get_service_row(service_id, org_id)
+            paused_rows = (await self.db.execute(
+                select(Counter)
+                .where(
+                    Counter.org_id == org_id,
+                    Counter.agency_id == agency_id,
+                    Counter.is_active.is_(True),
+                    Counter.is_open.is_(True),
+                    Counter.is_paused.is_(True),
+                )
+                .order_by(Counter.name, Counter.id)
+            )).scalars().all()
+            now_utc = datetime.now(timezone.utc)
+            paused_counters = [
+                {
+                    "name": counter.name,
+                    "paused_until": (
+                        counter.paused_until.isoformat()
+                        if counter.paused_until
+                        and as_utc(counter.paused_until) > now_utc
+                        else None
+                    ),
+                }
+                for counter in paused_rows
+            ]
             avg_seconds = await self._avg_service_seconds(
                 service_id, service.avg_duration_minutes if service else 0
             ) if service is not None else 0
@@ -2446,6 +2470,7 @@ class TicketService:
                 eta_calculated_at=eta_calculated_at,
                 eta_version=eta_version,
                 eta_available=eta_available,
+                paused_counters=paused_counters,
             )
             # Commit the forecast projection and its event together. The business
             # transition was already committed by the Queue Engine; from this point
