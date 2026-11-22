@@ -16,13 +16,14 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.branch import Branch
+from app.models.branch import Branch, Service
 from app.models.counter import Counter
 from app.models.ticket import Ticket
 from app.schemas.counter import (
     CounterListResponse,
     CounterResponse,
     CreateCounterRequest,
+    PauseCounterRequest,
     UpdateCounterRequest,
 )
 from app.services.ticket_service import TicketService
@@ -229,12 +230,34 @@ class CounterService:
             HTTPException 404: Si le guichet n'existe pas dans l'org / l'agence
         """
         counter = await self._get_counter(counter_id, org_id, agency_id)
+        was_active = counter.is_active
+        was_open = counter.is_open
+        was_paused = counter.is_paused
 
         for field, value in data.model_dump(exclude_unset=True).items():
             setattr(counter, field, value)
 
+        deactivated = counter.is_active is False
+        capacity_changed = (
+            was_active != counter.is_active
+            or was_open != counter.is_open
+            or was_paused != counter.is_paused
+        )
+        if deactivated:
+            await self._release_called_ticket(counter)
+            counter.is_open = False
+            counter.is_paused = False
+            counter.paused_until = None
+            counter.current_ticket_id = None
+
         await self.db.commit()
         await self.db.refresh(counter)
+        if capacity_changed:
+            await self._announce(
+                counter,
+                EventType.COUNTER_OPEN if counter.is_active and counter.is_open else EventType.COUNTER_CLOSE,
+            )
+            await self._refresh_branch_queue_etas(counter)
         return CounterResponse.model_validate(counter)
 
     async def open(
@@ -265,9 +288,12 @@ class CounterService:
             )
 
         counter.is_open = True
+        counter.is_paused = False
+        counter.paused_until = None
         await self.db.commit()
         await self.db.refresh(counter)
         await self._announce(counter, EventType.COUNTER_OPEN)
+        await self._refresh_branch_queue_etas(counter)
         return CounterResponse.model_validate(counter)
 
     async def close(
@@ -300,12 +326,60 @@ class CounterService:
             )
 
         counter.is_open = False
+        counter.is_paused = False
+        counter.paused_until = None
         # Le client appelé ne doit pas être abandonné parce que le guichet ferme.
         await self._release_called_ticket(counter)
         counter.current_ticket_id = None
         await self.db.commit()
         await self.db.refresh(counter)
         await self._announce(counter, EventType.COUNTER_CLOSE)
+        await self._refresh_branch_queue_etas(counter)
+        return CounterResponse.model_validate(counter)
+
+    async def pause(
+        self,
+        counter_id: str,
+        org_id: str,
+        agency_id: str | None = None,
+        data: PauseCounterRequest | None = None,
+    ) -> CounterResponse:
+        """Remove an idle open counter from available ETA and Queue Engine capacity.
+
+        When `paused_until` is supplied, the expected resumption time is stored
+        and announced to clients so the mobile app can show « guichet en pause
+        jusqu'à 14h45 » instead of a misleading ETA.
+        """
+        counter = await self._get_counter(counter_id, org_id, agency_id, active_only=True)
+        if not counter.is_open:
+            raise HTTPException(status_code=400, detail={"code": "COUNTER_CLOSED", "message": "Ouvrez le guichet avant de le mettre en pause"})
+        if counter.is_paused:
+            raise HTTPException(status_code=400, detail={"code": "COUNTER_ALREADY_PAUSED", "message": "Ce guichet est déjà en pause"})
+        if counter.current_ticket_id:
+            raise HTTPException(status_code=409, detail={"code": "COUNTER_BUSY", "message": "Terminez ou interrompez le ticket en cours avant la pause"})
+        counter.is_paused = True
+        counter.paused_until = data.paused_until if data else None
+        await self.db.commit()
+        await self.db.refresh(counter)
+        await self._announce(counter, EventType.COUNTER_PAUSE)
+        await self._refresh_branch_queue_etas(counter)
+        return CounterResponse.model_validate(counter)
+
+    async def resume(
+        self, counter_id: str, org_id: str, agency_id: str | None = None
+    ) -> CounterResponse:
+        """Make a paused open counter available again."""
+        counter = await self._get_counter(counter_id, org_id, agency_id, active_only=True)
+        if not counter.is_open:
+            raise HTTPException(status_code=400, detail={"code": "COUNTER_CLOSED", "message": "Ouvrez le guichet avant de le reprendre"})
+        if not counter.is_paused:
+            raise HTTPException(status_code=400, detail={"code": "COUNTER_NOT_PAUSED", "message": "Ce guichet n'est pas en pause"})
+        counter.is_paused = False
+        counter.paused_until = None
+        await self.db.commit()
+        await self.db.refresh(counter)
+        await self._announce(counter, EventType.COUNTER_RESUME)
+        await self._refresh_branch_queue_etas(counter)
         return CounterResponse.model_validate(counter)
 
     async def _release_called_ticket(self, counter: Counter) -> None:
@@ -322,7 +396,11 @@ class CounterService:
         if not counter.current_ticket_id:
             return
         ticket = (await self.db.execute(
-            select(Ticket).where(Ticket.id == counter.current_ticket_id)
+            select(Ticket).where(
+                Ticket.id == counter.current_ticket_id,
+                Ticket.org_id == counter.org_id,
+                Ticket.agency_id == counter.agency_id,
+            )
         )).scalar_one_or_none()
         if ticket is None:
             return
@@ -354,10 +432,13 @@ class CounterService:
         await self._release_called_ticket(counter)
         counter.is_open = False
         counter.is_active = False
+        counter.is_paused = False
+        counter.paused_until = None
         counter.current_ticket_id = None
         await self.db.commit()
         if was_open:
             await self._announce(counter, EventType.COUNTER_CLOSE)
+            await self._refresh_branch_queue_etas(counter)
 
     async def _announce(self, counter: Counter, event_type: EventType) -> None:
         """Diffuse l'ouverture/fermeture d'un guichet à la salle d'attente. Ne lève jamais."""
@@ -366,4 +447,27 @@ class CounterService:
             "agency_id": counter.agency_id,
             "counter_id": counter.id,
             "counter_name": counter.name,
+            "paused_until": (
+                counter.paused_until.isoformat()
+                if counter.is_paused and counter.paused_until else None
+            ),
         })
+
+    async def _refresh_branch_queue_etas(self, counter: Counter) -> None:
+        """Rediffuse les prévisions après un changement de capacité de l'agence."""
+        try:
+            service_ids = (await self.db.execute(
+                select(Service.id).where(
+                    Service.org_id == counter.org_id,
+                    Service.branch_id == counter.agency_id,
+                )
+            )).scalars().all()
+            ticket_service = TicketService(self.db)
+            for service_id in service_ids:
+                await ticket_service._publish_queue_snapshot(
+                    counter.org_id, counter.agency_id, service_id
+                )
+        except Exception as exc:  # noqa: BLE001 — l'ouverture du guichet ne doit pas échouer
+            logger.warning(
+                f"Mise à jour des ETA échouée après changement du guichet {counter.id}: {exc}"
+            )

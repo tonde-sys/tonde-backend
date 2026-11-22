@@ -8,11 +8,13 @@ Pattern : Router → Service → Model
 Isolation multi-tenant : toutes les requêtes filtrent par org_id.
 """
 import uuid
+from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from fastapi import HTTPException
 
 from app.models.branch import Branch, Service
+from app.models.eta import EtaCounterProfile, EtaServiceProfile
 from app.schemas.service import CreateServiceRequest, UpdateServiceRequest
 
 
@@ -52,6 +54,11 @@ class ServiceService:
             description=data.description,
             ticket_prefix=prefix,
             avg_duration_minutes=data.avg_duration_minutes,
+            eta_ewma_alpha=data.eta_ewma_alpha,
+            eta_min_service_samples=data.eta_min_service_samples,
+            eta_min_counter_samples=data.eta_min_counter_samples,
+            eta_outlier_min_samples=data.eta_outlier_min_samples,
+            eta_outlier_mad_multiplier=data.eta_outlier_mad_multiplier,
             is_active=data.is_active,
         )
         self.db.add(service)
@@ -154,7 +161,20 @@ class ServiceService:
                 detail={"code": "SERVICE_NOT_FOUND", "message": "Service introuvable"},
             )
 
+        previous_avg_minutes = service.avg_duration_minutes
         changes = data.model_dump(exclude_unset=True)
+        eta_or_availability_changed = any(
+            field in changes
+            for field in (
+                "avg_duration_minutes",
+                "eta_ewma_alpha",
+                "eta_min_service_samples",
+                "eta_min_counter_samples",
+                "eta_outlier_min_samples",
+                "eta_outlier_mad_multiplier",
+                "is_active",
+            )
+        )
 
         # P2-13 : le préfixe n'est pas modifiable (extra="forbid"), mais `is_active`
         # l'est. Réactiver un service dont le préfixe a été repris entre-temps par un
@@ -169,8 +189,43 @@ class ServiceService:
         for field, value in changes.items():
             setattr(service, field, value)
 
+        # L'administrateur garde la main sur la durée de référence : quand il la
+        # change, on ré-amorce l'apprentissage (EWMA) avec cette nouvelle valeur
+        # sans effacer les observations ni le niveau de confiance déjà acquis.
+        if (
+            "avg_duration_minutes" in changes
+            and changes["avg_duration_minutes"] != previous_avg_minutes
+        ):
+            seeded_seconds = float(service.avg_duration_minutes * 60)
+            now = datetime.now(timezone.utc)
+            service_profile = (await self.db.execute(
+                select(EtaServiceProfile).where(
+                    EtaServiceProfile.service_id == service.id,
+                    EtaServiceProfile.org_id == org_id,
+                )
+            )).scalar_one_or_none()
+            if service_profile is not None:
+                service_profile.ewma_seconds = seeded_seconds
+                service_profile.updated_at = now
+            counter_profiles = (await self.db.execute(
+                select(EtaCounterProfile).where(
+                    EtaCounterProfile.service_id == service.id,
+                    EtaCounterProfile.org_id == org_id,
+                )
+            )).scalars().all()
+            for counter_profile in counter_profiles:
+                counter_profile.ewma_seconds = seeded_seconds
+                counter_profile.updated_at = now
+
         await self.db.commit()
         await self.db.refresh(service)
+        if eta_or_availability_changed:
+            # Keep connected queue clients in sync with persisted ETA policy changes.
+            # Queue snapshots are best effort; the next authorized ticket read also
+            # reconstructs its current forecast from PostgreSQL.
+            from app.services.ticket_service import TicketService
+
+            await TicketService(self.db)._publish_queue_snapshot(org_id, branch_id, service_id)
         return self._to_dict(service)
 
     async def delete(self, service_id: str, branch_id: str, org_id: str) -> None:
@@ -201,6 +256,10 @@ class ServiceService:
 
         service.is_active = False
         await self.db.commit()
+
+        from app.services.ticket_service import TicketService
+
+        await TicketService(self.db)._publish_queue_snapshot(org_id, branch_id, service_id)
 
     # ── Helpers privés ────────────────────────────────────────────────────────
     async def _ensure_prefix_available(
@@ -277,6 +336,11 @@ class ServiceService:
             "description": service.description,
             "ticket_prefix": service.ticket_prefix,
             "avg_duration_minutes": service.avg_duration_minutes,
+            "eta_ewma_alpha": service.eta_ewma_alpha,
+            "eta_min_service_samples": service.eta_min_service_samples,
+            "eta_min_counter_samples": service.eta_min_counter_samples,
+            "eta_outlier_min_samples": service.eta_outlier_min_samples,
+            "eta_outlier_mad_multiplier": service.eta_outlier_mad_multiplier,
             "is_active": service.is_active,
             "created_at": service.created_at.isoformat() if service.created_at else None,
         }

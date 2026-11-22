@@ -5,7 +5,7 @@ Aucune logique métier ici, tout délègue à CounterService.
 Permissions :
   - Créer / modifier / désactiver un guichet : ADMIN_AGENCY (sa branch), ADMIN_ORG, SUPER_ADMIN
   - Lister / consulter : tout membre du staff de la branch
-  - Ouvrir / fermer : l'agent affecté à CE guichet, ou un superviseur et plus de la branch
+  - Ouvrir / fermer / mettre en pause / reprendre : l'agent affecté à CE guichet, ou un superviseur et plus
 """
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
@@ -16,7 +16,7 @@ from app.core.database import get_db
 from app.core.deps import get_current_admin_agency, get_current_agent
 from app.models.employee import Employee, EmployeeStatus
 from app.models.user import User, UserRole
-from app.schemas.counter import CreateCounterRequest, UpdateCounterRequest
+from app.schemas.counter import CreateCounterRequest, PauseCounterRequest, UpdateCounterRequest
 from app.services.counter_service import CounterService
 
 router = APIRouter()
@@ -135,6 +135,39 @@ async def close_counter(
     await _assert_can_operate_counter(db, current_user, counter_id)
     result = await CounterService(db).close(counter_id, org_id, agency_id=branch_id)
     return {"success": True, "data": result, "message": "Guichet fermé"}
+
+
+@router.post("/{counter_id}/pause", response_model=None)
+async def pause_counter(
+    org_id: str,
+    branch_id: str,
+    counter_id: str,
+    body: PauseCounterRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_agent),
+) -> dict:
+    """Met un guichet libre en pause et annonce optionally l'heure de reprise."""
+    await assert_branch_access(db, current_user, org_id, branch_id)
+    await _assert_can_operate_counter(db, current_user, counter_id)
+    result = await CounterService(db).pause(
+        counter_id, org_id, agency_id=branch_id, data=body
+    )
+    return {"success": True, "data": result, "message": "Guichet mis en pause"}
+
+
+@router.post("/{counter_id}/resume", response_model=None)
+async def resume_counter(
+    org_id: str,
+    branch_id: str,
+    counter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_agent),
+) -> dict:
+    """Réactive un guichet précédemment mis en pause."""
+    await assert_branch_access(db, current_user, org_id, branch_id)
+    await _assert_can_operate_counter(db, current_user, counter_id)
+    result = await CounterService(db).resume(counter_id, org_id, agency_id=branch_id)
+    return {"success": True, "data": result, "message": "Guichet repris"}
 
 
 @router.delete("/{counter_id}", status_code=200)

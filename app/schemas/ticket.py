@@ -70,6 +70,9 @@ class TicketResponse(BaseModel):
     position: int                            # Position actuelle dans la file (0 si hors file)
     total_in_queue: int                      # Nombre total de tickets en file
     estimated_wait_minutes: Optional[int] = None
+    estimated_wait_confidence: Optional[str] = None
+    eta_calculated_at: Optional[datetime] = None
+    eta_version: Optional[int] = None
     created_at: datetime
     counter_name: Optional[str] = None       # Guichet assigné si appelé
 
@@ -170,7 +173,10 @@ class QueueUpdateEvent(BaseModel):
     current_called_number: str    # Numéro actuellement servi dans la salle (harmonisé avec events.py)
     position: int
     total_in_queue: int
-    estimated_wait_minutes: int
+    estimated_wait_minutes: Optional[int] = None
+    estimated_wait_confidence: Optional[str] = None
+    eta_calculated_at: Optional[datetime] = None
+    eta_version: Optional[int] = None
     counter_name: Optional[str] = None
 
 

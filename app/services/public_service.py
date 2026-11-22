@@ -9,7 +9,6 @@ Règle absolue : AUCUNE donnée personnelle. Ni nom, ni téléphone, ni identifi
 d'utilisateur ; uniquement des numéros de ticket, des guichets et des durées.
 """
 import logging
-import math
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
@@ -77,6 +76,9 @@ class PublicQueueService:
             "position": view.position,
             "total_in_queue": view.total_in_queue,
             "estimated_wait_minutes": view.estimated_wait_minutes,
+            "estimated_wait_confidence": view.estimated_wait_confidence,
+            "eta_calculated_at": view.eta_calculated_at,
+            "eta_version": view.eta_version,
             "service_name": service_name,
             "branch_name": branch_name,
             "counter_name": ticket.counter_name,
@@ -268,31 +270,48 @@ class PublicQueueService:
         ticket_service = TicketService(self.db)
 
         counters = (await self.db.execute(
-            select(Counter).where(Counter.agency_id == branch_id, Counter.is_active == True)  # noqa: E712
+            select(Counter).where(
+                Counter.org_id == branch.org_id,
+                Counter.agency_id == branch_id,
+                Counter.is_active == True,  # noqa: E712
+            )
             .order_by(Counter.name)
         )).scalars().all()
 
         # Une seule requête pour tous les numéros en cours, au lieu d'une par guichet.
-        serving_numbers = await self._counter_numbers(counters)
+        serving_numbers = await self._counter_numbers(counters, branch.org_id)
         counter_rows = [
             {
                 "id": counter.id,
                 "name": counter.name,
                 "is_open": counter.is_open,
+                "is_paused": counter.is_paused,
+                "paused_until": (
+                    counter.paused_until.isoformat()
+                    if counter.is_paused and counter.paused_until else None
+                ),
                 "now_serving": serving_numbers.get(counter.current_ticket_id or ""),
             }
             for counter in counters
         ]
 
         services = (await self.db.execute(
-            select(Service).where(Service.branch_id == branch_id, Service.is_active == True)  # noqa: E712
+            select(Service).where(
+                Service.org_id == branch.org_id,
+                Service.branch_id == branch_id,
+                Service.is_active == True,  # noqa: E712
+            )
             .order_by(Service.ticket_prefix)
         )).scalars().all()
 
         service_ids = [service.id for service in services]
         waiting_counts = await self._waiting_counts(branch, services)
-        avg_seconds = await ticket_service.avg_service_seconds_batch(list(services))
-        last_called = await ticket_service.current_called_numbers(service_ids)
+        try:
+            dynamic_estimates = await ticket_service.estimate_service_queues(list(services))
+        except Exception as exc:  # noqa: BLE001 — l'écran public garde son ETA de repli
+            logger.warning(f"AWTE indisponible pour l'agence {branch_id} ({exc})")
+            dynamic_estimates = {}
+        last_called = await ticket_service.current_called_numbers(service_ids, branch.org_id)
 
         service_rows = [
             {
@@ -300,10 +319,21 @@ class PublicQueueService:
                 "name": service.name,
                 "ticket_prefix": service.ticket_prefix,
                 "waiting": waiting_counts.get(service.id, 0),
-                "estimated_wait_minutes": self._eta_minutes(
-                    waiting_counts.get(service.id, 0) + 1,
-                    avg_seconds.get(service.id, 0),
+                "estimated_wait_minutes": (
+                    dynamic_estimates[service.id].next_ticket_minutes
+                    if service.id in dynamic_estimates
+                    else None
                 ),
+                "estimated_wait_confidence": (
+                    dynamic_estimates[service.id].next_ticket.confidence
+                    if service.id in dynamic_estimates else "unavailable"
+                ),
+                "eta_calculated_at": (
+                    dynamic_estimates[service.id].calculated_at.isoformat()
+                    if service.id in dynamic_estimates and dynamic_estimates[service.id].calculated_at
+                    else None
+                ),
+                "eta_version": dynamic_estimates[service.id].version if service.id in dynamic_estimates else None,
                 "last_called_number": last_called.get(service.id),
             }
             for service in services
@@ -316,7 +346,7 @@ class PublicQueueService:
             "generated_at": datetime.now(timezone.utc),
         }
 
-    async def _counter_numbers(self, counters: list[Counter]) -> dict[str, str]:
+    async def _counter_numbers(self, counters: list[Counter], org_id: str | None) -> dict[str, str]:
         """
         Numéros en cours de traitement, pour tous les guichets en une requête.
 
@@ -327,7 +357,10 @@ class PublicQueueService:
         if not ticket_ids:
             return {}
         rows = (await self.db.execute(
-            select(Ticket.id, Ticket.number).where(Ticket.id.in_(ticket_ids))
+            select(Ticket.id, Ticket.number).where(
+                Ticket.org_id == org_id,
+                Ticket.id.in_(ticket_ids),
+            )
         )).all()
         return {ticket_id: number for ticket_id, number in rows}
 
@@ -352,25 +385,13 @@ class PublicQueueService:
                 select(Ticket.service_id, func.count(Ticket.id))
                 .where(
                     Ticket.service_id.in_([service.id for service in services]),
+                    Ticket.org_id == branch.org_id,
                     Ticket.status == TicketStatus.WAITING,
                 )
                 .group_by(Ticket.service_id)
             )).all()
             counts = {service_id: count for service_id, count in rows}
             return {service.id: counts.get(service.id, 0) for service in services}
-
-    @staticmethod
-    def _eta_minutes(position: int, avg_seconds: int) -> int:
-        """
-        Attente estimée pour une position (1 = prochain), en minutes.
-
-        Même formule que `TicketService.estimate_wait_minutes`, appliquée à une
-        durée moyenne déjà calculée en lot : on évite ainsi une requête par service
-        juste pour relire la durée moyenne.
-        """
-        if position <= 1 or avg_seconds <= 0:
-            return 0
-        return math.ceil((position - 1) * avg_seconds / 60)
 
     @staticmethod
     def _is_staff_of(viewer: User | None, org_id: str) -> bool:

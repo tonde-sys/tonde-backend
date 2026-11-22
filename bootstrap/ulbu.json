@@ -50,12 +50,22 @@
     {
       "name": "Prise de Photo",
       "ticket_prefix": "T",
-      "avg_duration_minutes": 3
+      "avg_duration_minutes": 3,
+      "eta_ewma_alpha": 0.25,
+      "eta_min_service_samples": 3,
+      "eta_min_counter_samples": 10,
+      "eta_outlier_min_samples": 10,
+      "eta_outlier_mad_multiplier": 3.0
     },
     {
       "name": "Demande de la carte",
       "ticket_prefix": "C",
-      "avg_duration_minutes": 5
+      "avg_duration_minutes": 5,
+      "eta_ewma_alpha": 0.25,
+      "eta_min_service_samples": 3,
+      "eta_min_counter_samples": 10,
+      "eta_outlier_min_samples": 10,
+      "eta_outlier_mad_multiplier": 3.0
     }
   ],
   "counters": [
