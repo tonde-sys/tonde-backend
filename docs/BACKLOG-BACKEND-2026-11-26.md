@@ -88,9 +88,14 @@ répondre depuis l'outil.
 
 ### 3. Les notifications ne parlent qu'en français
 
-**Problème.** `users` n'a **aucune colonne `locale`**. Tous les textes de
-`notification_service.py` sont des f-strings françaises codées en dur
-(`f"Ticket {ticket.number} appelé"`), et partent tels quels en push **et en SMS**.
+**Problème.** `users.language` **existe** (`app/models/user.py:64`, défaut `fr`),
+est accepté par `PATCH /auth/me` et renvoyé à la connexion — mais
+`notification_service.py` ne le lit **jamais**. Tous les textes sont des
+f-strings françaises codées en dur (`f"Ticket {ticket.number} appelé"`), et
+partent tels quels en push **et en SMS**.
+
+La colonne est donc un mensonge : le client peut choisir sa langue, ça ne change
+rien à ce qu'il reçoit.
 
 **Pourquoi ça compte.** L'application est traduite en français, anglais et
 kirundi. Un client de Bujumbura qui utilise l'app en kirundi reçoit un SMS
@@ -100,13 +105,15 @@ canal d'alerte qui échoue. Et un SMS français dépasse souvent 160 caractères
 donc coûte deux segments.
 
 **Tâche.**
-- Migration : `users.locale` (`fr` par défaut, `en`, `rn`).
-- Le mobile envoie sa langue à l'inscription et dans `PATCH /auth/me`.
-- Catalogue de messages par événement × langue (`your_turn`, `absent_warning`,
-  `expired`, `cancelled`, `transferred`, `done`), hors base de code ou dans un
-  module `notification_templates.py`.
+- Lire `user.language` dans chaque méthode `notify_*` (l'utilisateur y est déjà
+  chargé par `_get_user`).
+- Catalogue de messages par événement × langue (`ticket_called`,
+  `absent_warning`, `absent`, `expired`, `cancelled`, `transferred`, `done`),
+  dans un module `notification_templates.py` plutôt que dans le service.
 - Compter les segments GSM-7 avant envoi ; journaliser le coût estimé par SMS.
-- Repli : langue inconnue → français, jamais de message vide.
+- Repli : langue inconnue ou absente → français, jamais de message vide.
+- Vérifier que `language` est bien renseigné à l'inscription (téléphone et
+  e-mail) : aujourd'hui `bootstrap_service` force `"fr"`.
 
 **Critères d'acceptation.**
 - Un utilisateur `rn` reçoit le SMS en kirundi.
@@ -114,9 +121,9 @@ donc coûte deux segments.
 - Un test vérifie qu'aucun texte n'est codé en dur hors du catalogue.
 
 **Fichiers.** `app/services/notification_service.py`, `app/models/user.py`,
-`app/schemas/auth.py`, `app/services/sms_gateway.py`.
+`app/services/auth_service.py`, `app/services/sms_gateway.py`.
 
-**Estimation.** 3 à 4 jours.
+**Estimation.** 2 à 3 jours.
 
 ---
 
@@ -201,7 +208,7 @@ confie au `QueueScheduler` déjà présent. **0,5 à 1 jour.**
 
 ### 10. Découper `TicketService` (B1)
 
-3 610 lignes, 60+ méthodes, 6 responsabilités. Cible : `QueueEngine`,
+3 619 lignes, 60+ méthodes, 6 responsabilités. Cible : `QueueEngine`,
 `AbsenceService`, `TicketQueries`, `QapeTicketCreation`, aucun fichier > 800
 lignes. **Gros chantier, à faire quand la couverture de tests est stable** :
 5 à 8 jours, sans changement de contrat.
