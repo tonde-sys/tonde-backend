@@ -2063,6 +2063,15 @@ class TicketService:
         )
         await self.db.commit()
         await self._leave_queue(ticket)
+
+        # Le client doit savoir pourquoi son ticket a quitté la file. Sans cela
+        # il voit son numéro disparaître, conclut à un bug et reprend un ticket
+        # sans comprendre — le défaut déjà corrigé pour l'expiration.
+        #
+        # La raison saisie par l'agent reste dans le journal d'audit : elle peut
+        # contenir une note interne (« n'est jamais revenu ») que le client n'a
+        # pas à lire telle quelle. Le motif qui lui est envoyé est neutre.
+        await self._notify_expired(ticket, "clôture par l'agence")
         return {"success": True, "ticket_id": ticket.id}
 
     # ══ Tâches planifiées (appelées par QueueScheduler) ═══════════════════════

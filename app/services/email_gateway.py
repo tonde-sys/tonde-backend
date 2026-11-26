@@ -95,7 +95,7 @@ async def send_email(to: str, subject: str, body: str, reply_to: str | None = No
     Raises:
         EmailDeliveryError: Échec d'envoi — l'appelant décide de bloquer ou non
     """
-    if settings.is_development:
+    if settings.is_development and not settings.SMTP_SEND_IN_DEV:
         # Journalisé en entier : en dev, l'email EST le canal de test.
         logger.info(f"[EMAIL DEV] → {to} | {subject}\n{body}")
         return

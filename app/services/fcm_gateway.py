@@ -102,6 +102,94 @@ def reset_token_cache() -> None:
     _cached_token = None
 
 
+# ── Présentation du message ───────────────────────────────────────────────────
+# FCM ne transmet pas seulement un texte : il décide de l'apparence et du
+# comportement de la bannière. Sans ces champs, Android place tout dans un canal
+# de repli en importance par défaut — l'appel du guichet arrive alors sans son,
+# sans tête d'épingle, et l'usager ne le voit pas.
+
+# Types qui exigent une attention immédiate. Un ticket appelé ou un
+# avertissement d'absence ne se rattrapent pas : le guichet passe au suivant.
+_URGENT_TYPES = frozenset({"ticket_called", "absent_warning"})
+
+# Identifiants des canaux créés par l'application mobile
+# (`LocalNotificationService`). Ils doivent correspondre au caractère près : un
+# identifiant inconnu fait créer par Android un canal de repli, et l'appel au
+# guichet perd son importance maximale.
+CHANNEL_URGENT = "tonde_queue_urgent"
+CHANNEL_PROGRESS = "tonde_queue_progress"
+
+# Petite icône de la barre d'état. Monochrome et dédiée : l'icône de lancement,
+# rendue en aplat blanc, apparaîtrait comme un carré.
+SMALL_ICON = "ic_stat_tonde"
+
+# Couleur d'accent affichée à côté de l'icône.
+BRAND_COLOR = "#1E293B"
+
+# Durée de conservation par FCM quand l'appareil est hors ligne. Un appel garde
+# 5 minutes : au-delà, le ticket a été rendu et la notification induirait en
+# erreur. La progression, elle, reste utile plus longtemps.
+URGENT_TTL_SECONDS = 300
+DEFAULT_TTL_SECONDS = 3600
+
+
+def build_message(
+    token: str, title: str, body: str, data: dict[str, str] | None = None
+) -> dict:
+    """
+    Construit le message FCM v1 complet pour un appareil.
+
+    Séparé de l'envoi pour être vérifiable sans réseau : la forme du message
+    est un contrat avec l'application mobile, pas un détail d'implémentation.
+    """
+    payload = {k: str(v) for k, v in (data or {}).items()}
+    urgent = payload.get("type") in _URGENT_TYPES
+    ticket_id = payload.get("ticket_id")
+    # Un fil par ticket : les notifications d'une même file se remplacent au
+    # lieu de s'empiler (« encore 5 personnes », puis « 4 », puis « 3 »…).
+    thread = f"ticket-{ticket_id}" if ticket_id else "tonde"
+
+    return {
+        "token": token,
+        "notification": {"title": title, "body": body},
+        "data": payload,
+        "android": {
+            # HIGH réveille l'appareil même en veille : sans cela, un téléphone
+            # en Doze reçoit l'appel plusieurs minutes après le guichet.
+            "priority": "HIGH",
+            "ttl": f"{URGENT_TTL_SECONDS if urgent else DEFAULT_TTL_SECONDS}s",
+            "notification": {
+                "channel_id": CHANNEL_URGENT if urgent else CHANNEL_PROGRESS,
+                "icon": SMALL_ICON,
+                "color": BRAND_COLOR,
+                "sound": "default",
+                # Nécessaire pour que le clic soit remonté à l'application
+                # lorsqu'elle est en arrière-plan.
+                "click_action": "FLUTTER_NOTIFICATION_CLICK",
+                "tag": thread,
+                "notification_priority": (
+                    "PRIORITY_MAX" if urgent else "PRIORITY_DEFAULT"
+                ),
+                "default_vibrate_timings": True,
+            },
+        },
+        # iOS : même intention, autre vocabulaire. `time-sensitive` traverse le
+        # mode Concentration, ce qui est exactement le besoin d'un appel.
+        "apns": {
+            "headers": {"apns-priority": "10" if urgent else "5"},
+            "payload": {
+                "aps": {
+                    "sound": "default",
+                    "thread-id": thread,
+                    "interruption-level": (
+                        "time-sensitive" if urgent else "active"
+                    ),
+                }
+            },
+        },
+    }
+
+
 async def send_push(token: str, title: str, body: str, data: dict[str, str] | None = None) -> None:
     """
     Envoie une notification push à un appareil.
@@ -121,14 +209,7 @@ async def send_push(token: str, title: str, body: str, data: dict[str, str] | No
         logger.info(f"[FCM DEV] → {token[:20]}... title={title}")
         return
 
-    message = {
-        "message": {
-            "token": token,
-            "notification": {"title": title, "body": body},
-            "data": {k: str(v) for k, v in (data or {}).items()},
-            "android": {"priority": "HIGH"},
-        }
-    }
+    message = {"message": build_message(token, title, body, data)}
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
             access_token = await _access_token(client)

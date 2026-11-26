@@ -34,6 +34,7 @@ from app.routers import (
     counters,
     employees,
     exports,
+    feedback,
     health,
     notifications,
     organizations,
@@ -190,6 +191,7 @@ app.include_router(tickets.router,         prefix="/api/v1/tickets",       tags=
 app.include_router(qape_review.router,     prefix="/api/v1/qape",          tags=["QAPE Review"])
 app.include_router(sync.router,            prefix="/api/v1/sync",          tags=["🔄 Sync hors-ligne"])
 app.include_router(notifications.router,   prefix="/api/v1/notifications", tags=["🔔 Notifications"])
+app.include_router(feedback.router,        prefix="/api/v1/feedback",      tags=["💬 Retours utilisateurs"])
 app.include_router(organizations.router,   prefix="/api/v1/organizations", tags=["🏢 Organizations"])
 app.include_router(branches.router,        prefix="/api/v1/organizations", tags=["🏦 Branches"])
 app.include_router(services_router.router, prefix="/api/v1",               tags=["🛎 Services"])

@@ -80,8 +80,17 @@ class Settings(BaseSettings):
     # 587 = STARTTLS (recommandé) ; 465 = TLS implicite, géré automatiquement.
     SMTP_USE_TLS: bool = True
     SMTP_TIMEOUT_SECONDS: float = 15.0
+    # En développement, l'envoi est simulé (journalisé). Ce drapeau force
+    # l'envoi réel même en dev : sans lui, configurer un SMTP sur un poste de
+    # développement ne servait à rien, ce qui est contre-intuitif.
+    SMTP_SEND_IN_DEV: bool = False
     # Adresse affichée dans les emails (support, réponses).
     SUPPORT_EMAIL: str = "support@tonde.app"
+    # Boîte qui reçoit les retours envoyés depuis l'application mobile.
+    # Distincte de SUPPORT_EMAIL : celle-ci est affichée au public, celle-là
+    # est la boîte de travail du support — on ne veut pas que les deux se
+    # confondent le jour où l'une change.
+    FEEDBACK_INBOX: str = "vitalzagabe156@gmail.com"
     # Durée de vie d'un lien de réinitialisation de mot de passe.
     PASSWORD_RESET_TTL_MINUTES: int = 30
     # URL de base du front qui affiche le formulaire de réinitialisation.

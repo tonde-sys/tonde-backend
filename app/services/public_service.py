@@ -103,8 +103,11 @@ class PublicQueueService:
         route, l'application ne pouvait lister aucune organisation et l'écran de
         prise de ticket restait vide.
 
-        Champs strictement publics : ni e-mail, ni téléphone, ni code
-        d'invitation, ni statistiques d'usage.
+        Champs strictement publics : pas de code d'invitation, pas de
+        statistiques d'usage. Seule exception, ajoutée avec L6 : le bloc
+        `support` (téléphone, WhatsApp, e-mail, horaires). Ces coordonnées sont
+        publiées par l'institution précisément pour que le client l'appelle —
+        les cacher reviendrait à demander de l'aide sans donner le numéro.
         """
         organizations = (await self.db.execute(
             select(Organization)
@@ -118,6 +121,12 @@ class PublicQueueService:
                 "sector": org.sector,
                 "city": org.city,
                 "logo_url": org.logo_url,
+                "support": {
+                    "phone": org.phone,
+                    "whatsapp": org.support_whatsapp,
+                    "email": org.email,
+                    "hours": org.support_hours,
+                },
             }
             for org in organizations
         ]

@@ -15,11 +15,12 @@ import secrets
 from datetime import datetime, timezone, timedelta
 from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from fastapi import HTTPException, status
 
 from app.models.audit_log import AuditAction
 from app.models.user import User
+from app.models.user_device import UserDevice
 from app.models.employee import Employee, EmployeeStatus
 from app.models.refresh_token import RefreshToken
 from app.services.audit_service import AuditService
@@ -1047,23 +1048,90 @@ class AuthService:
         await self.db.refresh(user)
         return user
 
-    async def set_fcm_token(self, user: User, fcm_token: str | None) -> None:
+    async def set_fcm_token(
+        self,
+        user: User,
+        fcm_token: str | None,
+        *,
+        device_token: str | None = None,
+        platform: str | None = None,
+        device_model: str | None = None,
+        app_version: str | None = None,
+    ) -> None:
         """
-        Enregistre (ou efface) le jeton de push de l'appareil de l'utilisateur.
+        Enregistre (ou retire) un appareil de notification.
 
-        Un jeton identifie UN appareil : s'il était associé à un autre compte
-        (téléphone partagé, changement de compte), il est retiré de cet autre compte
-        pour que les notifications d'un utilisateur n'arrivent pas chez un autre.
+        Un jeton identifie UNE installation : s'il était associé à un autre
+        compte (téléphone partagé, changement de compte), il est déplacé vers
+        ce compte plutôt que dupliqué — les appels d'un utilisateur ne doivent
+        jamais arriver chez un autre.
 
         Args:
             user: Utilisateur connecté
-            fcm_token: Jeton FCM, ou None pour se désinscrire des push (déconnexion)
+            fcm_token: Jeton à enregistrer, ou None pour désinscrire l'appareil
+            device_token: Jeton à retirer lors d'une désinscription. Les clients
+                antérieurs à B1bis ne l'envoient pas ; on retombe alors sur
+                `users.fcm_token`, qui ne connaît qu'un appareil.
+            platform: `android` / `ios`
+            device_model: modèle ou version du système
+            app_version: version de l'application
         """
+        now = datetime.now(timezone.utc)
+
         if fcm_token:
+            # Le jeton quitte l'ancien compte avant d'être rattaché au nouveau.
+            await self.db.execute(
+                delete(UserDevice).where(
+                    UserDevice.token == fcm_token,
+                    UserDevice.user_id != user.id,
+                )
+            )
             await self.db.execute(
                 update(User)
                 .where(User.fcm_token == fcm_token, User.id != user.id)
                 .values(fcm_token=None)
             )
-        user.fcm_token = fcm_token
+
+            device = (
+                await self.db.execute(
+                    select(UserDevice).where(UserDevice.token == fcm_token)
+                )
+            ).scalar_one_or_none()
+
+            if device is None:
+                self.db.add(
+                    UserDevice(
+                        user_id=user.id,
+                        token=fcm_token,
+                        platform=platform,
+                        device_model=device_model,
+                        app_version=app_version,
+                    )
+                )
+            else:
+                # Déjà connue : on rafraîchit ce que l'appareil nous dit de lui.
+                device.user_id = user.id
+                device.last_seen_at = now
+                if platform:
+                    device.platform = platform
+                if device_model:
+                    device.device_model = device_model
+                if app_version:
+                    device.app_version = app_version
+
+            # Colonne historique : le dernier appareil enregistré. Les clients
+            # qui ne lisent que `users.fcm_token` continuent de fonctionner.
+            user.fcm_token = fcm_token
+        else:
+            token = device_token or user.fcm_token
+            if token:
+                await self.db.execute(
+                    delete(UserDevice).where(
+                        UserDevice.token == token,
+                        UserDevice.user_id == user.id,
+                    )
+                )
+            if user.fcm_token == token or token is None:
+                user.fcm_token = None
+
         await self.db.commit()

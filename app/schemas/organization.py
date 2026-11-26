@@ -21,6 +21,8 @@ class CreateOrganizationRequest(BaseModel):
     phone: str | None = None
     email: EmailStr | None = None
     website: str | None = None
+    support_whatsapp: str | None = None
+    support_hours: str | None = None
     logo_url: str | None = None
 
     @field_validator("slug")
@@ -47,6 +49,8 @@ class UpdateOrganizationRequest(BaseModel):
     phone: str | None = None
     email: EmailStr | None = None
     website: str | None = None
+    support_whatsapp: str | None = None
+    support_hours: str | None = None
     logo_url: str | None = None
     is_active: bool | None = None
 
@@ -72,6 +76,10 @@ class OrganizationResponse(BaseModel):
     phone: str | None
     email: str | None
     website: str | None
+    # Canaux de support publiés à l'application mobile (L6). Nullables : une
+    # institution qui n'a rien renseigné n'affiche pas de bouton mort.
+    support_whatsapp: str | None = None
+    support_hours: str | None = None
     logo_url: str | None
     is_active: bool
     # S2-08 : champs invitation (None si pas de code généré)

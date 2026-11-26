@@ -22,12 +22,13 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.notification import Notification, NotificationChannel, NotificationStatus
 from app.models.ticket import Ticket
 from app.models.user import User
+from app.models.user_device import UserDevice
 from app.services import fcm_gateway, sms_gateway
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ class NotificationService:
         )
         if user.phone:
             await self._send_sms(ticket.org_id, user.id, ticket.id, user.phone, message)
-        if user.fcm_token:
+        if await self._has_push_target(user):
             await self._send_fcm(
                 ticket.org_id, user, ticket.id,
                 title=f"Ticket {ticket.number} appelé", body=message,
@@ -71,7 +72,9 @@ class NotificationService:
         Push uniquement (pas de SMS : le coût n'est pas justifié, l'appel SMS a déjà eu lieu).
         """
         user = await self._get_user(ticket.user_id)
-        if not user or not user.fcm_token:
+        if not user:
+            return
+        if not await self._has_push_target(user):
             return
         await self._send_fcm(
             ticket.org_id, user, ticket.id,
@@ -96,7 +99,7 @@ class NotificationService:
             title=f"Absent — {ticket.number}", body=message,
             status=NotificationStatus.SENT,
         )
-        if user.fcm_token:
+        if await self._has_push_target(user):
             await self._send_fcm(
                 ticket.org_id, user, ticket.id,
                 title=f"Ticket {ticket.number} — absent", body=message,
@@ -124,7 +127,7 @@ class NotificationService:
             title=f"Ticket annulé — {ticket.number}", body=message,
             status=NotificationStatus.SENT,
         )
-        if user.fcm_token:
+        if await self._has_push_target(user):
             await self._send_fcm(
                 ticket.org_id, user, ticket.id,
                 title=f"Ticket {ticket.number} — annulé", body=message,
@@ -265,6 +268,36 @@ class NotificationService:
                 error_message=str(exc)[:500],
             )
 
+    async def _push_tokens(self, user: User) -> list[str]:
+        """Tous les appareils joignables du compte, sans doublon.
+
+        `users.fcm_token` est ajouté s'il n'est pas déjà dans `user_devices` :
+        c'est le seul jeton des comptes enregistrés avant B1bis.
+        """
+        tokens = (
+            await self.db.execute(
+                select(UserDevice.token)
+                .where(UserDevice.user_id == user.id)
+                .order_by(UserDevice.last_seen_at.desc())
+            )
+        ).scalars().all()
+
+        ordered = list(tokens)
+        if user.fcm_token and user.fcm_token not in ordered:
+            ordered.append(user.fcm_token)
+        return ordered
+
+    async def _has_push_target(self, user: User) -> bool:
+        """Vrai s'il existe au moins un appareil à prévenir."""
+        return bool(await self._push_tokens(user))
+
+    async def _forget_token(self, user: User, token: str) -> None:
+        """Retire un appareil définitivement invalide (application désinstallée)."""
+        await self.db.execute(delete(UserDevice).where(UserDevice.token == token))
+        if user.fcm_token == token:
+            user.fcm_token = None
+        await self.db.commit()
+
     async def _send_fcm(
         self,
         org_id: str,
@@ -276,25 +309,42 @@ class NotificationService:
         data: dict[str, str] | None = None,
     ) -> None:
         """
-        Envoie un push via FCM v1 et trace le résultat.
+        Envoie un push via FCM v1 à **tous** les appareils du compte.
 
         - Firebase non configuré : ignoré sans bruit (warning), aucune ligne d'audit.
-        - Jeton invalide (app désinstallée) : supprimé de l'utilisateur.
+        - Jeton invalide (app désinstallée) : supprimé, les autres appareils
+          restent servis.
         - Ne lève jamais.
         """
-        try:
-            await fcm_gateway.send_push(user.fcm_token, title, body, data)
-            status, error = NotificationStatus.SENT, None
-        except fcm_gateway.FcmNotConfigured as exc:
-            logger.warning(f"[FCM] {exc} — push ignoré")
+        tokens = await self._push_tokens(user)
+        if not tokens:
             return
-        except fcm_gateway.FcmTokenInvalid as exc:
-            logger.warning(f"[FCM] Jeton invalide pour user={user.id} : suppression")
-            await self.db.execute(update(User).where(User.id == user.id).values(fcm_token=None))
-            status, error = NotificationStatus.FAILED, str(exc)[:500]
-        except fcm_gateway.FcmDeliveryError as exc:
-            logger.error(f"[FCM] Échec envoi → user={user.id} : {exc}")
-            status, error = NotificationStatus.FAILED, str(exc)[:500]
+
+        status, error = NotificationStatus.SENT, None
+        delivered = 0
+        for token in tokens:
+            try:
+                await fcm_gateway.send_push(token, title, body, data)
+                delivered += 1
+            except fcm_gateway.FcmNotConfigured as exc:
+                logger.warning(f"[FCM] {exc} — push ignoré")
+                return
+            except fcm_gateway.FcmTokenInvalid as exc:
+                logger.warning(
+                    f"[FCM] Jeton invalide pour user={user.id} : appareil retiré"
+                )
+                await self._forget_token(user, token)
+                status, error = NotificationStatus.FAILED, str(exc)[:500]
+            except fcm_gateway.FcmDeliveryError as exc:
+                logger.error(f"[FCM] Échec envoi → user={user.id} : {exc}")
+                status, error = NotificationStatus.FAILED, str(exc)[:500]
+
+        # Une seule ligne d'audit : le support veut savoir si l'alerte est
+        # partie, pas combien de téléphones le client possède. Le détail par
+        # appareil vit dans les journaux.
+        if delivered == 0 and status == NotificationStatus.SENT:
+            status = NotificationStatus.FAILED
+            error = "Aucun appareil joignable"
 
         await self._save_notification(
             org_id=org_id, user_id=user.id, ticket_id=ticket_id,

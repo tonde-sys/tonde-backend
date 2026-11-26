@@ -23,6 +23,7 @@ from app.core.config import settings
 from app.core.redis import get_queue_size
 from app.models.audit_log import AuditAction, AuditLog
 from app.models.branch import Branch, Service
+from app.models.notification import Notification, NotificationChannel
 from app.models.user import User, UserRole
 from app.models.queue_log import QueueLog, QueueLogAction
 from app.models.ticket import Ticket, TicketPriority, TicketStatus
@@ -729,6 +730,33 @@ async def test_close_ticket_frees_the_client(ticket_service, db_session, real_re
     )
     assert again.status == "waiting"
     assert await get_queue_size(org_id, agency_id, service_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_close_ticket_tells_the_client_why(ticket_service, db_session, real_redis):
+    """
+    Une clôture par l'agent ne doit pas être silencieuse.
+
+    Le client voit son ticket quitter la file : sans message il conclut à un
+    bug. Le motif envoyé est neutre — la note interne de l'agent (« n'est
+    jamais revenu ») reste dans le journal d'audit.
+    """
+    org, agency, service, counter, agent = await _world(db_session)
+    ticket = await _new_ticket(ticket_service, agency, service, "client-1")
+    await _call(ticket_service, org, agency, service, counter, agent)
+    await _grace_ecoulee(db_session, ticket.id)
+    await ticket_service.mark_absent(ticket.id, agent)
+
+    await ticket_service.close_ticket(ticket.id, agent, reason="n'est jamais revenu")
+
+    notes = (await db_session.execute(
+        select(Notification).where(Notification.user_id == "client-1")
+    )).scalars().all()
+    in_app = [n for n in notes if n.channel == NotificationChannel.IN_APP]
+    assert len(in_app) == 1, "le client est prévenu une seule fois"
+    assert "clôture par l'agence" in in_app[0].body
+    assert "n'est jamais revenu" not in in_app[0].body, "la note interne ne fuit pas"
+    assert ticket.number in in_app[0].body
 
 
 @pytest.mark.asyncio

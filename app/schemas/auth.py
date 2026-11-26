@@ -236,8 +236,14 @@ class UpdateProfileRequest(BaseModel):
 class FcmTokenRequest(BaseModel):
     """Jeton de push de l'appareil. `null` = se désinscrire des notifications push."""
     fcm_token: str | None = None
+    # Jeton de l'appareil qui se désinscrit. Nécessaire dès qu'un compte peut
+    # avoir plusieurs téléphones : `fcm_token: null` seul ne dit pas lequel.
+    device_token: str | None = None
+    platform: str | None = None
+    device_model: str | None = None
+    app_version: str | None = None
 
-    @field_validator("fcm_token")
+    @field_validator("fcm_token", "device_token")
     @classmethod
     def validate_token(cls, v: str | None) -> str | None:
         if v is None:

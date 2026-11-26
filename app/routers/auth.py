@@ -262,11 +262,24 @@ async def set_fcm_token(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Enregistre le jeton FCM de l'appareil (obligatoire pour recevoir les notifications push :
-    « c'est votre tour », avertissement avant absence…).
-    Envoyer `{"fcm_token": null}` à la déconnexion pour ne plus en recevoir.
+    Enregistre l'appareil qui doit recevoir les notifications push
+    (« c'est votre tour », avertissement avant absence…).
+
+    Plusieurs appareils peuvent être enregistrés pour un même compte : envoyer
+    un jeton l'ajoute, il ne remplace plus les précédents.
+
+    À la déconnexion, envoyer `{"fcm_token": null, "device_token": "<jeton>"}`
+    pour retirer **cet** appareil. `device_token` est facultatif : sans lui, le
+    serveur retire le dernier appareil enregistré (`users.fcm_token`).
     """
-    await AuthService(db).set_fcm_token(current_user, body.fcm_token)
+    await AuthService(db).set_fcm_token(
+        current_user,
+        body.fcm_token,
+        device_token=body.device_token,
+        platform=body.platform,
+        device_model=body.device_model,
+        app_version=body.app_version,
+    )
     return {
         "success": True,
         "message": "Notifications push activées" if body.fcm_token else "Notifications push désactivées",

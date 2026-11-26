@@ -38,9 +38,21 @@ class Organization(Base):
     city: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     # ── Contact ───────────────────────────────────────────────
+    # `phone` et `email` servent AUSSI de canaux de support : ce sont les
+    # coordonnées que l'institution publie pour être joignable. Les dupliquer
+    # dans des colonnes `support_*` aurait créé deux vérités, et un client qui
+    # appelle un numéro que l'institution a changé ailleurs.
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     website: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # ── Support client (L6) ───────────────────────────────────
+    # WhatsApp est distinct du téléphone : beaucoup d'institutions burundaises
+    # répondent sur WhatsApp et pas au téléphone. `support_hours` est du texte
+    # libre (« Lun–Ven 8h–16h », « 24/7 ») : un champ structuré aurait imposé
+    # un modèle de plages horaires que personne n'aurait rempli correctement.
+    support_whatsapp: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    support_hours: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
     # ── Logo ──────────────────────────────────────────────────
     logo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)

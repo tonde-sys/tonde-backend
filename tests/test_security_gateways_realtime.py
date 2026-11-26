@@ -355,6 +355,55 @@ async def test_fcm_sends_v1_message_with_oauth_token(firebase, monkeypatch):
     assert message["android"]["priority"] == "HIGH"
 
 
+def test_fcm_payload_uses_the_channels_created_by_the_app():
+    """
+    Le canal est choisi par le serveur, pas par Android.
+
+    Un `channel_id` inconnu de l'application fait créer un canal de repli en
+    importance par défaut : le push arrive alors sans son ni tête d'épingle,
+    et l'usager découvre son appel quand le guichet est déjà passé.
+    """
+    urgent = fcm_gateway.build_message(
+        "jeton", "Ticket A-001 appelé", "Présentez-vous", {"type": "ticket_called", "ticket_id": "t-9"}
+    )
+    android = urgent["android"]["notification"]
+    assert android["channel_id"] == fcm_gateway.CHANNEL_URGENT
+    assert android["notification_priority"] == "PRIORITY_MAX"
+    assert urgent["apns"]["payload"]["aps"]["interruption-level"] == "time-sensitive"
+    # Cinq minutes : au-delà, le ticket a été rendu et la bannière mentirait.
+    assert urgent["android"]["ttl"] == "300s"
+
+    progress = fcm_gateway.build_message(
+        "jeton", "Encore 4 personnes", "…", {"type": "queue_progress", "ticket_id": "t-9"}
+    )
+    assert progress["android"]["notification"]["channel_id"] == fcm_gateway.CHANNEL_PROGRESS
+    assert progress["android"]["notification"]["notification_priority"] == "PRIORITY_DEFAULT"
+    assert progress["android"]["ttl"] == "3600s"
+
+
+def test_fcm_payload_carries_the_brand_icon_and_groups_per_ticket():
+    message = fcm_gateway.build_message(
+        "jeton", "t", "b", {"type": "ticket_called", "ticket_id": "t-42"}
+    )
+    android = message["android"]["notification"]
+    # Icône monochrome dédiée : l'icône de lancement, rendue en aplat, donne un
+    # carré blanc dans la barre d'état.
+    assert android["icon"] == fcm_gateway.SMALL_ICON == "ic_stat_tonde"
+    assert android["color"] == fcm_gateway.BRAND_COLOR
+    # Un fil par ticket : les messages d'une même file se remplacent.
+    assert android["tag"] == "ticket-t-42"
+    assert message["apns"]["payload"]["aps"]["thread-id"] == "ticket-t-42"
+    assert android["click_action"] == "FLUTTER_NOTIFICATION_CLICK"
+
+
+def test_fcm_payload_without_ticket_falls_back_to_a_single_thread():
+    message = fcm_gateway.build_message("jeton", "t", "b", None)
+    assert message["data"] == {}
+    assert message["android"]["notification"]["tag"] == "tonde"
+    # Sans type connu, le message reste dans le canal de progression.
+    assert message["android"]["notification"]["channel_id"] == fcm_gateway.CHANNEL_PROGRESS
+
+
 @pytest.mark.asyncio
 async def test_fcm_access_token_is_cached(firebase, monkeypatch):
     calls: list = []
@@ -394,7 +443,8 @@ async def test_fcm_not_configured_and_development(monkeypatch):
     with pytest.raises(fcm_gateway.FcmNotConfigured):
         await fcm_gateway.send_push("jeton", "t", "b")
 
-    monkeypatch.setattr(settings, "ENVIRONMENT", "development")       # développement : aucun appel
+    # développement : aucun appel réseau
+    monkeypatch.setattr(settings, "ENVIRONMENT", "development")
     await fcm_gateway.send_push("jeton", "t", "b")
 
 
@@ -462,6 +512,25 @@ async def test_absent_notification_is_in_app_plus_push(db_session):
 
     channels = {n.channel for n in await notes_of(db_session, client.id)}
     assert channels == {NotificationChannel.IN_APP, NotificationChannel.FCM}
+
+
+@pytest.mark.asyncio
+async def test_cancellation_says_why_in_app_and_by_push(db_session):
+    """
+    Un ticket annulé doit dire pourquoi, sur les deux canaux.
+
+    C'est la règle posée pour l'expiration à 12 h, qui supprimait des tickets en
+    silence ; la clôture par un agent suit la même règle.
+    """
+    ticket, client = await make_called_ticket(db_session)
+
+    await NotificationService(db_session).notify_ticket_expired(ticket, "clôture par l'agence")
+
+    notes = await notes_of(db_session, client.id)
+    assert {n.channel for n in notes} == {NotificationChannel.IN_APP, NotificationChannel.FCM}
+    in_app = next(n for n in notes if n.channel == NotificationChannel.IN_APP)
+    assert ticket.number in in_app.body
+    assert "clôture par l'agence" in in_app.body
 
 
 @pytest.mark.asyncio
