@@ -4,6 +4,13 @@
 # Création : Dashboard Render → New → Blueprint → repo tonde-sys/tonde-backend
 #            branche main, chemin render.yaml.
 #
+# État au 27/11/2026 : ces ressources ont été créées via l'API Render sur le
+# compte « Vital's workspace », l'ancien compte ayant été suspendu. Le service
+# répond sur https://tonde-api-bdi.onrender.com ; la base reste sur Neon, donc
+# aucune donnée n'a été perdue lors du changement de compte. Les noms ci-dessous
+# sont ceux réellement en service : un Blueprint appliqué depuis ce fichier
+# retrouve les mêmes ressources au lieu d'en créer des doublons.
+#
 # Coût : 0 $/mois. Contreparties du plan gratuit Render :
 #   - le web s'endort après 15 min sans trafic → UptimeRobot ping /health
 #     toutes les 5 min pour le garder éveillé ;
@@ -21,11 +28,16 @@
 services:
   # ── API FastAPI ───────────────────────────────────────────────────────────
   - type: web
-    name: tonde-api-pilot
+    name: tonde-api-bdi
     runtime: docker
     region: frankfurt
     plan: free
     branch: main
+    # Le dépôt est public : Render le clone sans passer par l'application
+    # GitHub, donc aucun webhook de push n'arrive. Les déploiements sont
+    # déclenchés explicitement (dashboard ou POST /v1/services/{id}/deploys) ;
+    # laisser `true` donnerait l'illusion d'un déploiement automatique.
+    autoDeploy: false
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /health
@@ -47,7 +59,7 @@ services:
       # Render n'assure pas (expiration à 30 jours).
       #
       # sync: false → la valeur N'EST PAS dans le dépôt. À renseigner une fois
-      # dans Dashboard → tonde-api-pilot → Environment :
+      # dans Dashboard → tonde-api-bdi → Environment :
       #
       #   DATABASE_URL = postgresql://<user>:<password>@<endpoint>-pooler.<region>.neon.tech/<db>?sslmode=require
       #   MIGRATION_DATABASE_URL = postgresql://<user>:<password>@<endpoint>.<region>.neon.tech/<db>?sslmode=require
@@ -68,7 +80,7 @@ services:
       - key: REDIS_URL
         fromService:
           type: keyvalue
-          name: tonde-pilot-kv
+          name: tonde-kv-bdi
           property: connectionString
 
       # Secret généré par Render (256 bits), jamais dans le dépôt.
@@ -101,7 +113,7 @@ services:
 
   # ── File d'attente Redis (Valkey) ─────────────────────────────────────────
   - type: keyvalue
-    name: tonde-pilot-kv
+    name: tonde-kv-bdi
     region: frankfurt
     plan: free
     maxmemoryPolicy: noeviction

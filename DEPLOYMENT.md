@@ -6,6 +6,14 @@ une seule organisation**. Il couvre deux cibles :
 - **Render** (recommandé) : Blueprint `render.yaml`, HTTPS et sauvegardes gérés ;
 - **Docker Compose sur VPS** : alternative autonome avec PostgreSQL et Redis.
 
+> **Déploiement en service (27/11/2026)** : `https://tonde-api-bdi.onrender.com`,
+> sur le compte Render « Vital's workspace » (Francfort, plan gratuit). Les
+> ressources ont été créées par l'API ; `render.yaml` porte désormais les mêmes
+> noms, pour qu'un Blueprint retrouve l'existant au lieu de créer des doublons.
+> La base reste sur Neon : elle est indépendante du compte Render, donc un
+> changement de compte ne perd aucune donnée. L'ancien service
+> `tonde-api-pilot-fx1j` est suspendu et ne doit plus être utilisé.
+
 > **Règle d'or** : les migrations Alembic s'exécutent **avant** le démarrage de
 > l'API. Sur Render payant : `preDeployCommand`. Sur Render gratuit : le
 > `docker-entrypoint.sh` applique `alembic upgrade head` au démarrage
@@ -179,16 +187,16 @@ git commit --allow-empty -m "test: webhook" && git push origin main
 >
 > | Ressource | Nom réel | URL / identifiant |
 > |---|---|---|
-> | API | `tonde-api-pilot-fx1j` | `https://tonde-api-pilot-fx1j.onrender.com` |
+> | API | `tonde-api-bdi` | `https://tonde-api-bdi.onrender.com` |
 > | PostgreSQL | ~~`tonde-pilot-db-fx1j`~~ supprimé | remplacé par Neon (§3.7) |
-> | Key Value | `tonde-pilot-kv-fx1j` | — |
+> | Key Value | `tonde-kv-bdi` | — |
 >
 > Les commandes ci-dessous utilisent cette URL réelle. Pour un nouveau
 > déploiement, remplacer `BASE` par l'URL affichée par Render.
 
 ### 3.2 Vérifier les secrets
 
-Dans **tonde-api-pilot-fx1j → Environment** :
+Dans **tonde-api-bdi → Environment** :
 
 - `JWT_SECRET_KEY` doit être présent et généré par Render (ne jamais le lire à voix haute).
 - `DATABASE_URL` pointe vers Neon (URL **poolée**), `MIGRATION_DATABASE_URL` vers
@@ -215,7 +223,7 @@ variable d'environnement `BOOTSTRAP_CONFIG_JSON` du service, puis redéployer.
 générés apparaissent **une seule fois** dans les logs du premier démarrage.
 Laisser `BOOTSTRAP_PASSWORDS_JSON` vide pour les générer aléatoirement.
 
-**Render payant / VPS** : ouvrir **Shell** sur `tonde-api-pilot-fx1j` et créer
+**Render payant / VPS** : ouvrir **Shell** sur `tonde-api-bdi` et créer
 `/tmp/pilot.json` à partir de `bootstrap/pilot.example.json`.
 
 ```bash
@@ -325,7 +333,7 @@ python -m app.cli bootstrap \
 ### 3.4 Vérification post-déploiement
 
 ```bash
-BASE=https://tonde-api-pilot-fx1j.onrender.com
+BASE=https://tonde-api-bdi.onrender.com
 
 curl -fsS $BASE/health
 curl -fsS $BASE/health/ready
@@ -398,7 +406,7 @@ Le plan gratuit Render endort un web service après **15 minutes** sans trafic.
 Un seul moniteur UptimeRobot suffit :
 
 1. Créer un moniteur **HTTP(s)**.
-2. URL : `https://tonde-api-pilot-fx1j.onrender.com/health`.
+2. URL : `https://tonde-api-bdi.onrender.com/health`.
 3. Intervalle : **5 minutes** (minimum du plan gratuit).
 4. Timeout : **60 s**. Un service Render endormi met 30 à 50 s à répondre au
    premier appel ; un timeout de 30 s produit de faux incidents.
@@ -591,7 +599,7 @@ Tester une restauration au moins une fois avant le pilote.
 
 ```bash
 # Render : Dashboard → Logs, ou CLI
-render logs tonde-api-pilot-fx1j --tail
+render logs tonde-api-bdi --tail
 
 # VPS
 docker compose --env-file .env.production -f docker-compose.prod.yml logs -f api
