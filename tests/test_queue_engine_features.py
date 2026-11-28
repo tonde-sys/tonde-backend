@@ -761,13 +761,17 @@ async def test_close_ticket_tells_the_client_why(ticket_service, db_session, rea
     notes = (await db_session.execute(
         select(Notification).where(Notification.user_id == client.id)
     )).scalars().all()
-    in_app = [n for n in notes if n.channel == NotificationChannel.IN_APP]
+    # Le parcours complet (appel, non-présentation, clôture) produit plusieurs
+    # messages. Ce qui est vérifié ici, c'est que la clôture en ajoute un seul.
+    in_app = [n for n in notes
+              if n.channel == NotificationChannel.IN_APP
+              and "clôture par l'agence" in (n.body or "")]
     # `_notify_expired` avale volontairement ses erreurs pour ne jamais faire
     # échouer une clôture. Le journal est donc la seule trace : on le remonte
     # dans le message d'assertion, sinon l'échec ne dit rien.
     assert len(in_app) == 1, (
-        f"le client est prévenu une seule fois (reçu {len(notes)} notification(s)) ; "
-        f"journal : {caplog.text[-900:]}")
+        f"la clôture prévient une seule fois (reçu {len(in_app)} sur {len(notes)} "
+        f"notification(s)) ; journal : {caplog.text[-900:]}")
     assert "clôture par l'agence" in in_app[0].body
     assert "n'est jamais revenu" not in in_app[0].body, "la note interne ne fuit pas"
     assert ticket.number in in_app[0].body

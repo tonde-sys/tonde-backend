@@ -101,8 +101,14 @@ async def test_legacy_migration_preserves_audit_or_blocks(
         try:
             async with engine.connect() as conn:
                 version = await conn.scalar(text('SELECT version_num FROM alembic_version'))
-                assert version == ('017_qape_create_operations' if blocked
-                                   else '018_qape_review_generation')
+                # `head` avance à chaque nouvelle migration (023 aujourd'hui) :
+                # on vérifie que la base a dépassé la 017, pas qu'elle s'arrête
+                # à la 018. Épingler « 018 » cassait le test à chaque release.
+                if blocked:
+                    assert version == '017_qape_create_operations'
+                else:
+                    assert version != '017_qape_create_operations', (
+                        'la migration 018 aurait dû être appliquée')
                 actual = await conn.scalar(text('''SELECT review_generation
                     FROM qape_create_operations WHERE id=:id'''), {'id': op_id})
                 assert actual == (0 if blocked else expected)
