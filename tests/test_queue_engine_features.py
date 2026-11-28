@@ -742,7 +742,16 @@ async def test_close_ticket_tells_the_client_why(ticket_service, db_session, rea
     jamais revenu ») reste dans le journal d'audit.
     """
     org, agency, service, counter, agent = await _world(db_session)
-    ticket = await _new_ticket(ticket_service, agency, service, "client-1")
+    # Le client doit exister en base : `notify_ticket_expired` résout la ligne
+    # `users` pour connaître le téléphone et le jeton push, et abandonne
+    # silencieusement si elle est absente. Un identifiant synthétique
+    # (« client-1 ») ne prouverait donc rien sur la notification.
+    client = User(phone='+257' + str(uuid.uuid4().int % 10**8).zfill(8),
+                  role=UserRole.CLIENT, org_id=org.id)
+    db_session.add(client)
+    await db_session.commit()
+
+    ticket = await _new_ticket(ticket_service, agency, service, client.id)
     await _call(ticket_service, org, agency, service, counter, agent)
     await _grace_ecoulee(db_session, ticket.id)
     await ticket_service.mark_absent(ticket.id, agent)
@@ -750,7 +759,7 @@ async def test_close_ticket_tells_the_client_why(ticket_service, db_session, rea
     await ticket_service.close_ticket(ticket.id, agent, reason="n'est jamais revenu")
 
     notes = (await db_session.execute(
-        select(Notification).where(Notification.user_id == "client-1")
+        select(Notification).where(Notification.user_id == client.id)
     )).scalars().all()
     in_app = [n for n in notes if n.channel == NotificationChannel.IN_APP]
     assert len(in_app) == 1, "le client est prévenu une seule fois"

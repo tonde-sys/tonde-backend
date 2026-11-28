@@ -26,7 +26,11 @@ from tests.http_helpers import (  # noqa: F401  (fixtures importées par nom)
     api, auth, make_branch, make_org, make_service, make_user, make_world, real_redis,
 )
 
-PUBLIC_ORGANIZATION_FIELDS = {"id", "name", "sector", "city", "logo_url"}
+PUBLIC_ORGANIZATION_FIELDS = {"id", "name", "sector", "city", "logo_url", "support"}
+# Bloc ajouté avec le centre d'aide (L6) : l'institution publie elle-même ces
+# coordonnées pour être joignable. Le contrat doit rester fermé — une clé en
+# plus ici serait une fuite silencieuse.
+PUBLIC_SUPPORT_FIELDS = {"phone", "whatsapp", "email", "hours"}
 PUBLIC_BRANCH_FIELDS = {
     "id", "name", "address", "city", "sector", "latitude", "longitude",
     "opens_at", "closes_at", "is_open", "waiting_count",
@@ -186,6 +190,7 @@ async def test_organisations_publiques_n_exposent_aucun_champ_sensible(api, db_s
     assert items, "au moins une organisation pour vérifier la forme"
     for item in items:
         assert set(item) == PUBLIC_ORGANIZATION_FIELDS
+        assert set(item["support"]) == PUBLIC_SUPPORT_FIELDS
 
 
 @pytest.mark.asyncio

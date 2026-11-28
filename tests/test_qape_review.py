@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from sqlalchemy import select, func
+from sqlalchemy import select, func, insert
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from app.core.redis import close_redis
 from app.models.organization import Organization
@@ -29,30 +29,46 @@ async def redis_lifecycle():
     await close_redis()
 
 
+async def _insert_legacy_org(db, name: str) -> str:
+    """
+    Insère une organisation sans nommer les colonnes ajoutées après la 017.
+
+    `test_qape_review_migration` amorce une base migrée à la révision 017, donc
+    antérieure à la 022 qui crée `support_whatsapp` et `support_hours`. Un
+    INSERT construit depuis l'ORM enverrait ces colonnes et Postgres répondrait
+    `UndefinedColumnError`. On ne nomme donc que les colonnes du schéma
+    initial ; SQLAlchemy complète avec les valeurs par défaut déclarées côté
+    Python (`country`), présentes depuis la 001.
+    """
+    org_id = str(uuid.uuid4())
+    await db.execute(insert(Organization.__table__).values(
+        id=org_id, name=name, slug=uuid.uuid4().hex, sector='other'))
+    return org_id
+
+
 async def setup_review(db, *, mode='REVIEW_REQUIRED'):
-    org = Organization(name='review', slug=uuid.uuid4().hex, sector='other')
-    other = Organization(name='other review', slug=uuid.uuid4().hex, sector='other')
-    db.add_all([org, other]); await db.flush()
-    branch = Branch(name='test', slug=uuid.uuid4().hex, sector='other', org_id=org.id,
+    org = await _insert_legacy_org(db, 'review')
+    other = await _insert_legacy_org(db, 'other review')
+    branch = Branch(name='test', slug=uuid.uuid4().hex, sector='other', org_id=org,
                     is_open=True, opens_at='00:00', closes_at='23:59')
     db.add(branch); await db.flush()
-    svc = Service(name='test', org_id=org.id, branch_id=branch.id)
+    svc = Service(name='test', org_id=org, branch_id=branch.id)
     client = User(phone='+257' + str(uuid.uuid4().int % 10**8).zfill(8))
     agent = User(phone='+257' + str(uuid.uuid4().int % 10**8).zfill(8),
-                 role=UserRole.SUPERVISOR, org_id=org.id)
+                 role=UserRole.SUPERVISOR, org_id=org)
     other_agent = User(phone='+257' + str(uuid.uuid4().int % 10**8).zfill(8),
-                       role=UserRole.SUPERVISOR, org_id=other.id)
+                       role=UserRole.SUPERVISOR, org_id=other)
     ordinary = User(phone='+257' + str(uuid.uuid4().int % 10**8).zfill(8),
-                    role=UserRole.AGENT, org_id=org.id)
+                    role=UserRole.AGENT, org_id=org)
     db.add_all([svc, client, agent, other_agent, ordinary]); await db.flush()
-    db.add(Employee(org_id=org.id, agency_id=branch.id, user_id=agent.id,
+    db.add(Employee(org_id=org, agency_id=branch.id, user_id=agent.id,
                     role=UserRole.SUPERVISOR, status=EmployeeStatus.ACTIVE))
     policy_config = config()
     policy_config['redis_unavailable'] = mode
-    db.add(AbusePolicy(org_id=org.id, service_id=svc.id, version=1,
+    db.add(AbusePolicy(org_id=org, service_id=svc.id, version=1,
                        enabled=True, config=policy_config))
     await db.commit()
-    ids = org.id, other.id, branch.id, svc.id, client.id, agent.id, other_agent.id, ordinary.id
+    ids = org, other, branch.id, svc.id, client.id, agent.id, other_agent.id, ordinary.id
     return ids
 
 
