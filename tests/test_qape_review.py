@@ -7,10 +7,9 @@ from datetime import datetime, timezone
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from sqlalchemy import select, func, insert
+from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from app.core.redis import close_redis
-from app.models.organization import Organization
 from app.models.branch import Branch, Service
 from app.models.user import User, UserRole
 from app.models.employee import Employee, EmployeeStatus
@@ -29,30 +28,35 @@ async def redis_lifecycle():
     await close_redis()
 
 
-async def _insert_legacy_org(db, name: str) -> str:
+async def _insert_legacy(db, table: str, **values) -> None:
     """
-    Insère une organisation sans nommer les colonnes ajoutées après la 017.
+    Insère une ligne en SQL brut, sans nommer les colonnes ajoutées après la 017.
 
-    `test_qape_review_migration` amorce une base migrée à la révision 017, donc
-    antérieure à la 022 qui crée `support_whatsapp` et `support_hours`. Un
-    INSERT construit depuis l'ORM enverrait ces colonnes et Postgres répondrait
-    `UndefinedColumnError`. On ne nomme donc que les colonnes du schéma
-    initial ; SQLAlchemy complète avec les valeurs par défaut déclarées côté
-    Python (`country`), présentes depuis la 001.
+    `test_qape_review_migration` amorce une base figée à la révision 017, donc
+    antérieure à `services.eta_*` (019) et `organizations.support_*` (022). Un
+    INSERT construit depuis l'ORM enverrait ces colonnes — y compris via leurs
+    valeurs par défaut Python — et Postgres répondrait `UndefinedColumnError`.
+    Le SQL brut ne nomme que le minimum ; la base applique ses propres défauts.
     """
-    org_id = str(uuid.uuid4())
-    await db.execute(insert(Organization.__table__).values(
-        id=org_id, name=name, slug=uuid.uuid4().hex, sector='other'))
-    return org_id
+    columns = ", ".join(values)
+    placeholders = ", ".join(f":{name}" for name in values)
+    await db.execute(
+        text(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"), values)
 
 
 async def setup_review(db, *, mode='REVIEW_REQUIRED'):
-    org = await _insert_legacy_org(db, 'review')
-    other = await _insert_legacy_org(db, 'other review')
+    org = str(uuid.uuid4())
+    other = str(uuid.uuid4())
+    await _insert_legacy(db, 'organizations', id=org, name='review',
+                         slug=uuid.uuid4().hex, sector='other')
+    await _insert_legacy(db, 'organizations', id=other, name='other review',
+                         slug=uuid.uuid4().hex, sector='other')
     branch = Branch(name='test', slug=uuid.uuid4().hex, sector='other', org_id=org,
                     is_open=True, opens_at='00:00', closes_at='23:59')
     db.add(branch); await db.flush()
-    svc = Service(name='test', org_id=org, branch_id=branch.id)
+    svc = str(uuid.uuid4())
+    await _insert_legacy(db, 'services', id=svc, org_id=org,
+                         branch_id=branch.id, name='test')
     client = User(phone='+257' + str(uuid.uuid4().int % 10**8).zfill(8))
     agent = User(phone='+257' + str(uuid.uuid4().int % 10**8).zfill(8),
                  role=UserRole.SUPERVISOR, org_id=org)
@@ -60,15 +64,15 @@ async def setup_review(db, *, mode='REVIEW_REQUIRED'):
                        role=UserRole.SUPERVISOR, org_id=other)
     ordinary = User(phone='+257' + str(uuid.uuid4().int % 10**8).zfill(8),
                     role=UserRole.AGENT, org_id=org)
-    db.add_all([svc, client, agent, other_agent, ordinary]); await db.flush()
+    db.add_all([client, agent, other_agent, ordinary]); await db.flush()
     db.add(Employee(org_id=org, agency_id=branch.id, user_id=agent.id,
                     role=UserRole.SUPERVISOR, status=EmployeeStatus.ACTIVE))
     policy_config = config()
     policy_config['redis_unavailable'] = mode
-    db.add(AbusePolicy(org_id=org, service_id=svc.id, version=1,
+    db.add(AbusePolicy(org_id=org, service_id=svc, version=1,
                        enabled=True, config=policy_config))
     await db.commit()
-    ids = org, other, branch.id, svc.id, client.id, agent.id, other_agent.id, ordinary.id
+    ids = org, other, branch.id, svc, client.id, agent.id, other_agent.id, ordinary.id
     return ids
 
 

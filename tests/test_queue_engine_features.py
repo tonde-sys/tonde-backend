@@ -733,7 +733,7 @@ async def test_close_ticket_frees_the_client(ticket_service, db_session, real_re
 
 
 @pytest.mark.asyncio
-async def test_close_ticket_tells_the_client_why(ticket_service, db_session, real_redis):
+async def test_close_ticket_tells_the_client_why(ticket_service, db_session, real_redis, caplog):
     """
     Une clôture par l'agent ne doit pas être silencieuse.
 
@@ -762,7 +762,12 @@ async def test_close_ticket_tells_the_client_why(ticket_service, db_session, rea
         select(Notification).where(Notification.user_id == client.id)
     )).scalars().all()
     in_app = [n for n in notes if n.channel == NotificationChannel.IN_APP]
-    assert len(in_app) == 1, "le client est prévenu une seule fois"
+    # `_notify_expired` avale volontairement ses erreurs pour ne jamais faire
+    # échouer une clôture. Le journal est donc la seule trace : on le remonte
+    # dans le message d'assertion, sinon l'échec ne dit rien.
+    assert len(in_app) == 1, (
+        f"le client est prévenu une seule fois (reçu {len(notes)} notification(s)) ; "
+        f"journal : {caplog.text[-900:]}")
     assert "clôture par l'agence" in in_app[0].body
     assert "n'est jamais revenu" not in in_app[0].body, "la note interne ne fuit pas"
     assert ticket.number in in_app[0].body
