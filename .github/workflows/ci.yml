@@ -88,8 +88,23 @@ jobs:
       - name: Apply Alembic migrations from an empty database
         run: alembic upgrade head
 
+      # Le journal d'un job n'est lisible qu'authentifié : un échec ne laissait
+      # qu'un « exit code 1 » dans l'annotation publique, obligeant à ouvrir le
+      # navigateur pour connaître le test fautif. On remonte donc le résumé
+      # pytest en annotation, lisible par n'importe qui.
       - name: Run tests
-        run: pytest --tb=short -q
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! pytest --tb=short -q 2>&1 | tee pytest.log; then
+            MSG=$(grep -E "^(FAILED|ERROR) " pytest.log | head -20 \
+                  | tr '\n' '|' | sed 's/%/%25/g; s/\r//g')
+            if [ -z "$MSG" ]; then
+              MSG=$(tail -c 1500 pytest.log | tr '\n' '|' | sed 's/%/%25/g; s/\r//g')
+            fi
+            echo "::error title=Tests en echec::${MSG}"
+            exit 1
+          fi
 
       - name: Require QAPE migration tests to run without skips
         run: |
